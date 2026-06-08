@@ -148,6 +148,52 @@ struct MultiDerived : MixinA, MixinB {
     MultiDerived() : md(0) {}
 };
 
+// A secondary base that itself has a base, to exercise flattening of a whole
+// secondary subtree (Mid's members + SecBase's members onto Combo).
+struct SecBase {
+    int sb;
+    SecBase() : sb(0) {}
+    int sec_method() const { return sb; }
+};
+
+struct Mid : SecBase {
+    int mid;
+    Mid() : mid(0) {}
+};
+
+struct PrimaryX {
+    int px;
+    PrimaryX() : px(0) {}
+};
+
+struct Combo : PrimaryX, Mid {
+    int cm;
+    Combo() : cm(0) {}
+};
+
+// Diamond: Dia -> DiaL -> DiaTop and Dia -> DiaR -> DiaTop. DiaTop is reached via
+// the primary chain (DiaL), so it must NOT be flattened again through DiaR.
+struct DiaTop {
+    int dt;
+    DiaTop() : dt(0) {}
+    int top_method() const { return dt; }
+};
+
+struct DiaL : DiaTop {
+    int dl;
+    DiaL() : dl(0) {}
+};
+
+struct DiaR : DiaTop {
+    int dr;
+    DiaR() : dr(0) {}
+};
+
+struct Dia : DiaL, DiaR {
+    int db;
+    Dia() : db(0) {}
+};
+
 } // namespace reflect_test
 
 NB_MODULE(test_reflect_ext, m) {

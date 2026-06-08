@@ -18,6 +18,7 @@
 #include "stl/string.h"
 #include <string_view>
 #include <type_traits>
+#include <vector>
 
 NAMESPACE_BEGIN(NB_NAMESPACE)
 NAMESPACE_BEGIN(detail)
@@ -175,6 +176,54 @@ consteval std::meta::info first_public_base() {
     return ^^void;  // unreachable: guarded by public_base_count<T>() > 0
 }
 
+consteval bool info_vec_contains(const std::vector<std::meta::info>& v,
+                                 std::meta::info x) {
+    for (auto e : v)
+        if (e == x)
+            return true;
+    return false;
+}
+
+// Append every public base *type* in the subtree rooted at `type` (the type's
+// direct public bases, their public bases, and so on) to `out`, de-duplicated.
+consteval void collect_public_base_subtree(std::meta::info type,
+                                           std::vector<std::meta::info>& out) {
+    for (auto b : std::meta::bases_of(type, std::meta::access_context::unchecked())) {
+        if (!std::meta::is_public(b))
+            continue;
+        auto bt = std::meta::type_of(b);
+        if (!info_vec_contains(out, bt)) {
+            out.push_back(bt);
+            collect_public_base_subtree(bt, out);
+        }
+    }
+}
+
+// nanobind models a single base, so only T's first public base (and, through it,
+// that base's own subtree) is reachable on the Python side via the MRO. Every
+// other public base in T's subtree must have its members "flattened" directly
+// onto T. This returns exactly those base types: T's whole public-base subtree
+// minus the part already covered by the first public base. The subtraction makes
+// it correct for diamonds and for bases nested under the primary base (no member
+// is bound twice).
+template <typename T>
+consteval std::vector<std::meta::info> flatten_bases_vec() {
+    std::vector<std::meta::info> all, covered, result;
+    collect_public_base_subtree(^^T, all);
+    for (auto b : std::meta::bases_of(^^T, std::meta::access_context::unchecked())) {
+        if (std::meta::is_public(b)) {
+            auto primary = std::meta::type_of(b);
+            covered.push_back(primary);
+            collect_public_base_subtree(primary, covered);
+            break;  // only the first public base is the nanobind base
+        }
+    }
+    for (auto t : all)
+        if (!info_vec_contains(covered, t))
+            result.push_back(t);
+    return result;
+}
+
 // Bind the constructors, data members, static data members, and methods declared
 // directly in T onto an already-created class_ object. Inherited members are not
 // re-bound here -- they are exposed automatically through the Python base type.
@@ -228,6 +277,55 @@ void bind_class_contents(auto& cls) {
     };
 }
 
+// Flatten the public members declared directly in base type `Base` onto a
+// derived class_ `cls` (of type T), using base-class member pointers
+// (&[:mem:] yields a pointer-to-member of Base, which def_rw/def_ro accept
+// because Base is a base of T). Constructors are not flattened.
+template <typename T, std::meta::info Base>
+void flatten_base_members(auto& cls) {
+    template for (constexpr auto mem :
+        std::define_static_array(std::meta::nonstatic_data_members_of(
+            Base, std::meta::access_context::unchecked()))) {
+        if constexpr (std::meta::is_public(mem)) {
+            reflect_bind_member<T, mem>(cls);
+        }
+    };
+
+    template for (constexpr auto mem :
+        std::define_static_array(std::meta::static_data_members_of(
+            Base, std::meta::access_context::unchecked()))) {
+        if constexpr (std::meta::is_public(mem)) {
+            reflect_bind_static_member<T, mem>(cls);
+        }
+    };
+
+    template for (constexpr auto fn :
+        std::define_static_array(std::meta::members_of(
+            Base, std::meta::access_context::unchecked()))) {
+        if constexpr (std::meta::is_function(fn)
+            && std::meta::is_public(fn)
+            && !std::meta::is_constructor(fn)
+            && !std::meta::is_destructor(fn)
+            && !std::meta::is_special_member_function(fn)) {
+            if constexpr (std::meta::is_static_member(fn)) {
+                reflect_bind_static_method<fn>(cls);
+            } else {
+                reflect_bind_method<T, fn>(cls);
+            }
+        }
+    };
+}
+
+// Flatten every secondary public base (those nanobind cannot model as a real
+// Python base) onto T's class_. See flatten_bases_vec for which types these are.
+template <typename T>
+void flatten_secondary_bases(auto& cls) {
+    template for (constexpr auto base :
+        std::define_static_array(flatten_bases_vec<T>())) {
+        flatten_base_members<T, base>(cls);
+    };
+}
+
 template <typename T>
 void reflect_class(module_& m) {
     // Idempotent: skip if T is already registered. This makes binding
@@ -241,9 +339,10 @@ void reflect_class(module_& m) {
         std::define_static_string(std::meta::identifier_of(^^T));
 
     // nanobind supports a single base class. When T has one or more public
-    // bases, bind it as class_<T, Base> using the first public base; any
-    // additional public bases are ignored (their members are only reachable if
-    // those bases are bound as standalone types).
+    // bases, bind it as class_<T, Base> using the first public base. Any
+    // additional (secondary) public bases cannot be real Python bases, so their
+    // members are flattened directly onto T instead (see flatten_secondary_bases);
+    // the only thing lost for those bases is the isinstance/issubclass relation.
     if constexpr (public_base_count<T>() == 0) {
         auto cls = class_<T>(m, name);
         bind_class_contents<T>(cls);
@@ -255,6 +354,7 @@ void reflect_class(module_& m) {
         reflect_class<typename [:base:]>(m);
         auto cls = class_<T, typename [:base:]>(m, name);
         bind_class_contents<T>(cls);
+        flatten_secondary_bases<T>(cls);
     }
 }
 

@@ -162,6 +162,36 @@ library), it is bound on demand so the inheritance relationship still works.
 Binding is idempotent -- a type reached more than once is bound only the first
 time -- so ordering of types within ``reflect_`` does not matter.
 
+Multiple inheritance
+~~~~~~~~~~~~~~~~~~~~~~
+
+nanobind models a single C++ base per Python type. When a class has more than
+one public base, the **first** public base becomes the real Python base class,
+and the public members of every **additional** base (and of that base's own
+bases) are *flattened* directly onto the derived type -- so they remain fully
+accessible from Python:
+
+.. code-block:: cpp
+
+   struct Drawable { void draw() const; };
+   struct Serializable { std::string serialize() const; };
+   struct Widget : Drawable, Serializable { int id; };
+
+.. code-block:: python
+
+   w = my_module.Widget()
+   w.draw()            # via the real base (Drawable)
+   w.serialize()       # flattened from the secondary base (Serializable)
+   w.id
+   issubclass(my_module.Widget, my_module.Drawable)      # True
+   issubclass(my_module.Widget, my_module.Serializable)  # False (see below)
+
+The single thing lost for the secondary bases is the *type relationship*:
+``isinstance``/``issubclass`` against them is ``False``, and a ``Widget`` cannot
+be passed where a bound function expects a ``Serializable&``. Member access,
+however, is preserved. Diamond hierarchies are handled without binding any
+member twice (a base reached through the primary chain is not also flattened).
+
 Limitations
 -----------
 
@@ -170,10 +200,11 @@ Limitations
 - Private and protected members are skipped.
 - Operator overloads (``operator+``, etc.) are not yet mapped to Python
   dunder methods (as of March 2026).
-- **Multiple inheritance**: nanobind supports a single base class, so only the
-  first public base is used. Members of any additional bases are not exposed on
-  the derived type (those bases are still bound on their own if they appear in a
-  reflected namespace).
+- **Multiple inheritance**: nanobind supports a single base class. The first
+  public base is the real Python base; additional bases are flattened (their
+  members are exposed on the derived type, but ``isinstance``/``issubclass``
+  against them is ``False`` and the derived type cannot be passed where those
+  bases are expected at the binding boundary). See `Multiple inheritance`_.
 - Virtual functions are not bound with trampolines, so overriding C++ virtual
   methods from Python is not yet supported. Virtual (and diamond) inheritance
   layouts are untested.

@@ -192,18 +192,55 @@ def test21_external_base_transitive():
 
 
 @needs_reflect
-def test22_multiple_bases_first_only():
-    # MultiDerived : MixinA, MixinB -> only MixinA becomes the nanobind base.
+def test22_multiple_bases_flattened():
+    # MultiDerived : MixinA, MixinB -> MixinA is the real nanobind base, and
+    # MixinB's members are flattened directly onto MultiDerived.
     md = t.MultiDerived()
     md.md = 9
-    md.a = 1            # from the first base (MixinA)
+    md.a = 1            # from the first base (MixinA), via the Python base
+    md.b2 = 2           # from the second base (MixinB), flattened
     assert md.md == 9
     assert md.a == 1
+    assert md.b2 == 2
     assert md.from_a() == 1
+    assert md.from_b() == 2     # flattened method works
+    # Only the first base is a real Python base.
     assert issubclass(t.MultiDerived, t.MixinA)
-    # MixinB's members are NOT exposed on MultiDerived (single-base limitation).
+    assert isinstance(md, t.MixinA)
+    # The secondary base relationship is NOT modeled (single-base limitation).
     assert not issubclass(t.MultiDerived, t.MixinB)
-    assert not hasattr(md, 'b2')
-    assert not hasattr(md, 'from_b')
+    assert not isinstance(md, t.MixinB)
     # MixinB is still bound on its own (it is a member of the namespace).
     assert t.MixinB().from_b() == 0
+
+
+@needs_reflect
+def test23_secondary_subtree_flattened():
+    # Combo : PrimaryX, Mid; Mid : SecBase. PrimaryX is the real base; Mid AND
+    # its base SecBase are flattened onto Combo.
+    c = t.Combo()
+    c.cm = 1
+    c.px = 2            # PrimaryX (real base)
+    c.mid = 3           # Mid (flattened)
+    c.sb = 4            # SecBase, base of the secondary base (flattened)
+    assert (c.cm, c.px, c.mid, c.sb) == (1, 2, 3, 4)
+    assert c.sec_method() == 4
+    assert issubclass(t.Combo, t.PrimaryX)
+    assert not issubclass(t.Combo, t.Mid)
+    assert not issubclass(t.Combo, t.SecBase)
+
+
+@needs_reflect
+def test24_diamond_no_double_bind():
+    # Dia : DiaL, DiaR; both DiaL and DiaR : DiaTop. DiaTop is reached through the
+    # primary chain (DiaL), so it is a real ancestor and is not flattened twice.
+    d = t.Dia()
+    d.db = 1
+    d.dl = 2            # via DiaL (real base)
+    d.dt = 3            # via DiaTop (real ancestor through DiaL)
+    d.dr = 4            # DiaR's own member, flattened
+    assert (d.db, d.dl, d.dt, d.dr) == (1, 2, 3, 4)
+    assert d.top_method() == 3
+    assert issubclass(t.Dia, t.DiaL)
+    assert issubclass(t.Dia, t.DiaTop)   # via the primary chain / MRO
+    assert not issubclass(t.Dia, t.DiaR)
