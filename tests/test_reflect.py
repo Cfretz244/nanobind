@@ -149,3 +149,61 @@ def test18_private_members_hidden():
     assert not hasattr(m, 'priv_d')
     assert not hasattr(m, 'priv_method')
     assert not hasattr(m, 'prot_i')
+
+
+@needs_reflect
+def test19_single_inheritance():
+    d = t.Derived()
+    d.b = 3   # inherited data member
+    d.d = 4   # own data member
+    assert d.b == 3
+    assert d.d == 4
+    assert d.base_method() == 3       # inherited method
+    assert d.derived_method() == 4    # own method
+    assert issubclass(t.Derived, t.Base)
+    assert isinstance(d, t.Base)
+
+
+@needs_reflect
+def test20_multilevel_chain():
+    x = t.L2()
+    x.v0 = 1
+    x.v1 = 2
+    x.v2 = 3
+    assert (x.m0(), x.m1(), x.m2()) == (1, 2, 3)
+    assert issubclass(t.L2, t.L1)
+    assert issubclass(t.L1, t.L0)
+    assert issubclass(t.L2, t.L0)
+    assert isinstance(x, t.L0)
+
+
+@needs_reflect
+def test21_external_base_transitive():
+    # ExtBase lives outside reflect_test and was never passed to reflect_<...>;
+    # it must have been bound transitively because UsesExtBase derives from it.
+    assert hasattr(t, 'ExtBase')
+    u = t.UsesExtBase()
+    u.eb = 5   # inherited from the external base
+    u.ub = 6   # own member
+    assert u.eb == 5
+    assert u.ub == 6
+    assert u.ext_method() == 5
+    assert issubclass(t.UsesExtBase, t.ExtBase)
+
+
+@needs_reflect
+def test22_multiple_bases_first_only():
+    # MultiDerived : MixinA, MixinB -> only MixinA becomes the nanobind base.
+    md = t.MultiDerived()
+    md.md = 9
+    md.a = 1            # from the first base (MixinA)
+    assert md.md == 9
+    assert md.a == 1
+    assert md.from_a() == 1
+    assert issubclass(t.MultiDerived, t.MixinA)
+    # MixinB's members are NOT exposed on MultiDerived (single-base limitation).
+    assert not issubclass(t.MultiDerived, t.MixinB)
+    assert not hasattr(md, 'b2')
+    assert not hasattr(md, 'from_b')
+    # MixinB is still bound on its own (it is a member of the namespace).
+    assert t.MixinB().from_b() == 0

@@ -26,11 +26,15 @@ template <typename T, std::meta::info mem>
 void reflect_bind_member(auto& cls) {
     constexpr auto name =
         std::define_static_string(std::meta::identifier_of(mem));
-    using MemberType = [:std::meta::type_of(mem):];
-    cls.def_prop_rw(name,
-        [](T& self) -> MemberType& { return self.[:mem:]; },
-        [](T& self, const MemberType& val) { self.[:mem:] = val; }
-    );
+    // Bind via a pointer-to-data-member (&[:mem:]) rather than getter/setter
+    // lambdas: a lambda whose signature mentions the spliced member type
+    // [:type_of(mem):] crashes the clang-p2996 mangler when passed to the
+    // dependent `cls.def_*` call (placeholder-type mangling at parse time).
+    if constexpr (std::meta::is_const_type(std::meta::type_of(mem))) {
+        cls.def_ro(name, &[:mem:]);
+    } else {
+        cls.def_rw(name, &[:mem:]);
+    }
 }
 
 template <typename T, std::meta::info fn, typename FnType>
@@ -92,16 +96,12 @@ template <typename T, std::meta::info mem>
 void reflect_bind_static_member(auto& cls) {
     constexpr auto name =
         std::define_static_string(std::meta::identifier_of(mem));
-    using MemberType = [:std::meta::type_of(mem):];
-    if constexpr (std::meta::is_const(mem)) {
-        cls.def_prop_ro_static(name,
-            [](handle) -> const MemberType& { return [:mem:]; }
-        );
+    // Bind via a pointer to the static (&[:mem:]); see reflect_bind_member for
+    // why spliced-type lambdas are avoided.
+    if constexpr (std::meta::is_const_type(std::meta::type_of(mem))) {
+        cls.def_ro_static(name, &[:mem:]);
     } else {
-        cls.def_prop_rw_static(name,
-            [](handle) -> MemberType& { return [:mem:]; },
-            [](handle, const MemberType& val) { [:mem:] = val; }
-        );
+        cls.def_rw_static(name, &[:mem:]);
     }
 }
 
@@ -154,13 +154,32 @@ void reflect_bind_ctor(auto& cls) {
     reflect_bind_ctor_expand<ctor>(cls, std::make_index_sequence<ctor_param_count<ctor>()>{});
 }
 
+// --- Inheritance ---
+
+// Count the public base classes of T.
 template <typename T>
-void reflect_class(module_& m) {
-    constexpr auto name =
-        std::define_static_string(std::meta::identifier_of(^^T));
+consteval std::size_t public_base_count() {
+    std::size_t n = 0;
+    for (auto b : std::meta::bases_of(^^T, std::meta::access_context::unchecked()))
+        if (std::meta::is_public(b))
+            ++n;
+    return n;
+}
 
-    auto cls = class_<T>(m, name);
+// Reflection of T's first public base *type* (only valid when the count is > 0).
+template <typename T>
+consteval std::meta::info first_public_base() {
+    for (auto b : std::meta::bases_of(^^T, std::meta::access_context::unchecked()))
+        if (std::meta::is_public(b))
+            return std::meta::type_of(b);
+    return ^^void;  // unreachable: guarded by public_base_count<T>() > 0
+}
 
+// Bind the constructors, data members, static data members, and methods declared
+// directly in T onto an already-created class_ object. Inherited members are not
+// re-bound here -- they are exposed automatically through the Python base type.
+template <typename T>
+void bind_class_contents(auto& cls) {
     // Bind constructors
     template for (constexpr auto fn :
         std::define_static_array(std::meta::members_of(
@@ -207,6 +226,36 @@ void reflect_class(module_& m) {
             }
         }
     };
+}
+
+template <typename T>
+void reflect_class(module_& m) {
+    // Idempotent: skip if T is already registered. This makes binding
+    // order-independent and lets a base be reached both directly (via the
+    // namespace walk / another reflect_ argument) and transitively (below)
+    // without triggering nanobind's "already registered" warning.
+    if (type<T>().is_valid())
+        return;
+
+    constexpr auto name =
+        std::define_static_string(std::meta::identifier_of(^^T));
+
+    // nanobind supports a single base class. When T has one or more public
+    // bases, bind it as class_<T, Base> using the first public base; any
+    // additional public bases are ignored (their members are only reachable if
+    // those bases are bound as standalone types).
+    if constexpr (public_base_count<T>() == 0) {
+        auto cls = class_<T>(m, name);
+        bind_class_contents<T>(cls);
+    } else {
+        constexpr auto base = first_public_base<T>();
+        // Ensure the base (and, recursively, its ancestors) is bound first --
+        // nanobind requires the base registered before the derived type. The
+        // guard above keeps this a no-op if the base is already bound.
+        reflect_class<typename [:base:]>(m);
+        auto cls = class_<T, typename [:base:]>(m, name);
+        bind_class_contents<T>(cls);
+    }
 }
 
 template <typename E>

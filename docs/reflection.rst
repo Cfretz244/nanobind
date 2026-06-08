@@ -73,10 +73,11 @@ What gets bound
 For **classes**, ``reflect_`` automatically binds:
 
 - All public non-copy/move constructors (including default and parameterized)
-- All public nonstatic data members (as read-write properties)
+- All public nonstatic data members (read-write; read-only if ``const``)
 - All public static data members (read-only if ``const``, read-write otherwise)
 - All public nonstatic methods (including overloads)
 - All public static methods
+- A single public base class (see `Inheritance`_)
 
 For **enums**, all enumerators are bound by name.
 
@@ -132,6 +133,35 @@ call time based on argument types:
    p1.distance(p2)           # calls Point::distance(const Point&)
    p1.distance(4.0, 5.0, 6.0)  # calls Point::distance(double, double, double)
 
+Inheritance
+-----------
+
+Single inheritance is handled automatically. A derived class is bound as
+``nb::class_<Derived, Base>`` so that, on the Python side, it is a subclass of
+its base and transparently exposes the base's (already bound) members:
+
+.. code-block:: cpp
+
+   struct Animal { std::string name; std::string sound() const; };
+   struct Dog : Animal { int good_boy_points; };
+
+   NB_MODULE(my_module, m) {
+       nb::reflect_<^^Dog>(m);   // Animal is bound automatically, too
+   }
+
+.. code-block:: python
+
+   d = my_module.Dog()
+   d.name = "Rex"            # inherited from Animal
+   d.sound()                 # inherited method
+   issubclass(my_module.Dog, my_module.Animal)   # True
+
+The base class is bound **transitively**: if a derived class's base was not
+itself passed to ``reflect_`` (for example, it lives in another namespace or a
+library), it is bound on demand so the inheritance relationship still works.
+Binding is idempotent -- a type reached more than once is bound only the first
+time -- so ordering of types within ``reflect_`` does not matter.
+
 Limitations
 -----------
 
@@ -140,5 +170,10 @@ Limitations
 - Private and protected members are skipped.
 - Operator overloads (``operator+``, etc.) are not yet mapped to Python
   dunder methods (as of March 2026).
-- Virtual functions and inheritance hierarchies are not yet handled
-  specially (as of March 2026).
+- **Multiple inheritance**: nanobind supports a single base class, so only the
+  first public base is used. Members of any additional bases are not exposed on
+  the derived type (those bases are still bound on their own if they appear in a
+  reflected namespace).
+- Virtual functions are not bound with trampolines, so overriding C++ virtual
+  methods from Python is not yet supported. Virtual (and diamond) inheritance
+  layouts are untested.

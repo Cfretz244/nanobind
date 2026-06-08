@@ -7,6 +7,18 @@
 
 namespace nb = nanobind;
 
+// A base class that lives OUTSIDE the reflected namespace and is never passed to
+// reflect_<...>. It must still be bound transitively so the derived class works.
+namespace external_bases {
+
+struct ExtBase {
+    int eb;
+    ExtBase() : eb(0) {}
+    int ext_method() const { return eb; }
+};
+
+} // namespace external_bases
+
 namespace reflect_test {
 
 enum class Enum { A, B, C };
@@ -77,6 +89,64 @@ double free_fn(double a, double b) { return a + b; }
 double free_fn(double a, double b, double c) { return a + b + c; }
 
 } // namespace ns
+
+// --- Inheritance ---
+
+// Single inheritance: derived exposes its own + inherited members.
+struct Base {
+    int b;
+    Base() : b(0) {}
+    int base_method() const { return b; }
+};
+
+struct Derived : Base {
+    int d;
+    Derived() : d(0) {}
+    int derived_method() const { return d; }
+};
+
+// Multi-level chain L0 <- L1 <- L2.
+struct L0 {
+    int v0;
+    L0() : v0(0) {}
+    int m0() const { return v0; }
+};
+
+struct L1 : L0 {
+    int v1;
+    L1() : v1(0) {}
+    int m1() const { return v1; }
+};
+
+struct L2 : L1 {
+    int v2;
+    L2() : v2(0) {}
+    int m2() const { return v2; }
+};
+
+// Derived from a base outside the reflected namespace (bound transitively).
+struct UsesExtBase : external_bases::ExtBase {
+    int ub;
+    UsesExtBase() : ub(0) {}
+};
+
+// Multiple public bases: only the first (MixinA) becomes the nanobind base.
+struct MixinA {
+    int a;
+    MixinA() : a(0) {}
+    int from_a() const { return a; }
+};
+
+struct MixinB {
+    int b2;
+    MixinB() : b2(0) {}
+    int from_b() const { return b2; }
+};
+
+struct MultiDerived : MixinA, MixinB {
+    int md;
+    MultiDerived() : md(0) {}
+};
 
 } // namespace reflect_test
 
