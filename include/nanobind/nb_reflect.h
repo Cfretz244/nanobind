@@ -860,6 +860,7 @@ void bind_class_contents(auto& cls) {
             ^^T, std::meta::access_context::unchecked()))) {
         if constexpr (std::meta::is_constructor(fn)
             && std::meta::is_public(fn)
+            && !std::meta::is_template(fn)   // skip constructor templates (cannot reflect)
             && !std::meta::is_copy_constructor(fn)
             && !std::meta::is_move_constructor(fn)) {
             reflect_bind_ctor<fn>(cls);
@@ -891,6 +892,7 @@ void bind_class_contents(auto& cls) {
             ^^T, std::meta::access_context::unchecked()))) {
         if constexpr (std::meta::is_function(fn)
             && std::meta::is_public(fn)
+            && !std::meta::is_template(fn)   // skip member function templates (unsupported)
             && !std::meta::is_constructor(fn)
             && !std::meta::is_destructor(fn)
             && !std::meta::is_special_member_function(fn)) {
@@ -898,14 +900,19 @@ void bind_class_contents(auto& cls) {
         }
     };
 
-    // Bind properties from [[=r::property{"name"}]] getter/setter pairs.
+    // Bind properties from [[=r::property{"name"}]] getter/setter pairs. The is_template
+    // guard must gate the is_property_getter<fn>() call itself: that helper queries
+    // annotations_of(fn), which is ill-formed on a template, so a templated member must be
+    // excluded *before* it is instantiated (a nested if constexpr, not an && short-circuit).
     template for (constexpr auto fn :
         std::define_static_array(std::meta::members_of(
             ^^T, std::meta::access_context::unchecked()))) {
         if constexpr (std::meta::is_function(fn)
             && std::meta::is_public(fn)
-            && is_property_getter<fn>()) {
-            reflect_bind_property<T, fn>(cls);
+            && !std::meta::is_template(fn)) {
+            if constexpr (is_property_getter<fn>()) {
+                reflect_bind_property<T, fn>(cls);
+            }
         }
     };
 }
@@ -937,6 +944,7 @@ void flatten_base_members(auto& cls) {
             Base, std::meta::access_context::unchecked()))) {
         if constexpr (std::meta::is_function(fn)
             && std::meta::is_public(fn)
+            && !std::meta::is_template(fn)   // skip member function templates (unsupported)
             && !std::meta::is_constructor(fn)
             && !std::meta::is_destructor(fn)
             && !std::meta::is_special_member_function(fn)) {

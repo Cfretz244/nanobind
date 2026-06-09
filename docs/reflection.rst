@@ -540,8 +540,9 @@ Limitations
 - **Annotations**: per-argument ownership transfer is not yet handled (see
   `Controlling the bindings with annotations`_).
 - **Templates**: only specializations are bound (see `Templates`_); they are
-  auto-discovered from signatures or listed explicitly. Member function templates are
-  unsupported, explicit instantiation definitions are not auto-detected, and the
+  auto-discovered from signatures or listed explicitly. Member function templates
+  (including templated constructors and conversion operators) are unsupported and are
+  *gracefully skipped*, explicit instantiation definitions are not auto-detected, and the
   header-only path does not diagnose a missing std caster used *only* by a discovered
   specialization's members (it surfaces at bind time); the codegen path emits it.
 - **Default-argument values** are not bound — a standard limitation, not a binder
