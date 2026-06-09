@@ -16,6 +16,8 @@
             [[=r::rename{"size"}]] int get_size() const;   // bound as "size"
             [[=r::reference_internal]] Buffer& buffer();    // return policy
             [[=r::doc{"Reset to defaults."}]] void reset();
+            [[=r::property{"value"}]] int  value() const;   // a Python property
+            [[=r::property{"value"}]] void value(int);      //   (getter + setter)
         };
 
         [[=r::keep_alive{0, 1}]] Child* make_child(Parent&);  // tie lifetimes
@@ -65,6 +67,17 @@ template <unsigned N> struct doc {
     consteval doc(const char (&s)[N]) : str(s) {}
 };
 template <unsigned N> doc(const char (&)[N]) -> doc<N>;
+
+/// Bind a getter/setter pair as a Python property. Annotate BOTH accessors with the
+/// same name: [[=r::property{"value"}]]. The string is the Python property name and
+/// the grouping key; within a group the parameter-less method is the getter and the
+/// one-parameter method the setter. Annotate only the getter for a read-only
+/// property. The getter's return-policy / doc annotations apply to the property.
+template <unsigned N> struct property {
+    fixed_string<N> str;
+    consteval property(const char (&s)[N]) : str(s) {}
+};
+template <unsigned N> property(const char (&)[N]) -> property<N>;
 
 /// Return-value ownership/lifetime policy (mirrors nanobind::rv_policy).
 enum class lifetime {

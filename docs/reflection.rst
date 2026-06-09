@@ -406,9 +406,39 @@ Available annotations:
   a function or method.
 - ``keep_alive{nurse, patient}`` — tie one argument's/return's lifetime to another
   (index 0 = return, 1 = ``self`` / first argument, ...; see nanobind's ``keep_alive``).
+- ``property{"name"}`` — bind a getter/setter pair as a Python property (see `Properties`_).
 
 Annotations are read at compile time; an unannotated entity uses the defaults, so adding
 annotations is purely incremental.
+
+Properties
+----------
+
+Annotate a getter/setter pair with the same ``property`` name to bind a Python
+``@property`` instead of two methods. The parameter-less accessor is the getter and the
+one-parameter accessor the setter; annotate only the getter for a read-only property.
+The C++ accessor names are irrelevant (the property name comes from the annotation), and
+the getter's return-policy / docstring annotations apply to the property:
+
+.. code-block:: cpp
+
+   struct Thermo {
+       double c_;
+       [[=r::property{"celsius"}]] double celsius() const { return c_; }    // getter
+       [[=r::property{"celsius"}]] void   celsius(double v) { c_ = v; }     // setter
+       [[=r::property{"fahrenheit"}]] double to_f() const { return c_*9/5+32; } // read-only
+   };
+
+.. code-block:: python
+
+   t = Thermo()
+   t.celsius = 100        # setter
+   assert t.celsius == 100 and t.fahrenheit == 212
+   t.fahrenheit = 0       # AttributeError -- read-only
+
+The accessors are bound via pointer-to-member (so no spliced type enters a lambda
+signature). Pairing is annotation-driven only; getter/setter *name-convention* sniffing
+(``getX``/``setX``) is intentionally not done.
 
 Limitations
 -----------

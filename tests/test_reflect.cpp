@@ -330,6 +330,18 @@ Vec operator*(double s, const Vec& v) { return Vec(s * v.x, s * v.y); }
 // Comparison free operator -> __eq__.
 bool operator==(const Vec& a, const Vec& b) { return a.x == b.x && a.y == b.y; }
 
+// --- Properties from getter/setter pairs ([[=r::property]]) ---
+
+struct Thermo {
+    double c_;
+    Thermo() : c_(0) {}
+    // Read-write property via an overloaded accessor name.
+    [[=r::property{"celsius"}]] double celsius() const { return c_; }   // getter
+    [[=r::property{"celsius"}]] void   celsius(double v) { c_ = v; }    // setter
+    // Read-only property, with a C++ accessor name unrelated to the property name.
+    [[=r::property{"fahrenheit"}]] double to_f() const { return c_ * 9.0 / 5.0 + 32.0; }
+};
+
 } // namespace reflect_test
 
 // The trampoline lives OUTSIDE the reflected namespace so reflect_ does not try

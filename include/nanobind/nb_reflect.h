@@ -94,6 +94,29 @@ consteval const char* entity_doc() {
     return ann_string_or<R, ^^reflect::doc>(nullptr);
 }
 
+// Property name annotated on R via [[=r::property{"name"}]], or nullptr if R is not
+// a property accessor.
+template <std::meta::info R>
+consteval const char* prop_name() {
+    return ann_string_or<R, ^^reflect::property>(nullptr);
+}
+template <std::meta::info R>
+consteval bool is_property_accessor() {
+    return prop_name<R>() != nullptr;
+}
+// A property accessor taking no parameters is the getter (the 1-parameter one is the
+// setter); a read-only property annotates only the getter. (Kept in consteval helpers
+// so parameters_of()'s vector is consumed within one constant evaluation -- an inline
+// parameters_of().size() in an if-constexpr condition is not a constant expression.)
+template <std::meta::info fn>
+consteval bool is_property_getter() {
+    return is_property_accessor<fn>() && std::meta::parameters_of(fn).size() == 0;
+}
+template <std::meta::info fn>
+consteval bool is_property_setter() {
+    return is_property_accessor<fn>() && std::meta::parameters_of(fn).size() == 1;
+}
+
 // Invoke `f` with R's docstring as a single const char* extra when [[=r::doc]] is
 // present, or with no extra otherwise; returns f(...)'s result. Lets class_/enum_
 // construction add an optional docstring without doubling its branch count -- the
@@ -673,6 +696,49 @@ void bind_free_operators(auto& cls) {
     }
 }
 
+// --- Properties (getter/setter pairs marked [[=r::property{"name"}]]) ---
+
+// The setter paired with property getter `getter` in class T: a property accessor
+// taking one parameter whose property name matches the getter's, or ^^void if none
+// (a read-only property). Uses an internal `template for` because reading each
+// candidate's property-name annotation requires a constexpr reflection.
+template <typename T, std::meta::info getter>
+consteval std::meta::info find_property_setter() {
+    constexpr std::string_view gname = prop_name<getter>();
+    std::meta::info found = ^^void;
+    template for (constexpr auto fn : std::define_static_array(
+            std::meta::members_of(^^T, std::meta::access_context::unchecked()))) {
+        if constexpr (is_property_setter<fn>()) {
+            if (std::string_view(prop_name<fn>()) == gname)
+                found = fn;
+        }
+    };
+    return found;
+}
+
+// Bind one property from its getter and (optional) setter. Uses pointer-to-member-
+// functions (&[:getter:] / &[:setter:]) -- like data members use &[:mem:] -- so no
+// lambda names a spliced type (clang-p2996 mangler rule). getter/setter are template
+// parameters (not captured locals): a std::meta::info is a consteval-only type and
+// cannot be captured by the runtime extras lambda. The getter's return-policy / doc
+// annotations are threaded via with_data_extras.
+template <std::meta::info getter, std::meta::info setter>
+void reflect_bind_property_impl(auto& cls) {
+    constexpr auto name = prop_name<getter>();
+    with_data_extras<getter>([&](auto&&... e) {
+        if constexpr (setter == ^^void)
+            cls.def_prop_ro(name, &[:getter:], std::forward<decltype(e)>(e)...);
+        else
+            cls.def_prop_rw(name, &[:getter:], &[:setter:],
+                            std::forward<decltype(e)>(e)...);
+    });
+}
+
+template <typename T, std::meta::info getter>
+void reflect_bind_property(auto& cls) {
+    reflect_bind_property_impl<getter, find_property_setter<T, getter>()>(cls);
+}
+
 // Route a public member function to the right binder. Operators and conversion
 // functions have no identifier, so they must be detected before reflect_bind_method
 // (which names the binding via identifier_of).
@@ -680,6 +746,8 @@ template <typename T, std::meta::info fn>
 void reflect_bind_member_function(auto& cls) {
     if constexpr (has_ann<fn, reflect::skip>())
         return;  // explicitly excluded
+    else if constexpr (is_property_accessor<fn>())
+        return;  // getter/setter handled by the property pass, not as a method
     else if constexpr (std::meta::is_operator_function(fn))
         reflect_bind_operator<T, fn>(cls);
     else if constexpr (std::meta::is_conversion_function(fn))
@@ -726,7 +794,8 @@ void bind_class_contents(auto& cls) {
         }
     };
 
-    // Bind methods (instance, static, operators, conversions)
+    // Bind methods (instance, static, operators, conversions). Property accessors are
+    // skipped here (see reflect_bind_member_function) and bound by the pass below.
     template for (constexpr auto fn :
         std::define_static_array(std::meta::members_of(
             ^^T, std::meta::access_context::unchecked()))) {
@@ -736,6 +805,17 @@ void bind_class_contents(auto& cls) {
             && !std::meta::is_destructor(fn)
             && !std::meta::is_special_member_function(fn)) {
             reflect_bind_member_function<T, fn>(cls);
+        }
+    };
+
+    // Bind properties from [[=r::property{"name"}]] getter/setter pairs.
+    template for (constexpr auto fn :
+        std::define_static_array(std::meta::members_of(
+            ^^T, std::meta::access_context::unchecked()))) {
+        if constexpr (std::meta::is_function(fn)
+            && std::meta::is_public(fn)
+            && is_property_getter<fn>()) {
+            reflect_bind_property<T, fn>(cls);
         }
     };
 }

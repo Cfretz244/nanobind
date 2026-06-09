@@ -395,3 +395,26 @@ def test32_free_operators():
     # Free operator== -> __eq__.
     assert a == t.Vec(1.0, 2.0)
     assert not (a == b)
+
+
+@needs_reflect
+def test34_properties():
+    th = t.Thermo()
+
+    # Read-write property: get + set go through the C++ accessor pair.
+    th.celsius = 100.0
+    assert th.celsius == 100.0
+    th.celsius = 0.0
+    assert th.celsius == 0.0
+
+    # Read-only property (getter only) reflects the underlying state.
+    th.celsius = 100.0
+    assert th.fahrenheit == 212.0
+    with pytest.raises(AttributeError):
+        th.fahrenheit = 0.0          # no setter -> read-only
+
+    # The raw accessor methods are consumed by the property, not exposed as methods.
+    assert not hasattr(th, "to_f")
+    assert not callable(th.celsius)  # 'celsius' is now a value, not a method
+    assert isinstance(type(th).celsius, property)
+    assert isinstance(type(th).fahrenheit, property)
