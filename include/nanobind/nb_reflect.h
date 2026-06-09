@@ -343,7 +343,11 @@ void reflect_bind_member(auto& cls) {
         // [:type_of(mem):] crashes the clang-p2996 mangler when passed to the
         // dependent `cls.def_*` call (placeholder-type mangling at parse time).
         with_data_extras<mem>([&](auto&&... e) {
-            if constexpr (std::meta::is_const_type(std::meta::type_of(mem)))
+            // def_rw's setter assigns (`c.*p = value`), so a const or non-copy-assignable
+            // member (e.g. a move-only `node_handle` inside absl's insert_return_type) is
+            // exposed read-only via def_ro instead of breaking the build.
+            if constexpr (std::meta::is_const_type(std::meta::type_of(mem)) ||
+                          !std::meta::is_copy_assignable_type(std::meta::type_of(mem)))
                 cls.def_ro(name, &[:mem:], std::forward<decltype(e)>(e)...);
             else
                 cls.def_rw(name, &[:mem:], std::forward<decltype(e)>(e)...);
