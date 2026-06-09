@@ -191,8 +191,14 @@ consteval std::string gen_override(std::meta::info m) {
 }
 
 // Emit the trampoline struct + registration for `cls`, or "" if it has no
-// overridable virtuals.
-consteval std::string emit_one_class(std::meta::info cls) {
+// overridable virtuals or was already emitted. `seen` holds the trampoline
+// struct names emitted so far and is threaded across the whole emit_trampolines
+// run, so a class reachable from more than one reflected arg (e.g. a virtual
+// detail:: type pulled in by both `^^nlohmann::json` and a helper namespace that
+// returns json) is emitted exactly once — otherwise the generated header has a
+// C++ redefinition and fails to compile.
+consteval std::string emit_one_class(std::meta::info cls,
+                                     std::vector<std::string>& seen) {
     std::vector<std::meta::info> virts = overridable_virtuals(cls);
     if (virts.empty())
         return "";
@@ -201,6 +207,10 @@ consteval std::string emit_one_class(std::meta::info cls) {
     // name drops the non-identifier chars in a template-id ("<", ">", ",", " ").
     std::string cq = type_spelling(cls);
     std::string tname = "Tramp" + sanitize_identifier(cq);
+
+    if (str_vec_contains(seen, tname))
+        return "";
+    seen.push_back(tname);
 
     std::string s = "namespace nanobind { namespace reflect_generated {\n";
     s += "struct " + tname + " : " + cq + " {\n";
@@ -214,19 +224,20 @@ consteval std::string emit_one_class(std::meta::info cls) {
 }
 
 // Recurse into a namespace (or handle a single class) and emit trampolines.
-consteval std::string emit_subtree(std::meta::info r) {
+consteval std::string emit_subtree(std::meta::info r,
+                                   std::vector<std::string>& seen) {
     std::string s;
     if (std::meta::is_namespace(r)) {
         for (auto mem :
              std::meta::members_of(r, std::meta::access_context::unchecked())) {
             if (std::meta::is_type(mem) && std::meta::is_class_type(mem) &&
                 !std::meta::is_template(mem))
-                s += emit_one_class(mem);
+                s += emit_one_class(mem, seen);
             else if (std::meta::is_namespace(mem))
-                s += emit_subtree(mem);
+                s += emit_subtree(mem, seen);
         }
     } else if (std::meta::is_type(r) && std::meta::is_class_type(r)) {
-        s += emit_one_class(r);
+        s += emit_one_class(r, seen);
     }
     return s;
 }
@@ -234,12 +245,13 @@ consteval std::string emit_subtree(std::meta::info r) {
 // Emit a trampoline (when needed) for every user class-template specialization
 // reachable from r's signatures. Specializations are not namespace members, so
 // emit_subtree never reaches them; this covers a templated class with virtuals
-// (e.g. Processor<int>). required_user_specs is de-duplicated, so each is emitted
-// once.
-consteval std::string emit_spec_classes(std::meta::info r) {
+// (e.g. Processor<int>). required_user_specs is de-duplicated per call; `seen`
+// additionally de-duplicates across reflected args and against emit_subtree.
+consteval std::string emit_spec_classes(std::meta::info r,
+                                        std::vector<std::string>& seen) {
     std::string s;
     for (auto spec : required_user_specs(r))
-        s += emit_one_class(spec);
+        s += emit_one_class(spec, seen);
     return s;
 }
 
@@ -288,10 +300,13 @@ consteval const char* emit_trampolines() {
         "#include <nanobind/trampoline.h>\n";
     ((out += detail::codegen::emit_stl_includes(Rs)), ...);
     out += "\n";
-    ((out += detail::codegen::emit_subtree(Rs)), ...);
+    // One `seen` set across every reflected arg and both emission passes, so each
+    // trampoline struct is emitted exactly once (no redefinition in the header).
+    std::vector<std::string> seen;
+    ((out += detail::codegen::emit_subtree(Rs, seen)), ...);
     // Trampolines for discovered template specializations (not namespace members,
     // so emit_subtree misses them).
-    ((out += detail::codegen::emit_spec_classes(Rs)), ...);
+    ((out += detail::codegen::emit_spec_classes(Rs, seen)), ...);
     return std::define_static_string(out);
 }
 

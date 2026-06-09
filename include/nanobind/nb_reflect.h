@@ -985,6 +985,24 @@ consteval bool is_in_std(std::meta::info e) {
     return false;
 }
 
+// True if a class type (or, for a specialization, its primary template) carries a
+// [[=reflect::skip]] annotation. Defined here (before the STL-caster and user-spec
+// collection walks that use it) so a skip-annotated type can be treated as opaque
+// throughout. Annotating a class template skips ALL of its specializations.
+consteval bool is_skip_annotated(std::meta::info e) {
+    e = std::meta::remove_cvref(e);
+    while (std::meta::is_pointer_type(e))
+        e = std::meta::remove_cvref(std::meta::remove_pointer(e));
+    // Only class types carry a [[=reflect::skip]] we care about; querying
+    // annotations_of on a non-class entity is not meaningful and must be avoided
+    // (this runs in the arbitrary-type STL/spec walks).
+    if (!std::meta::is_type(e) || !std::meta::is_class_type(e))
+        return false;
+    if (!std::meta::annotations_of(e, ^^reflect::skip).empty())
+        return true;
+    return false;
+}
+
 // If `type` is a std template instantiation nanobind covers with a caster header,
 // return that header path; otherwise nullptr. cv/ref-qualifiers are ignored.
 consteval const char* stl_caster_header(std::meta::info type) {
@@ -1048,6 +1066,11 @@ consteval void collect_stl_types(std::meta::info type,
                                  std::vector<std::meta::info>& out,
                                  std::vector<std::meta::info>& visited) {
     type = std::meta::remove_cvref(type);
+    // A [[=reflect::skip]] type is opaque: do not walk its template arguments for
+    // STL casters (e.g. nlohmann's output_adapter<uint8_t> resolves its default
+    // StringType to the un-castable std::basic_string<unsigned char>).
+    if (is_skip_annotated(type))
+        return;
     if (!std::meta::has_template_arguments(type))
         return;
     if (info_vec_contains(visited, type))
@@ -1146,6 +1169,10 @@ consteval bool is_user_class_template_spec(std::meta::info type) {
         return false;
     auto tmpl = std::meta::template_of(type);
     if (!std::meta::has_identifier(tmpl))
+        return false;
+    // A [[=reflect::skip]] on the type or its template excludes it from transitive
+    // user-spec discovery (so it is neither pre-bound nor walked for STL casters).
+    if (is_skip_annotated(type))
         return false;
     return !is_in_std(tmpl);
 }

@@ -90,7 +90,7 @@ template <typename T> constexpr auto optional_name(const T &v) {
     return const_name("typing.Optional[") + v + const_name("]");
 }
 template <typename... Ts> constexpr auto union_name(const Ts&... vs) {
-    return const_name("typing.Union[") + concat(vs...) + const_name("]");
+    return const_name("typing.Union[") + (concat)(vs...) + const_name("]");
 }
 #else
 template <typename T> constexpr auto optional_name(const T &v) {
@@ -121,10 +121,20 @@ constexpr descr<N, Ts...> concat(const descr<N, Ts...> &descr) { return descr; }
 template <size_t N, typename... Ts>
 constexpr descr<N, Ts...> concat_maybe(const descr<N, Ts...> &descr) { return descr; }
 
+// NOTE: this multi-argument `concat` is written as a FOLD over `operator+`
+// rather than as a self-recursive call, on purpose. A `descr<N, Ts...>` carries
+// the bound C++ types `Ts...` as template arguments, so a `descr` value's
+// associated namespaces include those types' namespaces. The original
+// `concat(d, args...) -> ... + concat(args...)` recursion resolved its own
+// recursive call via ADL at instantiation; if a bound type lived in a namespace
+// that also defined `concat` (e.g. nlohmann::detail::concat), ADL hijacked the
+// call and produced a hard error far from any user code. A fold over `operator+`
+// avoids the recursive name lookup entirely (descr's `operator+` lives in
+// nanobind::detail and is not shadowed by foreign overloads), so no ADL hijack
+// is possible. Expansion: `((d + (", " + a0)) + (", " + a1)) + ...`.
 template <size_t N, typename... Ts, typename... Args>
-constexpr auto concat(const descr<N, Ts...> &d, const Args &...args)
-    -> decltype(std::declval<descr<N + 2, Ts...>>() + concat(args...)) {
-    return d + const_name(", ") + concat(args...);
+constexpr auto concat(const descr<N, Ts...> &d, const Args &...args) {
+    return (d + ... + (const_name(", ") + args));
 }
 
 template <typename... Args>
