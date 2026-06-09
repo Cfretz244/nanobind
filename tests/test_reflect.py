@@ -315,6 +315,17 @@ def test27b_widest_int_conversion():
 
 
 @needs_reflect
+def test27c_move_only_by_value_param_skipped():
+    # An overload taking a move-only class type BY VALUE is skipped (the class
+    # caster cannot produce it); sibling overloads and the class still bind.
+    s = t.Sink()
+    s.put(5)
+    assert s.get() == 5
+    with pytest.raises(TypeError):
+        s.put(t.MoveOnlyBuf())   # only the int overload exists
+
+
+@needs_reflect
 def test26_function_qualifiers():
     q = t.Quals()
     # noexcept / const noexcept / lvalue-ref-qualified methods are bound.

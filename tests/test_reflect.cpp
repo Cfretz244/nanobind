@@ -279,6 +279,23 @@ struct Ops {
 // to bind it, last-bound silently winning -- `int`, declared after `long long`
 // here, would truncate). bool still binds __bool__. Mirrors absl::int128's
 // operator char/int/long/... cluster.
+// A by-value parameter of a move-only class type cannot be produced by
+// nanobind's generic class caster (it copies out of caster storage), so such
+// overloads are skipped while their siblings still bind (BINDER-0010; the real
+// case is absl::Cord::Append(absl::CordBuffer)).
+struct MoveOnlyBuf {
+    MoveOnlyBuf() = default;
+    MoveOnlyBuf(const MoveOnlyBuf&) = delete;
+    MoveOnlyBuf(MoveOnlyBuf&&) = default;
+};
+struct Sink {
+    int n;
+    Sink() : n(0) {}
+    void put(MoveOnlyBuf) { ++n; }   // skipped: by-value move-only param
+    void put(int v) { n += v; }      // stays: ordinary overload
+    int get() const { return n; }
+};
+
 struct ManyConv {
     long long v;
     ManyConv() : v(0) {}

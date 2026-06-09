@@ -470,6 +470,24 @@ NB_REFLECT_DEFINE_FREE_BINDER(noexcept)
 
 #undef NB_REFLECT_DEFINE_FREE_BINDER
 
+// True if fn has a by-value parameter of a non-copy-constructible class type.
+// nanobind's generic class caster produces a by-value argument with a COPY out of
+// the caster's storage (`operator T()`), so binding such an overload is a hard
+// compile error -- e.g. absl::Cord::Append(absl::CordBuffer) (move-only buffer
+// taken by value). Such functions are gracefully skipped, mirroring the
+// non-copy-assignable-member -> def_ro fallback (BINDER-0010, found via Abseil).
+consteval bool has_move_only_by_value_param(std::meta::info fn) {
+    for (auto p : std::meta::parameters_of(fn)) {
+        auto t = std::meta::type_of(p);
+        if (std::meta::is_reference_type(t) || std::meta::is_pointer_type(t))
+            continue;
+        auto c = std::meta::remove_cv(t);
+        if (std::meta::is_class_type(c) && !std::meta::is_copy_constructible_type(c))
+            return true;
+    }
+    return false;
+}
+
 template <std::meta::info fn>
 void reflect_free_function(module_& m) {
     // Skip C-variadic free functions (their function type matches no binder), and
@@ -479,6 +497,7 @@ void reflect_free_function(module_& m) {
     // IS bindable, so admit it via has_template_arguments (entity_name then derives
     // the CamelCase spec name from the template).
     if constexpr (!std::meta::has_ellipsis_parameter(fn) &&
+                  !has_move_only_by_value_param(fn) &&
                   (std::meta::has_identifier(fn) ||
                    std::meta::has_template_arguments(fn))) {
         using FnType = [:std::meta::type_of(fn):];
@@ -519,7 +538,8 @@ void reflect_bind_ctor_expand(auto& cls, std::index_sequence<Is...>) {
 
 template <std::meta::info ctor>
 void reflect_bind_ctor(auto& cls) {
-    if constexpr (!has_ann<ctor, reflect::skip>())
+    if constexpr (!has_ann<ctor, reflect::skip>()
+                  && !has_move_only_by_value_param(ctor))
         reflect_bind_ctor_expand<ctor>(cls, std::make_index_sequence<ctor_param_count<ctor>()>{});
 }
 
@@ -859,7 +879,8 @@ consteval bool is_bindable_free_operator() {
         || !std::meta::is_operator_function(fn)
         || std::meta::is_template(fn)
         || std::meta::has_ellipsis_parameter(fn)
-        || involves_stream_type(fn))
+        || involves_stream_type(fn)
+        || has_move_only_by_value_param(fn))
         return false;
     std::size_t n = std::meta::parameters_of(fn).size();
     return n == 1 || n == 2;
@@ -955,6 +976,8 @@ template <typename T, std::meta::info fn>
 void reflect_bind_member_function(auto& cls) {
     if constexpr (has_ann<fn, reflect::skip>())
         return;  // explicitly excluded
+    else if constexpr (has_move_only_by_value_param(fn))
+        return;  // by-value move-only param: the class caster cannot produce it
     else if constexpr (is_property_accessor<fn>())
         return;  // getter/setter handled by the property pass, not as a method
     else if constexpr (std::meta::is_operator_function(fn))
