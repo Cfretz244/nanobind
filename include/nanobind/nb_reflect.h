@@ -17,6 +17,7 @@
 #include "nanobind.h"
 #include "nb_reflect_annotations.h"
 #include "stl/string.h"
+#include <sstream>          // std::ostringstream for streamable -> __str__ (bind_stream_str)
 #include <string_view>
 #include <type_traits>
 #include <vector>
@@ -330,7 +331,12 @@ void with_arg_call_extras(F&& emit) {
 
 template <typename T, std::meta::info mem>
 void reflect_bind_member(auto& cls) {
-    if constexpr (!has_ann<mem, reflect::skip>()) {
+    // Skip [[=reflect::skip]] members and C-array-typed members. An array data member
+    // (e.g. an internal `T storage[N]`, as in absl::FixedArray's storage wrapper) has no
+    // def_rw-able form: the setter `c.*p = value` is ill-formed for an array, and even
+    // def_ro can't expose it usefully. Mirrors the unnamed/volatile/template member skips.
+    if constexpr (!has_ann<mem, reflect::skip>()
+                  && !std::meta::is_array_type(std::meta::type_of(mem))) {
         constexpr auto name = entity_name<mem>();
         // Bind via a pointer-to-data-member (&[:mem:]) rather than getter/setter
         // lambdas: a lambda whose signature mentions the spliced member type
@@ -753,6 +759,34 @@ NB_REFLECT_DEFINE_FREE_OP_BINDER(noexcept)
 
 #undef NB_REFLECT_DEFINE_FREE_OP_BINDER
 
+// True if any parameter of fn is a std::basic_ostream / basic_istream / basic_iostream — i.e.
+// fn is a stream I/O operator such as `operator<<(std::ostream&, T)`. nanobind has no caster for
+// stream types (and they're typically incomplete at the binding site), so such free operators are
+// NOT bound as dunders; a class's streamability is surfaced as __str__ instead (bind_stream_str).
+// Keyed on the OPERAND type, not the operator symbol, so a genuine shift like
+// `operator<<(absl::int128, int)` is untouched and still maps to __lshift__.
+// True if `type` is a std::basic_ostream / basic_istream / basic_iostream (after stripping
+// reference/cv and resolving the std::ostream/std::istream typedefs). nanobind has no caster for
+// stream types, and recursing into the (often incomplete) basic_ostream breaks the caster walk.
+consteval bool is_stream_type(std::meta::info type) {
+    std::string_view n = std::meta::display_string_of(
+        std::meta::dealias(std::meta::remove_cvref(type)));
+    return n.find("basic_ostream") != std::string_view::npos ||
+           n.find("basic_istream") != std::string_view::npos ||
+           n.find("basic_iostream") != std::string_view::npos;
+}
+
+// True if any parameter of fn is a stream type — i.e. fn is a stream I/O operator such as
+// operator<<(std::ostream&, T). Such free operators are NOT bound as dunders (a class's
+// streamability is surfaced as __str__ instead, see bind_stream_str); keyed on the OPERAND type,
+// not the operator symbol, so a genuine shift like operator<<(absl::int128, int) is untouched.
+consteval bool involves_stream_type(std::meta::info fn) {
+    for (std::meta::info p : std::meta::parameters_of(fn))
+        if (is_stream_type(std::meta::type_of(p)))
+            return true;
+    return false;
+}
+
 // True if fn is a binary namespace-scope operator the binder can attach as a dunder.
 // Kept in a consteval helper so the vector from parameters_of() is fully consumed
 // within one constant evaluation (an inline parameters_of().size() in the if-constexpr
@@ -763,6 +797,7 @@ consteval bool is_bindable_free_operator() {
         && std::meta::is_operator_function(fn)
         && !std::meta::is_template(fn)
         && !std::meta::has_ellipsis_parameter(fn)
+        && !involves_stream_type(fn)
         && std::meta::parameters_of(fn).size() == 2;
 }
 
@@ -770,6 +805,26 @@ consteval bool is_bindable_free_operator() {
 // onto T's class_ (`cls`). Runs once per class (reflect_class is idempotent), so a
 // given (class, operator, side) pair binds exactly once. O(classes x namespace
 // members); fine at this prove-out's scale.
+// If T is insertable into a std::ostream (via a member or free `operator<<(ostream&, T)`),
+// surface that as Python __str__: format through a std::ostringstream and return the resulting
+// std::string. This makes str(x) work for streamable C++ types (absl::int128, absl::Duration,
+// absl::Status, ...) WITHOUT ever exposing std::ostream to Python — sidestepping both the
+// no-ostream-caster problem and the incomplete-basic_ostream compile error that binding the
+// stream operator as a dunder would hit. Guarded by a requires-expression (only binds when
+// actually streamable); the lambda keeps T (a real template parameter, not a splice) in its
+// signature, avoiding the clang-p2996 spliced-signature mangler crash; the `oss << self` call
+// resolves the operator by ADL in the lambda body.
+template <typename T>
+void bind_stream_str(auto& cls) {
+    if constexpr (requires(std::ostream& os, const T& t) { os << t; }) {
+        cls.def("__str__", [](const T& self) {
+            std::ostringstream oss;
+            oss << self;
+            return oss.str();
+        });
+    }
+}
+
 template <typename T>
 void bind_free_operators(auto& cls) {
     constexpr auto scope = std::meta::parent_of(^^T);
@@ -1388,6 +1443,9 @@ void reflect_class(module_& m) {
     // Attach namespace-scope operators that take T as an operand (e.g. a free
     // operator+(T, T) or a scalar operator*(double, T)) as dunders on T.
     bind_free_operators<T>(cls);
+    // If T is ostream-insertable, expose str(x) via __str__ (the stream operator itself is
+    // not bound as a dunder — see involves_stream_type / bind_stream_str).
+    bind_stream_str<T>(cls);
 }
 
 template <typename E>

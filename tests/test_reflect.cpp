@@ -330,6 +330,14 @@ Vec operator*(double s, const Vec& v) { return Vec(s * v.x, s * v.y); }
 // Comparison free operator -> __eq__.
 bool operator==(const Vec& a, const Vec& b) { return a.x == b.x && a.y == b.y; }
 
+// --- Array data members are skipped (BINDER-0006); scalar siblings still bind. ---
+
+struct WithArray {
+    int arr[3];          // C-array member -> skipped (not def_rw-able)
+    int scalar;          // ordinary member -> bound
+    WithArray() : arr{1, 2, 3}, scalar(7) {}
+};
+
 // --- Properties from getter/setter pairs ([[=r::property]]) ---
 
 struct Thermo {
@@ -343,6 +351,24 @@ struct Thermo {
 };
 
 } // namespace reflect_test
+
+// --- Streamable: free operator<<(ostream&, T) -> __str__ (BINDER-0007), while a genuine
+//     operator<<(T, int) shift still maps to __lshift__. Reflected as a TYPE (^^stream_test::
+//     Streamable), mirroring how a real streamable library value (e.g. absl::int128) is bound.
+namespace stream_test {
+
+struct Streamable {
+    int v;
+    Streamable() : v(0) {}
+    explicit Streamable(int v) : v(v) {}
+};
+
+// Stream-insertion: surfaced as Python __str__ (NOT bound as a dunder; operand is a stream).
+inline std::ostream& operator<<(std::ostream& os, const Streamable& s) { return os << "S(" << s.v << ")"; }
+// A genuine left-shift on the value type -> __lshift__ (operand types are both bindable).
+inline Streamable operator<<(const Streamable& s, int n) { return Streamable(s.v << n); }
+
+} // namespace stream_test
 
 // The trampoline lives OUTSIDE the reflected namespace so reflect_ does not try
 // to bind it as a class; it is wired in only via NB_REFLECT_TRAMPOLINE.
@@ -459,5 +485,6 @@ NB_MODULE(test_reflect_ext, m) {
     // identity<int> is a free-function-template specialization, also explicit-only.
     nb::reflect_<^^reflect_test, ^^template_test,
                  ^^template_test::Box<float>,
-                 ^^template_test::identity<int>>(m);
+                 ^^template_test::identity<int>,
+                 ^^stream_test::Streamable>(m);
 }

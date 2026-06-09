@@ -51,14 +51,18 @@ thing that cannot be expressed in-language (a virtual-override **trampoline**) h
 ## What works today (each landed as its own commit on `mk-reflect`)
 
 - Classes: public constructors, data members (`def_rw`/`def_ro` via pointer-to-member),
-  static data, methods, static methods — including overloads.
+  static data, methods, static methods — including overloads. Unnamed (anonymous-union) and
+  C-array (`T[N]`) data members are gracefully skipped (neither is `def_rw`-able).
 - **Function-type matching**: `const`, `noexcept`, and lvalue-ref-qualified (`&`) methods.
   `volatile`, rvalue-ref (`&&`), and C-variadic functions are gracefully skipped.
 - **Operators → Python dunders** (`__add__`, `__eq__`, `__call__`, `__getitem__`,
   `__neg__`, in-place with identity preserved, …); conversion ops → `__bool__`/`__int__`/
   `__float__`. Bound with `nb::is_operator()`. **Binary free operators** too: forward dunder on
   the left operand's class, reversed dunder (`__radd__` …, swapped comparison) on the right —
-  so `2.0 * vec` works (`bind_free_operators` scans `parent_of(^^T)` during class binding).
+  so `2.0 * vec` works (`bind_free_operators` scans `parent_of(^^T)` during class binding). A
+  free **stream-insertion** `operator<<(std::ostream&, T)` is surfaced as Python `__str__`
+  (formatted via `std::ostringstream`, see `bind_stream_str`), not as a shift dunder; a genuine
+  `operator<<(T, int)` shift still maps to `__lshift__` (the guard keys on the operand type).
 - **Enums** → `nb::enum_` with all values.
 - **Inheritance**: first public base → real Python base (`class_<T, Base>`, bound
   transitively + idempotently); additional bases' members **flattened** onto the derived

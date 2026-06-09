@@ -260,6 +260,13 @@ expression such as ``2.0 * vec`` work when only the right operand is a bound typ
    2.0 * v     # operator*(double, Vec), via __rmul__
    a + b       # operator+(Vec, Vec)
 
+**Stream insertion → ``__str__``.** A free ``operator<<(std::ostream&, const T&)`` is *not*
+bound as a shift dunder (a ``std::ostream`` has no Python representation). Instead, if ``T`` is
+ostream-insertable, the binder exposes ``str(obj)`` via ``__str__``, formatting through a
+``std::ostringstream``. The check is on the operand type, so a genuine value shift such as
+``operator<<(T, int)`` still maps to ``__lshift__``. (Stream *extraction*, ``operator>>`` /
+``std::istream``, has no clean Python analog and is skipped.)
+
 Skipped: ``operator<=>``, ``++``/``--``, ``operator->``, logical ``&&``/``||``/``!``,
 and assignment ``operator=``.
 
@@ -526,6 +533,8 @@ Limitations
   glm's ``vec`` swizzle aliasing) are skipped: no pointer-to-member can be formed for
   an anonymous-union member, so they cannot be exposed by name. The class still binds
   (constructors, ``operator[]``, methods, etc.).
+- **C-array data members** (``T arr[N]``) are skipped: an array member is not assignable,
+  so ``def_rw`` cannot bind it. The rest of the class still binds.
 - ``volatile`` methods, rvalue-ref-qualified (``&&``) methods, and C-variadic
   (``...``) functions are skipped (they cannot bind meaningfully to a persistent
   Python object); the rest of the class still binds.

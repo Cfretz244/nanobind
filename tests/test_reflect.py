@@ -398,6 +398,28 @@ def test32_free_operators():
 
 
 @needs_reflect
+def test32b_array_member_skipped():
+    # BINDER-0006: a C-array data member has no def_rw-able form, so it is skipped while
+    # ordinary scalar members still bind.
+    w = t.WithArray()
+    assert hasattr(w, 'scalar')
+    assert w.scalar == 7
+    assert not hasattr(w, 'arr')
+
+
+@needs_reflect
+def test32c_stream_operator_to_str():
+    # BINDER-0007: a free operator<<(ostream&, T) is surfaced as Python __str__ (formatted via
+    # std::ostringstream), NOT bound as a dunder; a genuine operator<<(T, int) shift still maps
+    # to __lshift__.
+    s = t.Streamable(5)
+    assert str(s) == "S(5)"               # via the stream-insertion operator
+    assert (s << 1).v == 10               # genuine left-shift -> __lshift__
+    # The stream operator did not leak in as a left/right shift dunder taking a stream.
+    assert not hasattr(s, '__rlshift__')
+
+
+@needs_reflect
 def test34_properties():
     th = t.Thermo()
 
