@@ -22,9 +22,9 @@ functions, and enums with reflection and emits ordinary `nb::class_<T>().def(...
 thing that cannot be expressed in-language (a virtual-override **trampoline**) has a
 **text-codegen fallback**.
 
-> Requires a C++26/P2996 compiler. Build everything with the from-source clang-p2996
-> toolchain at `~/llvm-toolchain` (see "Building & testing" — these are exact, this-laptop
-> instructions).
+> Requires a C++26/P2996 compiler. Build everything with the umbrella repo's repo-local
+> from-source clang-p2996 toolchain at `../toolchain` (see "Building & testing" — these are
+> exact, this-laptop instructions).
 
 ## Where the implementation lives
 
@@ -112,44 +112,48 @@ trampoline hardening for final/ref-qualified virtuals.
 
 ## Building & testing (exact, this laptop)
 
-Toolchain: `~/llvm-toolchain` (the from-source clang-p2996, built from `~/git/llvm-project`).
-Python: Homebrew `python3.12` (system `/usr/bin/python3` lacks dev headers). A venv with
-pytest lives at `/tmp/nbvenv`; the CMake build tree at `/tmp/nbbuild` (both under `/tmp` —
-recreate if cleared, see below).
+Everything is self-contained in the umbrella repo `~/git/cpp26-reflect-nanobind`, which pins
+this checkout as its `nanobind/` submodule: the toolchain at `<umbrella>/toolchain` (the
+from-source clang-p2996, built from the umbrella's `llvm-project/` submodule), the venv at
+`<umbrella>/.venv` (Homebrew `python3.12` — system `/usr/bin/python3` lacks dev headers), and
+the CMake build tree at `<umbrella>/build`. **Do not use the old `~/llvm-toolchain`,
+`~/git/nanobind`, `~/git/llvm-project`, `/tmp/nbvenv`, or `/tmp/nbbuild`** — those predate the
+self-contained umbrella repo.
 
-Fast front-end check (no build/link):
+Fast front-end check (no build/link; run from this directory):
 
 ```bash
-TC=~/llvm-toolchain
+TC=../toolchain
 PYINC=$(/opt/homebrew/bin/python3.12 -c 'import sysconfig;print(sysconfig.get_path("include"))')
 $TC/bin/clang++ -std=c++26 -freflection-latest -stdlib=libc++ \
   -isysroot "$(xcrun --show-sdk-path)" -nostdinc++ -isystem $TC/include/c++/v1 \
   -I "$PYINC" -I include -fsyntax-only tests/test_reflect.cpp
 ```
 
-Recreate the venv + build tree if `/tmp` was cleared:
+Recreate the venv + build tree (run from the umbrella root; `git submodule update --init
+--recursive` there covers `ext/robin_map`):
 
 ```bash
-git submodule update --init ext/robin_map
-/opt/homebrew/bin/python3.12 -m venv /tmp/nbvenv && /tmp/nbvenv/bin/pip -q install pytest
-TC=~/llvm-toolchain
-cmake -S . -B /tmp/nbbuild -G Ninja -DCMAKE_BUILD_TYPE=Release \
+cd ~/git/cpp26-reflect-nanobind
+TC=$PWD/toolchain
+python3.12 -m venv .venv && .venv/bin/pip -q install pytest
+cmake -S nanobind -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER=$TC/bin/clang -DCMAKE_CXX_COMPILER=$TC/bin/clang++ \
   -DCMAKE_OSX_SYSROOT="$(xcrun --show-sdk-path)" \
-  -DPython_EXECUTABLE=/tmp/nbvenv/bin/python \
+  -DPython_EXECUTABLE="$PWD/.venv/bin/python" \
   -DNB_TEST=ON -DNB_TEST_FREE_THREADED=OFF -DNB_TEST_STABLE_ABI=OFF \
   -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-rpath,$TC/lib" \
   -DCMAKE_MODULE_LINKER_FLAGS="-Wl,-rpath,$TC/lib"
 ```
 (Configure prints `NB_HAS_REFLECTION_BLOOMBERG - Success` when the toolchain is detected.)
 
-Build + run the reflection tests:
+Build + run the reflection tests (from the umbrella root):
 
 ```bash
-ninja -C /tmp/nbbuild test_reflect_ext test_reflect_codegen_ext
-DYLD_LIBRARY_PATH=~/llvm-toolchain/lib PYTHONPATH=/tmp/nbbuild/tests \
-  /tmp/nbvenv/bin/python -m pytest tests/test_reflect.py tests/test_reflect_codegen.py \
-  -W error::RuntimeWarning
+ninja -C build test_reflect_ext test_reflect_codegen_ext
+DYLD_LIBRARY_PATH=$PWD/toolchain/lib PYTHONPATH=$PWD/build/tests \
+  .venv/bin/python -m pytest nanobind/tests/test_reflect.py \
+  nanobind/tests/test_reflect_codegen.py -W error::RuntimeWarning
 ```
 All reflection tests pass (`-W error::RuntimeWarning` turns nanobind's double-registration
 warning into a failure). Only `test_reflect*` targets are reflection-related; the rest of
