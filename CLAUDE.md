@@ -61,11 +61,15 @@ thing that cannot be expressed in-language (a virtual-override **trampoline**) h
   type (diamonds handled without double-binding).
 - **Virtual functions** (Python overrides C++): two-tier — a `reflect_trampoline<T>` hook
   wires in a hand-written *or* generated trampoline as nanobind's `Alias`.
-- **Annotations**: skip / rename / doc / return-value policy / keep-alive.
+- **Annotations**: skip / rename / doc / return-value policy / keep-alive. `doc` now applies to
+  classes and enums too (the annotation follows the `struct`/`enum class` keyword), not just
+  functions/methods/data members.
+- **Keyword-argument names**: P3096 parameter names → `nb::arg("name")` on methods, static
+  methods, free functions, and constructors. (Default-argument *values* are not bound — a
+  C++26 standard gap, not a binder one: P3096 exposes only `has_default_argument`, no value.)
 
 Roadmap / not yet: templates (need explicit instantiation lists — naturally
-annotation-driven), keyword-argument names (P3096 parameter names), class/enum docstrings,
-per-argument ownership-transfer annotations, free-operator reversed dunders.
+annotation-driven), per-argument ownership-transfer annotations, free-operator reversed dunders.
 
 ## Key gotchas (clang-p2996 @ the pinned toolchain commit)
 

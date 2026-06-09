@@ -137,6 +137,37 @@ call time based on argument types:
    p1.distance(p2)           # calls Point::distance(const Point&)
    p1.distance(4.0, 5.0, 6.0)  # calls Point::distance(double, double, double)
 
+Keyword arguments
+-----------------
+
+Parameter names are recovered via P3096 parameter reflection and emitted as
+``nb::arg("name")``, so callers can use Python keyword arguments on methods,
+static methods, free functions, and constructors:
+
+.. code-block:: cpp
+
+   struct Rect {
+       Rect(int width, int height);
+       int area(int scale) const;
+   };
+
+.. code-block:: python
+
+   r = my_module.Rect(width=3, height=4)   # constructor keywords
+   r.area(scale=2)                         # method keyword
+
+A parameter that has no name in the C++ declaration is bound as an unnamed
+positional argument; if *no* parameter of a function is named, the function is
+bound exactly as before (positional only).
+
+Default-argument **values** are *not* bound. This is a limitation of the C++26
+standard itself, not of this binder: P3096 exposes only ``has_default_argument``
+(a ``bool``) and provides no way to read a default argument's value or
+expression -- a default argument is an arbitrary expression evaluated in the
+caller's context, not a reflectable entity. A bound function therefore still
+requires every argument to be supplied (by position or keyword), even those that
+have a C++ default.
+
 Inheritance
 -----------
 
@@ -312,7 +343,10 @@ Available annotations:
 
 - ``skip`` — exclude a class, enum, member, data member, constructor, or free function.
 - ``rename{"name"}`` — bind under a different Python name.
-- ``doc{"text"}`` — attach a docstring (functions, methods, data members).
+- ``doc{"text"}`` — attach a docstring (functions, methods, data members, classes, enums).
+  On a class or enum the annotation follows the ``struct``/``enum class`` keyword, e.g.
+  ``struct [[=r::doc{"..."}]] Widget { ... };`` and
+  ``enum class [[=r::doc{"..."}]] Color { ... };``.
 - ``return_policy{...}`` / the shorthands ``take_ownership``, ``copy``, ``move``,
   ``reference``, ``reference_internal``, ``take_nothing`` — set the return-value policy on
   a function or method.
@@ -344,5 +378,7 @@ Limitations
   since trampolines cannot be synthesized in-language. Ref-qualified
   (``&``/``&&``) and ``final`` virtuals are not generated; virtual (diamond) base
   layouts are untested.
-- **Annotations**: class- and enum-level docstrings, and per-argument ownership
-  transfer, are not yet handled (see `Controlling the bindings with annotations`_).
+- **Annotations**: per-argument ownership transfer is not yet handled (see
+  `Controlling the bindings with annotations`_).
+- **Default-argument values** are not bound — a standard limitation, not a binder
+  one (P3096 exposes only ``has_default_argument``). See `Keyword arguments`_.

@@ -336,3 +336,39 @@ def test25_virtual_override_from_python():
     assert t.call_area(s) == 42.0            # C++ -> Python override dispatch
     assert s.kind() == 'shape'               # inherited C++ implementation
     assert t.call_kind(s) == 'shape'         # C++ -> C++ base fallback
+
+
+@needs_reflect
+def test30_keyword_arguments():
+    # Parameter names from C++ (P3096 reflection) become Python keyword args.
+    k = t.Kw()
+
+    # Method: positional still works; keywords and reordered keywords work too.
+    assert k.add(2, 3) == 5
+    assert k.add(a=2, b=3) == 5
+    assert k.add(b=3, a=2) == 5
+
+    # Static method.
+    assert t.Kw.smul(3, 4) == 12
+    assert t.Kw.smul(x=3, y=4) == 12
+    assert t.Kw.smul(y=4, x=3) == 12
+
+    # Free function.
+    assert t.kw_sub(10, 4) == 6
+    assert t.kw_sub(a=10, b=4) == 6
+    assert t.kw_sub(b=4, a=10) == 6
+
+    # Constructor.
+    c = t.KwCtor(j=2, i=1)
+    assert c.i == 1 and c.j == 2
+
+    # An unknown keyword is rejected (proves the names are actually bound).
+    with pytest.raises(TypeError):
+        k.add(a=2, c=3)
+
+
+@needs_reflect
+def test31_class_enum_docstrings():
+    # A [[=r::doc{...}]] annotation on a class or enum sets its Python __doc__.
+    assert t.DocClass.__doc__ == "A documented class."
+    assert t.DocEnum.__doc__ == "A documented enum."

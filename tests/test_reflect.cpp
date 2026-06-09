@@ -289,6 +289,30 @@ struct Shape {
 double call_area(const Shape& s) { return s.area(); }
 std::string call_kind(const Shape& s) { return s.kind(); }
 
+// --- Keyword-argument names (P3096 parameter names -> nb::arg) ---
+
+struct Kw {
+    Kw() {}
+    int add(int a, int b) const { return a + b; }     // method kwargs
+    static int smul(int x, int y) { return x * y; }   // static-method kwargs
+};
+
+int kw_sub(int a, int b) { return a - b; }            // free-function kwargs
+
+struct KwCtor {                                       // constructor kwargs
+    int i, j;
+    KwCtor(int i, int j) : i(i), j(j) {}
+};
+
+// --- Class / enum docstrings (annotation on the type itself) ---
+
+struct [[=r::doc{"A documented class."}]] DocClass {
+    DocClass() {}
+    int v() const { return 1; }
+};
+
+enum class [[=r::doc{"A documented enum."}]] DocEnum { X, Y };
+
 } // namespace reflect_test
 
 // The trampoline lives OUTSIDE the reflected namespace so reflect_ does not try

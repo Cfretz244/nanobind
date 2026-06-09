@@ -94,6 +94,17 @@ consteval const char* entity_doc() {
     return ann_string_or<R, ^^reflect::doc>(nullptr);
 }
 
+// Invoke `f` with R's docstring as a single const char* extra when [[=r::doc]] is
+// present, or with no extra otherwise; returns f(...)'s result. Lets class_/enum_
+// construction add an optional docstring without doubling its branch count -- the
+// entity-kind branch lives inside f, so both arms deduce the same return type.
+template <std::meta::info R, typename F>
+auto with_doc_extra(F&& f) {
+    constexpr const char* d = entity_doc<R>();
+    if constexpr (d != nullptr) return f(d);
+    else                        return f();
+}
+
 consteval rv_policy to_rv_policy(reflect::lifetime lt) {
     switch (lt) {
     case reflect::lifetime::take_ownership:     return rv_policy::take_ownership;
@@ -149,6 +160,63 @@ void with_data_extras(F&& emit) {
     } else {
         emit();
     }
+}
+
+// --- Keyword-argument names ---
+//
+// Emit one nb::arg("name") per parameter so Python callers can use keywords.
+// Names come from P3096 parameter reflection (identifier_of); a parameter with no
+// identifier yields nb::arg() (unnamed positional), which still keeps the count
+// correct for nanobind's all-or-nothing arg-annotation rule.
+//
+// Default-argument *values* are intentionally not bound: the C++26 standard
+// (P3096) exposes only has_default_argument, with no facility to read a default's
+// value/expression -- a default argument is an arbitrary expression evaluated in
+// the caller's context, not a reflectable entity -- so there is nothing to forward
+// to nanobind's `nb::arg("x") = value`.
+
+template <std::meta::info fn>
+consteval std::size_t fn_param_count() {
+    return std::meta::parameters_of(fn).size();
+}
+
+// True if at least one parameter of fn has an identifier (so naming adds value).
+template <std::meta::info fn>
+consteval bool fn_any_param_named() {
+    for (auto p : std::meta::parameters_of(fn))
+        if (std::meta::has_identifier(p))
+            return true;
+    return false;
+}
+
+// The I-th parameter's name as a static string, or nullptr when it is unnamed.
+template <std::meta::info fn, std::size_t I>
+consteval const char* param_name() {
+    constexpr auto params = std::define_static_array(std::meta::parameters_of(fn));
+    if constexpr (std::meta::has_identifier(params[I]))
+        return std::define_static_string(std::meta::identifier_of(params[I]));
+    else
+        return nullptr;
+}
+
+template <std::meta::info fn, typename F, std::size_t... Is>
+void with_arg_call_extras_impl(F&& emit, std::index_sequence<Is...>) {
+    with_call_extras<fn>([&](auto&&... call_e) {
+        emit(::nanobind::arg(param_name<fn, Is>())...,
+             std::forward<decltype(call_e)>(call_e)...);
+    });
+}
+
+// Like with_call_extras, but prepends an nb::arg("name") per parameter when any
+// parameter is named. When none are named it degrades to with_call_extras (no
+// arg annotations), preserving today's behavior and the all-or-nothing count.
+template <std::meta::info fn, typename F>
+void with_arg_call_extras(F&& emit) {
+    if constexpr (fn_any_param_named<fn>())
+        with_arg_call_extras_impl<fn>(std::forward<F>(emit),
+            std::make_index_sequence<fn_param_count<fn>()>{});
+    else
+        with_call_extras<fn>(std::forward<F>(emit));
 }
 
 template <typename T, std::meta::info mem>
@@ -208,7 +276,7 @@ void reflect_bind_method(auto& cls) {
                   !std::meta::is_rvalue_reference_qualified(fn) &&
                   !std::meta::has_ellipsis_parameter(fn)) {
         using FnType = [:std::meta::type_of(fn):];
-        with_call_extras<fn>([&](auto&&... e) {
+        with_arg_call_extras<fn>([&](auto&&... e) {
             reflect_method_binder<T, fn, FnType>::bind(
                 cls, entity_name<fn>(), std::forward<decltype(e)>(e)...);
         });
@@ -240,7 +308,7 @@ template <std::meta::info fn>
 void reflect_bind_static_method(auto& cls) {
     if constexpr (!std::meta::has_ellipsis_parameter(fn)) {
         using FnType = [:std::meta::type_of(fn):];
-        with_call_extras<fn>([&](auto&&... e) {
+        with_arg_call_extras<fn>([&](auto&&... e) {
             reflect_static_method_binder<fn, FnType>::bind(
                 cls, entity_name<fn>(), std::forward<decltype(e)>(e)...);
         });
@@ -291,7 +359,7 @@ void reflect_free_function(module_& m) {
     if constexpr (!std::meta::has_ellipsis_parameter(fn) &&
                   std::meta::has_identifier(fn)) {
         using FnType = [:std::meta::type_of(fn):];
-        with_call_extras<fn>([&](auto&&... e) {
+        with_arg_call_extras<fn>([&](auto&&... e) {
             reflect_free_fn_binder<fn, FnType>::bind(
                 m, entity_name<fn>(), std::forward<decltype(e)>(e)...);
         });
@@ -316,7 +384,13 @@ void reflect_bind_ctor_expand(auto& cls, std::index_sequence<Is...>) {
         cls.def(init<>());
     } else {
         constexpr auto params = ctor_param_infos<ctor>();
-        cls.def(init<typename [:std::meta::type_of(params[Is]):]...>());
+        // Attach nb::arg("name") per ctor parameter so Python callers can use
+        // keywords (e.g. T(i=1, j=2)); see with_arg_call_extras for the rule.
+        if constexpr (fn_any_param_named<ctor>())
+            cls.def(init<typename [:std::meta::type_of(params[Is]):]...>(),
+                    ::nanobind::arg(param_name<ctor, Is>())...);
+        else
+            cls.def(init<typename [:std::meta::type_of(params[Is]):]...>());
     }
 }
 
@@ -628,18 +702,19 @@ void reflect_class(module_& m) {
     }
 
     // Construct the class_ with the right template arguments. The lambda's return
-    // type is deduced from whichever if-constexpr branch is active.
-    auto cls = [&] {
+    // type is deduced from whichever if-constexpr branch is active. with_doc_extra
+    // supplies the optional [[=r::doc]] string as a trailing const char* extra.
+    auto cls = with_doc_extra<^^T>([&](auto&&... doc) {
         if constexpr (HasBase && HasTramp)
             return class_<T, typename [:first_public_base<T>():],
-                          reflect_trampoline_t<T>>(m, name);
+                          reflect_trampoline_t<T>>(m, name, doc...);
         else if constexpr (HasBase)
-            return class_<T, typename [:first_public_base<T>():]>(m, name);
+            return class_<T, typename [:first_public_base<T>():]>(m, name, doc...);
         else if constexpr (HasTramp)
-            return class_<T, reflect_trampoline_t<T>>(m, name);
+            return class_<T, reflect_trampoline_t<T>>(m, name, doc...);
         else
-            return class_<T>(m, name);
-    }();
+            return class_<T>(m, name, doc...);
+    });
 
     bind_class_contents<T>(cls);
     if constexpr (HasBase)
@@ -650,7 +725,9 @@ template <typename E>
 void reflect_enum(module_& m) {
     constexpr auto name = entity_name<^^E>();
 
-    auto e = enum_<E>(m, name);
+    auto e = with_doc_extra<^^E>([&](auto&&... doc) {
+        return enum_<E>(m, name, doc...);
+    });
 
     template for (constexpr auto val :
         std::define_static_array(std::meta::enumerators_of(^^E))) {
