@@ -1038,10 +1038,12 @@ consteval bool is_stl_policy(std::meta::info type) {
 
 // Append the std caster types reachable from `type` (itself and, recursively, its
 // value-carrying template arguments) to `out`, de-duplicated by reflection. `visited`
-// guards the *recursion* against cycles: a self-referential type whose template args
-// contain itself (e.g. nlohmann::json, whose object_t is std::map<std::string, json>
-// and array_t is std::vector<json>) would otherwise recurse forever -- the out-dedup
-// only prevents duplicate pushes, not re-descent through a non-caster cycle node.
+// memoizes types whose argument subtree has already been walked, so they are not re-walked.
+// Template-argument trees are finite, so this is not needed for termination -- it is a
+// performance guard: collapsing the O(members x graph) redundant re-walking that an enormous
+// type (e.g. nlohmann::json's basic_json) otherwise incurs, which on its own can exceed the
+// constexpr step budget. The `out`-dedup prevents duplicate pushes; `visited` prevents
+// redundant re-descent.
 consteval void collect_stl_types(std::meta::info type,
                                  std::vector<std::meta::info>& out,
                                  std::vector<std::meta::info>& visited) {
@@ -1152,8 +1154,8 @@ consteval bool is_user_class_template_spec(std::meta::info type) {
 // (pointer/ref/cv-unwrapped) type itself if it is one, plus, recursively, its
 // non-policy template args (Foo<Bar<int>> yields both Foo<Bar<int>> and Bar<int>)
 // -- to `out`, de-duplicated.
-// `visited` guards recursion against self-referential template args (same cycle hazard
-// as collect_stl_types: nlohmann::json's args contain json itself).
+// `visited` memoizes already-walked types to avoid redundant re-descent (same performance
+// purpose as in collect_stl_types; not needed for termination -- arg trees are finite).
 consteval void collect_user_specs_from_type(std::meta::info type,
                                             std::vector<std::meta::info>& out,
                                             std::vector<std::meta::info>& visited) {
