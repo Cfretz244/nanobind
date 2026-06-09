@@ -244,3 +244,20 @@ def test24_diamond_no_double_bind():
     assert issubclass(t.Dia, t.DiaL)
     assert issubclass(t.Dia, t.DiaTop)   # via the primary chain / MRO
     assert not issubclass(t.Dia, t.DiaR)
+
+
+@needs_reflect
+def test25_virtual_override_from_python():
+    # A Python subclass overrides a C++ virtual; C++ code calling through a base
+    # reference must dispatch into the Python override (this is what the
+    # trampoline provides).
+    class MyShape(t.Shape):
+        def area(self):
+            return 42.0
+        # kind() intentionally NOT overridden -> should fall back to C++
+
+    s = MyShape()
+    assert s.area() == 42.0                  # direct Python call
+    assert t.call_area(s) == 42.0            # C++ -> Python override dispatch
+    assert s.kind() == 'shape'               # inherited C++ implementation
+    assert t.call_kind(s) == 'shape'         # C++ -> C++ base fallback

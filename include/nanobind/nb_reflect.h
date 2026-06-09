@@ -23,6 +23,21 @@
 NAMESPACE_BEGIN(NB_NAMESPACE)
 NAMESPACE_BEGIN(detail)
 
+// --- Trampoline hook ---
+//
+// A trampoline (a class derived from T that overrides T's virtuals to forward
+// into Python) cannot be synthesized in-language on this fork, so reflect_ never
+// generates one itself. Instead it consults this trait: if a trampoline type is
+// registered for T, reflect_class passes it to nanobind as the class_ "Alias"
+// (enabling Python subclasses to override C++ virtuals). The trampoline may be
+// hand-written or produced by the codegen fallback (nb_reflect_codegen.h); both
+// register it the same way, via NB_REFLECT_TRAMPOLINE.
+template <typename T> struct reflect_trampoline { using type = void; };
+template <typename T> using reflect_trampoline_t = typename reflect_trampoline<T>::type;
+template <typename T>
+inline constexpr bool has_reflect_trampoline =
+    !std::is_same_v<reflect_trampoline_t<T>, void>;
+
 template <typename T, std::meta::info mem>
 void reflect_bind_member(auto& cls) {
     constexpr auto name =
@@ -343,19 +358,37 @@ void reflect_class(module_& m) {
     // additional (secondary) public bases cannot be real Python bases, so their
     // members are flattened directly onto T instead (see flatten_secondary_bases);
     // the only thing lost for those bases is the isinstance/issubclass relation.
-    if constexpr (public_base_count<T>() == 0) {
-        auto cls = class_<T>(m, name);
-        bind_class_contents<T>(cls);
-    } else {
-        constexpr auto base = first_public_base<T>();
+    //
+    // When a trampoline is registered for T, it is passed as the class_ "Alias"
+    // (the extra template arg that nanobind distinguishes from the base via
+    // is_base_of<T, Alias>), enabling Python subclasses to override C++ virtuals.
+    constexpr bool HasBase = public_base_count<T>() > 0;
+    constexpr bool HasTramp = has_reflect_trampoline<T>;
+
+    if constexpr (HasBase) {
         // Ensure the base (and, recursively, its ancestors) is bound first --
         // nanobind requires the base registered before the derived type. The
         // guard above keeps this a no-op if the base is already bound.
-        reflect_class<typename [:base:]>(m);
-        auto cls = class_<T, typename [:base:]>(m, name);
-        bind_class_contents<T>(cls);
-        flatten_secondary_bases<T>(cls);
+        reflect_class<typename [:first_public_base<T>():]>(m);
     }
+
+    // Construct the class_ with the right template arguments. The lambda's return
+    // type is deduced from whichever if-constexpr branch is active.
+    auto cls = [&] {
+        if constexpr (HasBase && HasTramp)
+            return class_<T, typename [:first_public_base<T>():],
+                          reflect_trampoline_t<T>>(m, name);
+        else if constexpr (HasBase)
+            return class_<T, typename [:first_public_base<T>():]>(m, name);
+        else if constexpr (HasTramp)
+            return class_<T, reflect_trampoline_t<T>>(m, name);
+        else
+            return class_<T>(m, name);
+    }();
+
+    bind_class_contents<T>(cls);
+    if constexpr (HasBase)
+        flatten_secondary_bases<T>(cls);
 }
 
 template <typename E>
@@ -416,5 +449,14 @@ void reflect_(module_& m) {
 }
 
 NAMESPACE_END(NB_NAMESPACE)
+
+/// Register a trampoline type for a polymorphic class so that reflect_ wires it
+/// in as nanobind's class_ "Alias" (enabling Python subclasses to override its
+/// C++ virtual functions). `Type` is the bound class; `Tramp` is a class derived
+/// from `Type` using NB_TRAMPOLINE + NB_OVERRIDE[_PURE] for each virtual. Used by
+/// both hand-written trampolines and the codegen fallback. Invoke at global scope.
+#define NB_REFLECT_TRAMPOLINE(Type, Tramp)                                       \
+    template <>                                                                  \
+    struct nanobind::detail::reflect_trampoline<Type> { using type = Tramp; }
 
 #endif // __has_include(<meta>)

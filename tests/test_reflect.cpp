@@ -1,4 +1,5 @@
 #include <nanobind/nb_reflect.h>
+#include <nanobind/trampoline.h>
 #include <nanobind/stl/vector.h>
 #include <nanobind/stl/string.h>
 #include <cmath>
@@ -194,7 +195,33 @@ struct Dia : DiaL, DiaR {
     Dia() : db(0) {}
 };
 
+// --- Virtual functions / trampoline (Tier 1: hand-written trampoline) ---
+
+struct Shape {
+    Shape() = default;
+    virtual ~Shape() = default;
+    virtual double area() const = 0;                      // pure virtual
+    virtual std::string kind() const { return "shape"; }  // non-pure virtual
+};
+
+// Free functions that invoke the virtuals from C++ -- used to prove that a
+// Python override is dispatched into when C++ calls through a base reference.
+double call_area(const Shape& s) { return s.area(); }
+std::string call_kind(const Shape& s) { return s.kind(); }
+
 } // namespace reflect_test
+
+// The trampoline lives OUTSIDE the reflected namespace so reflect_ does not try
+// to bind it as a class; it is wired in only via NB_REFLECT_TRAMPOLINE.
+namespace reflect_test_tramp {
+struct PyShape : reflect_test::Shape {
+    NB_TRAMPOLINE(reflect_test::Shape, 2);
+    double area() const override { NB_OVERRIDE_PURE(area); }
+    std::string kind() const override { NB_OVERRIDE(kind); }
+};
+} // namespace reflect_test_tramp
+
+NB_REFLECT_TRAMPOLINE(reflect_test::Shape, reflect_test_tramp::PyShape);
 
 NB_MODULE(test_reflect_ext, m) {
     nb::reflect_<^^reflect_test>(m);
