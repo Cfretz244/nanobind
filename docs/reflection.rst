@@ -240,8 +240,28 @@ methods automatically -- arithmetic and bitwise (``__add__``, ``__mul__``,
 bound with ``nb::is_operator()``, so calling one with an incompatible type yields
 ``NotImplemented`` (letting Python try the reflected operand) rather than raising.
 
-Skipped: free (non-member) operators, ``operator<=>``, ``++``/``--``,
-``operator->``, logical ``&&``/``||``/``!``, and assignment ``operator=``.
+Binary **free (namespace-scope) operators** are mapped too. A ``operator@(L, R)``
+is attached as a dunder to its operand's class: the forward dunder (``__add__``,
+…) on ``L``, and the reversed dunder on ``R`` (``__radd__``, …; comparisons use
+the swapped operator). The reversed form is what lets a scalar-on-the-left
+expression such as ``2.0 * vec`` work when only the right operand is a bound type:
+
+.. code-block:: cpp
+
+   struct Vec { double x, y; };
+   Vec  operator*(const Vec& v, double s);   // -> Vec.__mul__
+   Vec  operator*(double s, const Vec& v);   // -> Vec.__rmul__
+   Vec  operator+(const Vec& a, const Vec& b);  // -> Vec.__add__
+   bool operator==(const Vec& a, const Vec& b); // -> Vec.__eq__
+
+.. code-block:: python
+
+   v * 2.0     # operator*(Vec, double)
+   2.0 * v     # operator*(double, Vec), via __rmul__
+   a + b       # operator+(Vec, Vec)
+
+Skipped: ``operator<=>``, ``++``/``--``, ``operator->``, logical ``&&``/``||``/``!``,
+and assignment ``operator=``.
 
 Virtual functions (overriding from Python)
 ------------------------------------------
@@ -365,9 +385,8 @@ Limitations
 - ``volatile`` methods, rvalue-ref-qualified (``&&``) methods, and C-variadic
   (``...``) functions are skipped (they cannot bind meaningfully to a persistent
   Python object); the rest of the class still binds.
-- Member operators are mapped to Python dunders (see `Operators`_); free
-  operators, ``operator<=>``, ``++``/``--``, and logical ``&&``/``||``/``!`` are
-  skipped.
+- Member and binary free operators are mapped to Python dunders (see `Operators`_);
+  ``operator<=>``, ``++``/``--``, and logical ``&&``/``||``/``!`` are skipped.
 - **Multiple inheritance**: nanobind supports a single base class. The first
   public base is the real Python base; additional bases are flattened (their
   members are exposed on the derived type, but ``isinstance``/``issubclass``

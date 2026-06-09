@@ -354,8 +354,8 @@ NB_REFLECT_DEFINE_FREE_BINDER(noexcept)
 template <std::meta::info fn>
 void reflect_free_function(module_& m) {
     // Skip C-variadic free functions (their function type matches no binder), and
-    // free operators (operator@ has no identifier -- binding free operators as
-    // reversed dunders is future work).
+    // free operators (operator@ has no identifier) -- the latter are bound as class
+    // dunders by bind_free_operators during their operand types' class binding.
     if constexpr (!std::meta::has_ellipsis_parameter(fn) &&
                   std::meta::has_identifier(fn)) {
         using FnType = [:std::meta::type_of(fn):];
@@ -509,6 +509,34 @@ consteval const char* operator_dunder(std::meta::operators op, std::size_t arity
     }
 }
 
+// The "reversed" dunder for a binary operator, used when a free operator's class
+// operand is on the RIGHT (e.g. `2.0 * vec` needs `vec.__rmul__`). For arithmetic
+// operators this is the `__r*__` form; for comparisons it is the swapped operator
+// (a < b is computed as b.__gt__(a)). nullptr where no reversed form applies
+// (in-place operators, etc.), so the reversed binding is then skipped.
+consteval const char* operator_reversed_dunder(std::meta::operators op) {
+    using enum std::meta::operators;
+    switch (op) {
+    case op_plus:              return "__radd__";
+    case op_minus:             return "__rsub__";
+    case op_star:              return "__rmul__";
+    case op_slash:             return "__rtruediv__";
+    case op_percent:           return "__rmod__";
+    case op_caret:             return "__rxor__";
+    case op_ampersand:         return "__rand__";
+    case op_pipe:              return "__ror__";
+    case op_less_less:         return "__rlshift__";
+    case op_greater_greater:   return "__rrshift__";
+    case op_equals_equals:     return "__eq__";   // symmetric
+    case op_exclamation_equals:return "__ne__";   // symmetric
+    case op_less:              return "__gt__";   // a < b  <=>  b > a
+    case op_greater:           return "__lt__";
+    case op_less_equals:       return "__ge__";
+    case op_greater_equals:    return "__le__";
+    default:                   return nullptr;
+    }
+}
+
 consteval bool is_inplace_operator(std::meta::operators op) {
     using enum std::meta::operators;
     switch (op) {
@@ -557,6 +585,92 @@ void reflect_bind_conversion(auto& cls) {
     else if constexpr (std::meta::is_floating_point_type(R))
         cls.def("__float__", [](T& self) -> double { return (double) self.[:fn:](); });
     // else: no standard numeric dunder -- skip.
+}
+
+// --- Free (namespace-scope) operators -> dunders ---
+//
+// A free `operator@(L, R)` is attached as a dunder to the class of one of its
+// operands. The forward dunder (`__add__`, ...) goes on the LEFT operand's class;
+// the reversed dunder (`__radd__`, or a swapped comparison) goes on the RIGHT
+// operand's class -- the latter is what makes `2.0 * vec` work when only the right
+// operand is a bound type. Binding happens while that class is being reflected, so
+// its class_ object is in hand (no re-registration of an existing type).
+//
+// The forwarding lambda keeps the real Ret/P0/P1 template parameters in its
+// signature (from the function-type partial specialization) and only splices the
+// call in its body, staying clear of the clang-p2996 spliced-signature mangler crash.
+
+template <typename T, std::meta::info fn, typename FnType>
+struct reflect_free_operator_binder;
+
+#define NB_REFLECT_DEFINE_FREE_OP_BINDER(QUALS)                                    \
+    template <typename T, std::meta::info fn, typename Ret,                        \
+              typename P0, typename P1>                                            \
+    struct reflect_free_operator_binder<T, fn, Ret(P0, P1) QUALS> {                \
+        using A = std::remove_cvref_t<P0>;                                         \
+        using B = std::remove_cvref_t<P1>;                                         \
+        static void bind(auto& cls) {                                              \
+            constexpr auto op = std::meta::operator_of(fn);                        \
+            /* Forward: this class is the LEFT operand. */                         \
+            if constexpr (std::is_same_v<T, A>) {                                  \
+                constexpr const char* d = operator_dunder(op, 1);                  \
+                if constexpr (d != nullptr) {                                      \
+                    if constexpr (is_inplace_operator(op))                         \
+                        cls.def(d, [](P0 a, P1 b) -> Ret {                         \
+                            return [:fn:](a, b); },                                \
+                            is_operator(), rv_policy::reference);                  \
+                    else                                                           \
+                        cls.def(d, [](P0 a, P1 b) -> Ret {                         \
+                            return [:fn:](a, b); }, is_operator());                \
+                }                                                                  \
+            }                                                                      \
+            /* Reversed: this class is the RIGHT operand (and not also the left, */\
+            /* which would be the symmetric same-type case already covered).     */\
+            if constexpr (std::is_same_v<T, B> && !std::is_same_v<A, B>) {         \
+                constexpr const char* rd = operator_reversed_dunder(op);           \
+                if constexpr (rd != nullptr)                                       \
+                    cls.def(rd, [](P1 b, P0 a) -> Ret {                            \
+                        return [:fn:](a, b); }, is_operator());                    \
+            }                                                                      \
+        }                                                                          \
+    };
+
+NB_REFLECT_DEFINE_FREE_OP_BINDER()
+NB_REFLECT_DEFINE_FREE_OP_BINDER(noexcept)
+
+#undef NB_REFLECT_DEFINE_FREE_OP_BINDER
+
+// True if fn is a binary namespace-scope operator the binder can attach as a dunder.
+// Kept in a consteval helper so the vector from parameters_of() is fully consumed
+// within one constant evaluation (an inline parameters_of().size() in the if-constexpr
+// condition leaves the constant evaluator unable to prove the allocation is freed).
+template <std::meta::info fn>
+consteval bool is_bindable_free_operator() {
+    return std::meta::is_function(fn)
+        && std::meta::is_operator_function(fn)
+        && !std::meta::is_template(fn)
+        && !std::meta::has_ellipsis_parameter(fn)
+        && std::meta::parameters_of(fn).size() == 2;
+}
+
+// Scan T's enclosing namespace for binary free operators involving T and bind each
+// onto T's class_ (`cls`). Runs once per class (reflect_class is idempotent), so a
+// given (class, operator, side) pair binds exactly once. O(classes x namespace
+// members); fine at this prove-out's scale.
+template <typename T>
+void bind_free_operators(auto& cls) {
+    constexpr auto scope = std::meta::parent_of(^^T);
+    if constexpr (std::meta::is_namespace(scope)) {
+        template for (constexpr auto fn :
+            std::define_static_array(std::meta::members_of(
+                scope, std::meta::access_context::unchecked()))) {
+            if constexpr (is_bindable_free_operator<fn>()
+                && !has_ann<fn, reflect::skip>()) {
+                using FnType = [:std::meta::type_of(fn):];
+                reflect_free_operator_binder<T, fn, FnType>::bind(cls);
+            }
+        };
+    }
 }
 
 // Route a public member function to the right binder. Operators and conversion
@@ -719,6 +833,9 @@ void reflect_class(module_& m) {
     bind_class_contents<T>(cls);
     if constexpr (HasBase)
         flatten_secondary_bases<T>(cls);
+    // Attach namespace-scope operators that take T as an operand (e.g. a free
+    // operator+(T, T) or a scalar operator*(double, T)) as dunders on T.
+    bind_free_operators<T>(cls);
 }
 
 template <typename E>

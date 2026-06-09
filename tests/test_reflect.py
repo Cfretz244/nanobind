@@ -372,3 +372,26 @@ def test31_class_enum_docstrings():
     # A [[=r::doc{...}]] annotation on a class or enum sets its Python __doc__.
     assert t.DocClass.__doc__ == "A documented class."
     assert t.DocEnum.__doc__ == "A documented enum."
+
+
+@needs_reflect
+def test32_free_operators():
+    a = t.Vec(1.0, 2.0)
+    b = t.Vec(3.0, 4.0)
+
+    # Symmetric free operator+ -> __add__.
+    c = a + b
+    assert c.x == 4.0 and c.y == 6.0
+
+    # operator*(Vec, double) -> forward __mul__ (scalar on the right).
+    d = a * 2.0
+    assert d.x == 2.0 and d.y == 4.0
+
+    # operator*(double, Vec) -> reversed __rmul__ (scalar on the left). This is the
+    # case that only works because the reversed dunder is bound on Vec.
+    e = 2.0 * a
+    assert e.x == 2.0 and e.y == 4.0
+
+    # Free operator== -> __eq__.
+    assert a == t.Vec(1.0, 2.0)
+    assert not (a == b)

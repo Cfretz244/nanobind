@@ -313,6 +313,23 @@ struct [[=r::doc{"A documented class."}]] DocClass {
 
 enum class [[=r::doc{"A documented enum."}]] DocEnum { X, Y };
 
+// --- Free (namespace-scope) operators -> dunders ---
+
+struct Vec {
+    double x, y;
+    Vec() : x(0), y(0) {}
+    Vec(double x, double y) : x(x), y(y) {}
+};
+
+// Symmetric same-type operator -> forward __add__ only.
+Vec operator+(const Vec& a, const Vec& b) { return Vec(a.x + b.x, a.y + b.y); }
+// Scalar on the right -> forward __mul__ on Vec.
+Vec operator*(const Vec& v, double s) { return Vec(v.x * s, v.y * s); }
+// Scalar on the left -> reversed __rmul__ on Vec (the key reversed-dunder case).
+Vec operator*(double s, const Vec& v) { return Vec(s * v.x, s * v.y); }
+// Comparison free operator -> __eq__.
+bool operator==(const Vec& a, const Vec& b) { return a.x == b.x && a.y == b.y; }
+
 } // namespace reflect_test
 
 // The trampoline lives OUTSIDE the reflected namespace so reflect_ does not try

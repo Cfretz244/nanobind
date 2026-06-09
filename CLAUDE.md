@@ -54,7 +54,9 @@ thing that cannot be expressed in-language (a virtual-override **trampoline**) h
   `volatile`, rvalue-ref (`&&`), and C-variadic functions are gracefully skipped.
 - **Operators → Python dunders** (`__add__`, `__eq__`, `__call__`, `__getitem__`,
   `__neg__`, in-place with identity preserved, …); conversion ops → `__bool__`/`__int__`/
-  `__float__`. Bound with `nb::is_operator()`.
+  `__float__`. Bound with `nb::is_operator()`. **Binary free operators** too: forward dunder on
+  the left operand's class, reversed dunder (`__radd__` …, swapped comparison) on the right —
+  so `2.0 * vec` works (`bind_free_operators` scans `parent_of(^^T)` during class binding).
 - **Enums** → `nb::enum_` with all values.
 - **Inheritance**: first public base → real Python base (`class_<T, Base>`, bound
   transitively + idempotently); additional bases' members **flattened** onto the derived
@@ -69,7 +71,7 @@ thing that cannot be expressed in-language (a virtual-override **trampoline**) h
   C++26 standard gap, not a binder one: P3096 exposes only `has_default_argument`, no value.)
 
 Roadmap / not yet: templates (need explicit instantiation lists — naturally
-annotation-driven), per-argument ownership-transfer annotations, free-operator reversed dunders.
+annotation-driven), per-argument ownership-transfer annotations.
 
 ## Key gotchas (clang-p2996 @ the pinned toolchain commit)
 
