@@ -195,6 +195,26 @@ struct Dia : DiaL, DiaR {
     Dia() : db(0) {}
 };
 
+// --- Function-type qualifiers (noexcept / ref-qualified / skipped shapes) ---
+
+struct Quals {
+    int v;
+    Quals() : v(0) {}
+
+    int plain(int x) { return x + 1; }
+    int plain_ne(int x) noexcept { return x + 2; }          // noexcept
+    int c_ne(int x) const noexcept { return x + v; }        // const noexcept
+    int lref() & { return 10; }                             // lvalue-ref-qualified -> bound
+
+    int rref() && { return 20; }                            // rvalue-ref-qualified -> skipped
+    int vol() volatile { return 30; }                       // volatile -> skipped
+    int va(int a, ...) { return a; }                        // C-variadic -> skipped
+
+    static int sfn_ne() noexcept { return 99; }             // static noexcept -> bound
+};
+
+double free_ne(double a) noexcept { return a * 2; }         // free noexcept -> bound
+
 // --- Virtual functions / trampoline (Tier 1: hand-written trampoline) ---
 
 struct Shape {

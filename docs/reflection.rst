@@ -75,7 +75,8 @@ For **classes**, ``reflect_`` automatically binds:
 - All public non-copy/move constructors (including default and parameterized)
 - All public nonstatic data members (read-write; read-only if ``const``)
 - All public static data members (read-only if ``const``, read-write otherwise)
-- All public nonstatic methods (including overloads)
+- All public nonstatic methods (including overloads, and ``const``, ``noexcept``,
+  and lvalue-ref-qualified (``&``) methods)
 - All public static methods
 - A single public base class (see `Inheritance`_)
 
@@ -264,6 +265,9 @@ Limitations
 - Requires a compiler with P2996 support. As of March 2026, mainline Clang
   and MSVC do not implement the proposal.
 - Private and protected members are skipped.
+- ``volatile`` methods, rvalue-ref-qualified (``&&``) methods, and C-variadic
+  (``...``) functions are skipped (they cannot bind meaningfully to a persistent
+  Python object); the rest of the class still binds.
 - Operator overloads (``operator+``, etc.) are not yet mapped to Python
   dunder methods (as of March 2026).
 - **Multiple inheritance**: nanobind supports a single base class. The first

@@ -247,6 +247,24 @@ def test24_diamond_no_double_bind():
 
 
 @needs_reflect
+def test26_function_qualifiers():
+    q = t.Quals()
+    # noexcept / const noexcept / lvalue-ref-qualified methods are bound.
+    assert q.plain(1) == 2
+    assert q.plain_ne(1) == 3
+    assert q.c_ne(1) == 1
+    assert q.lref() == 10
+    # static noexcept and free noexcept are bound.
+    assert t.Quals.sfn_ne() == 99
+    assert t.free_ne(2.5) == 5.0
+    # rvalue-ref-qualified, volatile, and C-variadic shapes are skipped (not bound)
+    # rather than breaking the build.
+    assert not hasattr(q, 'rref')
+    assert not hasattr(q, 'vol')
+    assert not hasattr(q, 'va')
+
+
+@needs_reflect
 def test25_virtual_override_from_python():
     # A Python subclass overrides a C++ virtual; C++ code calling through a base
     # reference must dispatch into the Python override (this is what the

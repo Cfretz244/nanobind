@@ -66,32 +66,47 @@ void reflect_bind_member(auto& cls) {
 template <typename T, std::meta::info fn, typename FnType>
 struct reflect_method_binder;
 
-template <typename T, std::meta::info fn, typename Ret, typename... Args>
-struct reflect_method_binder<T, fn, Ret(Args...)> {
-    static void bind(auto& cls) {
-        constexpr auto name =
-            std::define_static_string(std::meta::identifier_of(fn));
-        cls.def(name, [](T& self, Args... args) -> Ret {
-            return self.[:fn:](std::forward<Args>(args)...);
-        });
-    }
-};
+// A method's function type carries its cv-, ref-, and noexcept-qualifiers, and a
+// partial specialization must match them exactly. Stamp out one specialization per
+// supported qualifier combination (cv in {-, const} x ref in {-, &} x noexcept).
+// The forwarding lambda's signature uses the real Ret/Args... template parameters
+// (never type splices), which keeps it clear of the clang-p2996 mangler crash that
+// spliced-type lambda signatures trigger in a dependent cls.def call.
+#define NB_REFLECT_DEFINE_METHOD_BINDER(QUALS, CONST)                          \
+    template <typename T, std::meta::info fn, typename Ret, typename... Args>  \
+    struct reflect_method_binder<T, fn, Ret(Args...) QUALS> {                  \
+        static void bind(auto& cls) {                                          \
+            constexpr auto name =                                              \
+                std::define_static_string(std::meta::identifier_of(fn));       \
+            cls.def(name, [](CONST T& self, Args... args) -> Ret {            \
+                return self.[:fn:](std::forward<Args>(args)...);              \
+            });                                                                \
+        }                                                                      \
+    };
 
-template <typename T, std::meta::info fn, typename Ret, typename... Args>
-struct reflect_method_binder<T, fn, Ret(Args...) const> {
-    static void bind(auto& cls) {
-        constexpr auto name =
-            std::define_static_string(std::meta::identifier_of(fn));
-        cls.def(name, [](const T& self, Args... args) -> Ret {
-            return self.[:fn:](std::forward<Args>(args)...);
-        });
-    }
-};
+NB_REFLECT_DEFINE_METHOD_BINDER(, )
+NB_REFLECT_DEFINE_METHOD_BINDER(noexcept, )
+NB_REFLECT_DEFINE_METHOD_BINDER(&, )
+NB_REFLECT_DEFINE_METHOD_BINDER(& noexcept, )
+NB_REFLECT_DEFINE_METHOD_BINDER(const, const)
+NB_REFLECT_DEFINE_METHOD_BINDER(const noexcept, const)
+NB_REFLECT_DEFINE_METHOD_BINDER(const &, const)
+NB_REFLECT_DEFINE_METHOD_BINDER(const & noexcept, const)
+
+#undef NB_REFLECT_DEFINE_METHOD_BINDER
 
 template <typename T, std::meta::info fn>
 void reflect_bind_method(auto& cls) {
-    using FnType = [:std::meta::type_of(fn):];
-    reflect_method_binder<T, fn, FnType>::bind(cls);
+    // Skip shapes that cannot bind meaningfully to a persistent Python instance:
+    // volatile and rvalue-ref-qualified (&&) member functions, and C-variadic
+    // functions. Skipping leaves them simply unexposed rather than breaking the
+    // build (an unmatched function type would select the incomplete primary).
+    if constexpr (!std::meta::is_volatile(fn) &&
+                  !std::meta::is_rvalue_reference_qualified(fn) &&
+                  !std::meta::has_ellipsis_parameter(fn)) {
+        using FnType = [:std::meta::type_of(fn):];
+        reflect_method_binder<T, fn, FnType>::bind(cls);
+    }
 }
 
 // --- Static methods ---
@@ -99,21 +114,30 @@ void reflect_bind_method(auto& cls) {
 template <std::meta::info fn, typename FnType>
 struct reflect_static_method_binder;
 
-template <std::meta::info fn, typename Ret, typename... Args>
-struct reflect_static_method_binder<fn, Ret(Args...)> {
-    static void bind(auto& cls) {
-        constexpr auto name =
-            std::define_static_string(std::meta::identifier_of(fn));
-        cls.def_static(name, [](Args... args) -> Ret {
-            return [:fn:](std::forward<Args>(args)...);
-        });
-    }
-};
+// Static methods have no cv/ref qualifiers, but may be noexcept.
+#define NB_REFLECT_DEFINE_STATIC_BINDER(QUALS)                                 \
+    template <std::meta::info fn, typename Ret, typename... Args>              \
+    struct reflect_static_method_binder<fn, Ret(Args...) QUALS> {             \
+        static void bind(auto& cls) {                                          \
+            constexpr auto name =                                              \
+                std::define_static_string(std::meta::identifier_of(fn));       \
+            cls.def_static(name, [](Args... args) -> Ret {                    \
+                return [:fn:](std::forward<Args>(args)...);                   \
+            });                                                                \
+        }                                                                      \
+    };
+
+NB_REFLECT_DEFINE_STATIC_BINDER()
+NB_REFLECT_DEFINE_STATIC_BINDER(noexcept)
+
+#undef NB_REFLECT_DEFINE_STATIC_BINDER
 
 template <std::meta::info fn>
 void reflect_bind_static_method(auto& cls) {
-    using FnType = [:std::meta::type_of(fn):];
-    reflect_static_method_binder<fn, FnType>::bind(cls);
+    if constexpr (!std::meta::has_ellipsis_parameter(fn)) {
+        using FnType = [:std::meta::type_of(fn):];
+        reflect_static_method_binder<fn, FnType>::bind(cls);
+    }
 }
 
 // --- Static data members ---
@@ -136,21 +160,31 @@ void reflect_bind_static_member(auto& cls) {
 template <std::meta::info fn, typename FnType>
 struct reflect_free_fn_binder;
 
-template <std::meta::info fn, typename Ret, typename... Args>
-struct reflect_free_fn_binder<fn, Ret(Args...)> {
-    static void bind(module_& m) {
-        constexpr auto name =
-            std::define_static_string(std::meta::identifier_of(fn));
-        m.def(name, [](Args... args) -> Ret {
-            return [:fn:](std::forward<Args>(args)...);
-        });
-    }
-};
+// Free functions have no cv/ref qualifiers, but may be noexcept.
+#define NB_REFLECT_DEFINE_FREE_BINDER(QUALS)                                   \
+    template <std::meta::info fn, typename Ret, typename... Args>              \
+    struct reflect_free_fn_binder<fn, Ret(Args...) QUALS> {                   \
+        static void bind(module_& m) {                                         \
+            constexpr auto name =                                              \
+                std::define_static_string(std::meta::identifier_of(fn));       \
+            m.def(name, [](Args... args) -> Ret {                            \
+                return [:fn:](std::forward<Args>(args)...);                   \
+            });                                                                \
+        }                                                                      \
+    };
+
+NB_REFLECT_DEFINE_FREE_BINDER()
+NB_REFLECT_DEFINE_FREE_BINDER(noexcept)
+
+#undef NB_REFLECT_DEFINE_FREE_BINDER
 
 template <std::meta::info fn>
 void reflect_free_function(module_& m) {
-    using FnType = [:std::meta::type_of(fn):];
-    reflect_free_fn_binder<fn, FnType>::bind(m);
+    // Skip C-variadic free functions (their function type matches no binder).
+    if constexpr (!std::meta::has_ellipsis_parameter(fn)) {
+        using FnType = [:std::meta::type_of(fn):];
+        reflect_free_fn_binder<fn, FnType>::bind(m);
+    }
 }
 
 // --- Constructors ---
