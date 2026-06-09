@@ -81,11 +81,97 @@ consteval const char* ann_string_or(const char* fallback) {
     return fallback;
 }
 
-// Python name for R: an explicit reflect::rename, else its C++ identifier.
+// --- Template-specialization naming (see spec_camel_name) ---
+
+// Defined later (with the stl caster machinery); used by spec_camel_name to skip
+// container "policy" args (allocator/comparator/...) and to name std string types.
+consteval bool is_stl_policy(std::meta::info type);
+consteval bool is_in_std(std::meta::info e);
+
+// Uppercase the first ASCII letter of s (used to CamelCase each appended arg).
+consteval std::string capitalize_first(std::string s) {
+    if (!s.empty() && s[0] >= 'a' && s[0] <= 'z')
+        s[0] = static_cast<char>(s[0] - 'a' + 'A');
+    return s;
+}
+
+// Reduce an arbitrary type/value spelling to an identifier fragment: drop every
+// char outside [A-Za-z0-9_]. (Used only for fragments appended after a base name
+// that already begins with a letter, so a leading digit here is harmless.)
+consteval std::string sanitize_identifier(std::string_view in) {
+    std::string s;
+    for (char c : in)
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '_')
+            s += c;
+    return s;
+}
+
+// Build a CamelCase Python name for a class/function template specialization:
+// the template's base identifier followed by each template argument, capitalized
+// and concatenated. Type args that are themselves specializations recurse
+// (Box<Bar<int>> -> "BoxBarInt", Box<vector<int>> -> "BoxVectorInt"); plain named
+// types use their identifier (int -> "Int"); non-type args render their value
+// (Array<int,3> -> "ArrayInt3"). std::string/std::wstring/std::string_view get the
+// friendly names String/WString/StringView. The base keeps its original case, so
+// free function templates stay lowercase (identity<int> -> "identityInt").
+// Container policy args (allocator/comparator/...) are skipped, matching the stl walk.
+consteval std::string spec_camel_name(std::meta::info type) {
+    // `type` may be a class-template specialization OR a function-template
+    // specialization (identity<int>); remove_cvref is only valid on a type.
+    if (std::meta::is_type(type))
+        type = std::meta::remove_cvref(type);
+    auto tmpl = std::meta::template_of(type);
+    std::string_view base = std::meta::identifier_of(tmpl);
+    if (is_in_std(tmpl)) {
+        if (base == "basic_string") {
+            auto args = std::meta::template_arguments_of(type);
+            return (!args.empty() && args[0] == ^^wchar_t) ? "WString" : "String";
+        }
+        if (base == "basic_string_view") return "StringView";
+    }
+    std::string out(base);
+    for (auto arg : std::meta::template_arguments_of(type)) {
+        if (std::meta::is_type(arg)) {
+            auto a = std::meta::remove_cvref(arg);
+            if (std::meta::has_template_arguments(a)) {
+                if (is_stl_policy(a))
+                    continue;                            // allocator/comparator/...
+                out += capitalize_first(spec_camel_name(a));
+            } else if (std::meta::has_identifier(a)) {
+                out += capitalize_first(std::string(std::meta::identifier_of(a)));
+            } else {
+                out += capitalize_first(
+                    sanitize_identifier(std::meta::display_string_of(a)));
+            }
+        } else {
+            out += capitalize_first(
+                sanitize_identifier(std::meta::display_string_of(arg)));
+        }
+    }
+    return out;
+}
+
+// spec_camel_name lifted to static storage. Goes through a named local so the
+// (possibly heap-backed, long) std::string is a constant expression when read by
+// define_static_string -- passing the nested-call temporary directly is not
+// (cf. stl_missing_caster_msg, which uses the same named-local pattern).
+consteval const char* spec_python_name(std::meta::info type) {
+    std::string s = spec_camel_name(type);
+    return std::define_static_string(s);
+}
+
+// Python name for R: an explicit reflect::rename, else its C++ identifier. For a
+// template specialization, the CamelCase spec name (spec_camel_name): identifier_of
+// is ill-formed on a specialization, and a single rename could not disambiguate two
+// instantiations anyway, so rename is not consulted for specializations.
 template <std::meta::info R>
 consteval const char* entity_name() {
-    return ann_string_or<R, ^^reflect::rename>(
-        std::define_static_string(std::meta::identifier_of(R)));
+    if constexpr (std::meta::has_template_arguments(R))
+        return spec_python_name(R);
+    else
+        return ann_string_or<R, ^^reflect::rename>(
+            std::define_static_string(std::meta::identifier_of(R)));
 }
 
 // Docstring for R, or nullptr if none.
@@ -378,9 +464,13 @@ template <std::meta::info fn>
 void reflect_free_function(module_& m) {
     // Skip C-variadic free functions (their function type matches no binder), and
     // free operators (operator@ has no identifier) -- the latter are bound as class
-    // dunders by bind_free_operators during their operand types' class binding.
+    // dunders by bind_free_operators during their operand types' class binding. A
+    // function-template specialization (identity<int>) also has no identifier, but it
+    // IS bindable, so admit it via has_template_arguments (entity_name then derives
+    // the CamelCase spec name from the template).
     if constexpr (!std::meta::has_ellipsis_parameter(fn) &&
-                  std::meta::has_identifier(fn)) {
+                  (std::meta::has_identifier(fn) ||
+                   std::meta::has_template_arguments(fn))) {
         using FnType = [:std::meta::type_of(fn):];
         with_arg_call_extras<fn>([&](auto&&... e) {
             reflect_free_fn_binder<fn, FnType>::bind(
@@ -996,9 +1086,131 @@ consteval void collect_scope_stl_types(std::meta::info r,
     }
 }
 
+// --- User (non-std) class-template specialization discovery ---
+//
+// A namespace's template *declarations* are not bindable and its *instantiations*
+// are not enumerable members, so the only way to find the specializations a
+// reflected set actually uses is to walk its concrete signatures (mirroring the stl
+// caster walk above). These helpers collect every user class-template specialization
+// reachable from the reflected set -- recursively through template args and through
+// each discovered spec's own members/bases -- so reflect_ can bind them.
+
+// True if `type` is a specialization of a user (non-std) class template. std
+// specializations go to the type-caster path, not the class-binding path.
+consteval bool is_user_class_template_spec(std::meta::info type) {
+    type = std::meta::remove_cvref(type);
+    if (!std::meta::is_type(type) || !std::meta::is_class_type(type))
+        return false;
+    if (!std::meta::has_template_arguments(type))
+        return false;
+    auto tmpl = std::meta::template_of(type);
+    if (!std::meta::has_identifier(tmpl))
+        return false;
+    return !is_in_std(tmpl);
+}
+
+// Append the user class-template specializations reachable from `type` -- the
+// (pointer/ref/cv-unwrapped) type itself if it is one, plus, recursively, its
+// non-policy template args (Foo<Bar<int>> yields both Foo<Bar<int>> and Bar<int>)
+// -- to `out`, de-duplicated.
+consteval void collect_user_specs_from_type(std::meta::info type,
+                                            std::vector<std::meta::info>& out) {
+    type = std::meta::remove_cvref(type);
+    while (std::meta::is_pointer_type(type))
+        type = std::meta::remove_cvref(std::meta::remove_pointer(type));
+    if (!std::meta::has_template_arguments(type))
+        return;
+    if (is_user_class_template_spec(type) && !info_vec_contains(out, type))
+        out.push_back(type);
+    for (auto arg : std::meta::template_arguments_of(type))
+        if (std::meta::is_type(arg) && !is_stl_policy(arg))
+            collect_user_specs_from_type(arg, out);
+}
+
+// Scan one class's own signatures -- data members, static data, the return/param
+// types of its functions, and its bases -- for user specializations. Skips template
+// members (a member template has no concrete signature) and destructors.
+consteval void collect_class_user_specs(std::meta::info cls,
+                                        std::vector<std::meta::info>& out) {
+    for (auto mem : std::meta::members_of(cls, std::meta::access_context::unchecked())) {
+        if (!std::meta::is_public(mem) || std::meta::is_template(mem))
+            continue;
+        if (std::meta::is_function(mem) && !std::meta::is_destructor(mem)) {
+            if (!std::meta::is_constructor(mem))
+                collect_user_specs_from_type(std::meta::return_type_of(mem), out);
+            for (auto p : std::meta::parameters_of(mem))
+                collect_user_specs_from_type(std::meta::type_of(p), out);
+        }
+    }
+    for (auto mem : std::meta::nonstatic_data_members_of(
+             cls, std::meta::access_context::unchecked()))
+        if (std::meta::is_public(mem))
+            collect_user_specs_from_type(std::meta::type_of(mem), out);
+    for (auto mem : std::meta::static_data_members_of(
+             cls, std::meta::access_context::unchecked()))
+        if (std::meta::is_public(mem))
+            collect_user_specs_from_type(std::meta::type_of(mem), out);
+    for (auto b : std::meta::bases_of(cls, std::meta::access_context::unchecked()))
+        if (std::meta::is_public(b))
+            collect_user_specs_from_type(std::meta::type_of(b), out);
+}
+
+// Seed pass: walk a namespace (recursively) collecting user specs from its classes
+// and free functions; or, given a class/spec or function directly, from that entity
+// (including the entity itself when it is a spec).
+consteval void collect_scope_user_specs(std::meta::info r,
+                                        std::vector<std::meta::info>& out) {
+    if (std::meta::is_namespace(r)) {
+        for (auto mem : std::meta::members_of(r, std::meta::access_context::unchecked())) {
+            if (std::meta::is_type(mem) && std::meta::is_class_type(mem))
+                collect_class_user_specs(mem, out);
+            else if (std::meta::is_function(mem) && !std::meta::is_template(mem)) {
+                collect_user_specs_from_type(std::meta::return_type_of(mem), out);
+                for (auto p : std::meta::parameters_of(mem))
+                    collect_user_specs_from_type(std::meta::type_of(p), out);
+            } else if (std::meta::is_namespace(mem))
+                collect_scope_user_specs(mem, out);
+        }
+    } else if (std::meta::is_type(r) && std::meta::is_class_type(r)) {
+        collect_user_specs_from_type(r, out);     // r itself, if a spec
+        collect_class_user_specs(r, out);         // and its members/bases
+    } else if (std::meta::is_function(r)) {
+        collect_user_specs_from_type(std::meta::return_type_of(r), out);
+        for (auto p : std::meta::parameters_of(r))
+            collect_user_specs_from_type(std::meta::type_of(p), out);
+    }
+}
+
+// The de-duplicated, fixpoint-closed list of user class-template specializations a
+// reflected entity needs bound. Seeds from the entity's concrete signatures, then
+// expands each newly found spec by scanning ITS members/bases (so Wrap<int> surfaces
+// Box<int>). The index loop over the growing vector plus the dedup is a worklist
+// fixpoint that visits each spec once -- terminating on CRTP/self-referential specs.
+consteval std::vector<std::meta::info> required_user_specs(std::meta::info r) {
+    std::vector<std::meta::info> out;
+    collect_scope_user_specs(r, out);
+    for (std::size_t i = 0; i < out.size(); ++i)
+        collect_class_user_specs(out[i], out);
+    return out;
+}
+
 consteval std::vector<std::meta::info> required_stl_types(std::meta::info r) {
     std::vector<std::meta::info> out;
     collect_scope_stl_types(r, out);
+    return out;
+}
+
+// Like required_stl_types, but also sweeps the members of every discovered template
+// specialization (a Holder<int> bound as a class needs the caster for its
+// std::vector<int> member, but the spec is not a namespace member so the scope walk
+// above misses it). This is a second full walk, so it is kept out of required_stl_types
+// -- the codegen path (emit_stl_includes), which must emit the #includes, calls this;
+// the header-only path leaves spec-member casters to surface at bind time.
+consteval std::vector<std::meta::info> required_stl_types_with_specs(std::meta::info r) {
+    std::vector<std::meta::info> out;
+    collect_scope_stl_types(r, out);
+    for (auto spec : required_user_specs(r))
+        collect_class_stl_types(spec, out);
     return out;
 }
 
@@ -1119,7 +1331,13 @@ void reflect_dispatch(module_& m) {
         template for (constexpr auto mem :
             std::define_static_array(std::meta::members_of(
                 r, std::meta::access_context::unchecked()))) {
-            if constexpr (has_ann<mem, reflect::skip>()) {
+            if constexpr (std::meta::is_template(mem)) {
+                // A class/function template declaration: not bindable directly (only
+                // its specializations are). Skip it here -- the specializations used
+                // by the reflected set are discovered and bound by reflect_user_specs,
+                // and others can be passed explicitly. Guarded first because
+                // annotations_of (used by has_ann) is ill-formed on a template.
+            } else if constexpr (has_ann<mem, reflect::skip>()) {
                 // explicitly excluded -- bind nothing
             } else if constexpr (std::meta::is_type(mem)
                 && std::meta::is_class_type(mem)) {
@@ -1134,15 +1352,29 @@ void reflect_dispatch(module_& m) {
                 reflect_dispatch<mem>(m);
             }
         };
-    } else if constexpr (std::meta::is_type(r)
-        && std::meta::is_class_type(r)) {
-        reflect_class<typename [:r:]>(m);
-    } else if constexpr (std::meta::is_type(r)
-        && std::meta::is_enum_type(r)) {
-        reflect_enum<typename [:r:]>(m);
+    } else if constexpr (std::meta::is_type(r)) {
+        // Nest the type-kind checks under is_type: is_class_type/is_enum_type are
+        // ill-formed on a non-type reflection (e.g. a function-template
+        // specialization like ^^identity<int> passed directly to reflect_).
+        if constexpr (std::meta::is_class_type(r))
+            reflect_class<typename [:r:]>(m);
+        else if constexpr (std::meta::is_enum_type(r))
+            reflect_enum<typename [:r:]>(m);
     } else if constexpr (std::meta::is_function(r)) {
         reflect_free_function<r>(m);
     }
+}
+
+// Bind every user class-template specialization discovered in R's signatures (see
+// required_user_specs). Specializations are not namespace members, so reflect_dispatch
+// never reaches them; this pre-pass does. reflect_class's is_valid() guard makes each
+// bind idempotent, so a spec also reached transitively (as a base/member) binds once.
+template <std::meta::info R>
+void reflect_user_specs(module_& m) {
+    template for (constexpr auto ty :
+                  std::define_static_array(required_user_specs(R))) {
+        reflect_class<typename [:ty:]>(m);
+    };
 }
 
 NAMESPACE_END(detail)
@@ -1157,6 +1389,10 @@ void reflect_(module_& m) {
     // Diagnose any std type used in a bound signature whose <nanobind/stl/*.h>
     // caster was not included (a no-op when every needed caster is present).
     (detail::check_stl_casters<Rs>(), ...);
+    // Bind user class-template specializations reachable from the signatures, then
+    // the namespaces/classes/enums/functions themselves (order-independent: the
+    // reflect_class is_valid() guard dedups specs reached by both passes).
+    (detail::reflect_user_specs<Rs>(m), ...);
     (detail::reflect_dispatch<Rs>(m), ...);
 }
 

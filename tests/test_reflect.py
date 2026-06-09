@@ -418,3 +418,62 @@ def test34_properties():
     assert not callable(th.celsius)  # 'celsius' is now a value, not a method
     assert isinstance(type(th).celsius, property)
     assert isinstance(type(th).fahrenheit, property)
+
+
+@needs_reflect
+def test35_template_specializations():
+    # Each instantiation is a distinct Python class, CamelCase-named.
+    for name in ("BoxInt", "BoxDouble", "BoxFloat", "BoxBoxInt", "WrapInt",
+                 "PairIntDouble", "ArrayInt3", "UsesBoxes"):
+        assert hasattr(t, name), name
+    assert t.BoxInt is not t.BoxDouble
+
+    # Round-trip a couple of instantiations through their bound methods/ctor.
+    b = t.BoxInt(5)
+    assert b.get() == 5
+    b.set(7)
+    assert b.get() == 7
+    assert b.value == 7
+    assert t.BoxDouble(2.5).get() == 2.5
+    # Explicitly-listed-only instantiation (no signature references it).
+    assert t.BoxFloat().get() == 0.0
+
+
+@needs_reflect
+def test36_template_nested_and_multi_arg():
+    # Nested type arg: Box<Box<int>> -> BoxBoxInt, holding a BoxInt value.
+    bb = t.BoxBoxInt()
+    inner = t.BoxInt(9)
+    bb.set(inner)
+    assert bb.get().get() == 9
+
+    # Multiple type args and a non-type (value) arg.
+    p = t.PairIntDouble(3, 1.5)
+    assert p.first == 3 and p.second == 1.5
+    a = t.ArrayInt3()
+    assert a.size() == 3
+
+
+@needs_reflect
+def test37_template_auto_discovery():
+    # UsesBoxes references the specializations only via its signatures; they are
+    # bound automatically (none were listed in reflect_<...>).
+    u = t.UsesBoxes()
+    u.bi = t.BoxInt(4)
+    assert u.bi.get() == 4
+    u.take(t.BoxInt(11))
+    assert u.bi.get() == 11
+    assert u.make_bd().get() == 2.5
+    # Transitive (fixpoint) discovery: WrapInt surfaced via Wrap<int>'s own member.
+    assert isinstance(u.wrapped, t.WrapInt)
+    u.wrapped.inner = t.BoxInt(1)
+    assert u.wrapped.inner.get() == 1
+
+
+@needs_reflect
+def test38_function_template_specialization():
+    # A free-function-template specialization bound by explicit listing. Python name
+    # is CamelCase (identity<int> -> identityInt); function templates cannot be bound,
+    # only their instantiations, and only when listed explicitly.
+    assert hasattr(t, "identityInt")
+    assert t.identityInt(42) == 42

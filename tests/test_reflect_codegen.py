@@ -43,3 +43,21 @@ def test03_generated_stl_caster_includes():
     b.items = [1, 2, 3]                       # std::vector<int> caster
     assert b.items == [1, 2, 3]
     assert b.counts() == {"1": 1, "2": 2, "3": 3}  # std::map<std::string,int> caster
+
+
+@needs_reflect
+def test04_generated_trampoline_for_template_spec():
+    # Processor<int> is a specialization of a class TEMPLATE with virtuals, discovered
+    # via UsesProcessor's signature. The generator emitted a trampoline for it (spelling
+    # the template-id as a fully-qualified C++ type), so a Python subclass can override
+    # process() and have C++ dispatch into it (roadmap #6, codegen route).
+    assert hasattr(t, "ProcessorInt")
+
+    class MyProc(t.ProcessorInt):
+        def process(self, x):
+            return x * 100
+
+    p = MyProc()
+    assert p.process(2) == 200                 # direct Python call
+    assert t.run_processor_int(p, 2) == 200    # C++ -> Python override (generated trampoline)
+    assert p.kind() == 0                        # non-overridden -> C++ base

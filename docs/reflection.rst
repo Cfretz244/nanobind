@@ -440,6 +440,82 @@ The accessors are bound via pointer-to-member (so no spliced type enters a lambd
 signature). Pairing is annotation-driven only; getter/setter *name-convention* sniffing
 (``getX``/``setX``) is intentionally not done.
 
+Templates
+---------
+
+A template cannot be bound -- only its **specializations** can (``Box<int>`` is a
+concrete class; ``Box`` is not). ``reflect_`` **auto-discovers** every user
+class-template specialization reachable from the reflected set's signatures -- data
+members, static data, method/function return and parameter types, and bases --
+recursively, and binds each one. A specialization surfaced this way is bound exactly
+like any other class (constructors, members, methods, operators, inheritance):
+
+.. code-block:: cpp
+
+   template <class T> struct Box {
+       T value;
+       Box() : value{} {}
+       explicit Box(T v) : value(v) {}
+       T get() const { return value; }
+       void set(T v) { value = v; }
+   };
+
+   struct Scene {
+       Box<int> count;                 // discovers Box<int>
+       Box<double> measure() const;    // discovers Box<double>
+   };
+
+   NB_MODULE(my_module, m) {
+       nb::reflect_<^^Scene>(m);       // Box<int> and Box<double> bound automatically
+   }
+
+Discovery is transitive and reaches a fixpoint: a discovered ``Wrap<int>`` whose own
+member is a ``Box<int>`` surfaces ``Box<int>`` too. ``std`` specializations
+(``std::vector<int>`` ...) are *not* bound as classes -- they go to the type-caster
+path (see `STL type casters`_).
+
+Python names are **CamelCase**, formed from the template name and its arguments:
+
+================================  =================
+C++ specialization                Python name
+================================  =================
+``Box<int>``                      ``BoxInt``
+``Box<double>``                   ``BoxDouble``
+``Pair<int, double>``             ``PairIntDouble``
+``Array<int, 3>``                 ``ArrayInt3``
+``Box<Box<int>>``                 ``BoxBoxInt``
+``Box<std::string>``              ``BoxString``
+================================  =================
+
+Explicit instantiations
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A specialization that **no signature references** is not discoverable (the set of
+instantiations in a translation unit is not reflectable). Bind such a one by listing
+it explicitly in the ``reflect_`` argument pack, alongside namespaces and types:
+
+.. code-block:: cpp
+
+   nb::reflect_<^^my_namespace,
+                ^^Box<float>,            // bound only because it is listed here
+                ^^identity<int>>(m);     // a free-function-template specialization
+
+The same applies to **free function templates**: a function template cannot be bound,
+but a specialization (``identity<int>`` → ``identityInt``) can, and only by listing it
+explicitly -- explicit instantiation *definitions* (``template int identity<int>(int);``)
+are not enumerable via reflection. **Member** function templates are not supported.
+
+There is intentionally no ``[[=r::instantiate<...>]]`` annotation: a P3394 annotation
+value must be a valid template argument and cannot carry a type or a
+``std::meta::info``, so the instantiation list lives in the ``reflect_`` arguments
+instead.
+
+Because two instantiations of the same template would otherwise collide on the bare
+template name, the auto-generated CamelCase name can in rare cases collide with a
+hand-named class (e.g. ``Pair<int,double>`` → ``PairIntDouble`` vs. a class literally
+named ``PairIntDouble``); such a collision surfaces as nanobind's double-registration
+warning.
+
 Limitations
 -----------
 
@@ -463,6 +539,11 @@ Limitations
   layouts are untested.
 - **Annotations**: per-argument ownership transfer is not yet handled (see
   `Controlling the bindings with annotations`_).
+- **Templates**: only specializations are bound (see `Templates`_); they are
+  auto-discovered from signatures or listed explicitly. Member function templates are
+  unsupported, explicit instantiation definitions are not auto-detected, and the
+  header-only path does not diagnose a missing std caster used *only* by a discovered
+  specialization's members (it surfaces at bind time); the codegen path emits it.
 - **Default-argument values** are not bound — a standard limitation, not a binder
   one (P3096 exposes only ``has_default_argument``). See `Keyword arguments`_.
 - **STL casters**: the header-only path cannot inject ``#include``s (it diagnoses

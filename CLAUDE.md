@@ -80,9 +80,19 @@ thing that cannot be expressed in-language (a virtual-override **trampoline**) h
   `reflect_` path can't inject includes so it *static_asserts* with the missing header name
   (`check_stl_casters`, P2741 message). `#include` can't be emitted from template code, so the
   header-only path is detect-and-diagnose only.
+- **Templates**: binds *specializations* of user class templates. `reflect_` **auto-discovers**
+  every user spec reachable from the reflected set's signatures (recursive fixpoint —
+  `required_user_specs`/`collect_user_specs_from_type` in `nb_reflect.h`), and additional ones
+  (incl. free-function-template specs and unreferenced classes) are listed explicitly as
+  `reflect_<^^ns, ^^Box<float>, ^^identity<int>>`. Python names are **CamelCase**
+  (`spec_camel_name`: `Box<int>`→`BoxInt`, `Pair<int,double>`→`PairIntDouble`,
+  `Array<int,3>`→`ArrayInt3`). The codegen path emits trampolines for spec'd templates with
+  virtuals (`type_spelling` writes the qualified template-id; `emit_spec_classes`). Member
+  function templates and `[[=r::instantiate]]` (infeasible — annotations can't carry types) are
+  *not* supported; explicit instantiation defs aren't auto-detected (not enumerable).
 
-Roadmap / not yet: templates (need explicit instantiation lists — naturally
-annotation-driven), per-argument ownership-transfer annotations.
+Roadmap / not yet: per-argument ownership-transfer annotations; member function templates;
+trampoline hardening for final/ref-qualified virtuals.
 
 ## Key gotchas (clang-p2996 @ the pinned toolchain commit)
 

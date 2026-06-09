@@ -65,12 +65,41 @@ consteval std::string qualified_name_of(std::meta::info e) {
 }
 
 // A C++-identifier-safe mangling of a qualified name, for the trampoline struct
-// name (e.g. "::ns::Foo" -> "_ns_Foo").
+// name (e.g. "::ns::Foo" -> "_ns_Foo"). Only ':' occurs in a plain qualified name.
 consteval std::string mangle(std::string_view qualified) {
     std::string s;
     for (char c : qualified)
         s += (c == ':') ? '_' : c;
     return s;
+}
+
+// A fully-qualified, compilable C++ spelling of a type -- including template
+// specializations, which qualified_name_of cannot handle (identifier_of is
+// ill-formed on a specialization). For a specialization, spell the template's
+// qualified name followed by its arguments (recursing into type args, rendering
+// value args); for a plain class/enum, qualified_name_of; for anything else
+// (fundamentals, pointers, ...), the display spelling. Unlike display_string_of on
+// the whole type, this keeps every class/template fully qualified, so the result
+// compiles from the generated trampoline namespace.
+consteval std::string type_spelling(std::meta::info t) {
+    if (std::meta::has_template_arguments(t)) {
+        std::string s = qualified_name_of(std::meta::template_of(t)) + "<";
+        bool first = true;
+        for (auto arg : std::meta::template_arguments_of(t)) {
+            if (!first)
+                s += ", ";
+            first = false;
+            if (std::meta::is_type(arg))
+                s += type_spelling(arg);
+            else
+                s += std::string(std::meta::display_string_of(arg));
+        }
+        s += ">";
+        return s;
+    }
+    if (std::meta::is_class_type(t) || std::meta::is_enum_type(t))
+        return qualified_name_of(t);
+    return std::string(std::meta::display_string_of(t));
 }
 
 // A signature key used to de-duplicate a virtual across a class hierarchy (so a
@@ -134,7 +163,7 @@ consteval std::vector<std::meta::info> overridable_virtuals(std::meta::info cls)
 consteval std::string gen_override(std::meta::info m) {
     std::meta::info owner = std::meta::parent_of(m);
     std::string memexpr = "::nanobind::detail::codegen_member<^^ " +
-                          qualified_name_of(owner) + ", " +
+                          type_spelling(owner) + ", " +
                           num(index_in_members(owner, m)) + ">()";
     std::string name(std::meta::identifier_of(m));
     auto params = std::meta::parameters_of(m);
@@ -168,8 +197,10 @@ consteval std::string emit_one_class(std::meta::info cls) {
     if (virts.empty())
         return "";
 
-    std::string cq = qualified_name_of(cls);
-    std::string tname = "Tramp" + mangle(cq);
+    // Fully-qualified C++ spelling (handles template specializations); the struct
+    // name drops the non-identifier chars in a template-id ("<", ">", ",", " ").
+    std::string cq = type_spelling(cls);
+    std::string tname = "Tramp" + sanitize_identifier(cq);
 
     std::string s = "namespace nanobind { namespace reflect_generated {\n";
     s += "struct " + tname + " : " + cq + " {\n";
@@ -200,13 +231,27 @@ consteval std::string emit_subtree(std::meta::info r) {
     return s;
 }
 
+// Emit a trampoline (when needed) for every user class-template specialization
+// reachable from r's signatures. Specializations are not namespace members, so
+// emit_subtree never reaches them; this covers a templated class with virtuals
+// (e.g. Processor<int>). required_user_specs is de-duplicated, so each is emitted
+// once.
+consteval std::string emit_spec_classes(std::meta::info r) {
+    std::string s;
+    for (auto spec : required_user_specs(r))
+        s += emit_one_class(spec);
+    return s;
+}
+
 // Emit the #include directives for the <nanobind/stl/*.h> type casters required by
 // the std types appearing in signatures reachable from r, de-duplicated. Unlike the
 // header-only path, codegen CAN emit these (the generated header is #included before
-// reflect_), so a generated module needs no hand-listed stl casters.
+// reflect_), so a generated module needs no hand-listed stl casters. Uses the
+// spec-aware walk so a discovered specialization's members (e.g. a Holder<int> with a
+// std::vector<int> field) pull their casters too.
 consteval std::string emit_stl_includes(std::meta::info r) {
     std::vector<std::string_view> hdrs;
-    for (auto ty : required_stl_types(r)) {
+    for (auto ty : required_stl_types_with_specs(r)) {
         std::string_view h = stl_caster_header(ty);
         bool seen = false;
         for (auto e : hdrs)
@@ -244,6 +289,9 @@ consteval const char* emit_trampolines() {
     ((out += detail::codegen::emit_stl_includes(Rs)), ...);
     out += "\n";
     ((out += detail::codegen::emit_subtree(Rs)), ...);
+    // Trampolines for discovered template specializations (not namespace members,
+    // so emit_subtree misses them).
+    ((out += detail::codegen::emit_spec_classes(Rs)), ...);
     return std::define_static_string(out);
 }
 

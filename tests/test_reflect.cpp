@@ -375,6 +375,89 @@ static_assert(reflect_test_needs("nanobind/stl/string.h"));
 static_assert(reflect_test_needs("nanobind/stl/vector.h"));
 static_assert(!reflect_test_needs("nanobind/stl/map.h"));
 
+// --- Templates: class-template specializations (roadmap #6) ---
+//
+// Templates themselves are not bindable; their *specializations* are. reflect_
+// auto-discovers every user class-template specialization reachable from the
+// reflected set's signatures (recursively), and additional ones can be listed
+// explicitly. Python names are CamelCase: Box<int> -> BoxInt, Pair<int,double> ->
+// PairIntDouble, Array<int,3> -> ArrayInt3, Box<Box<int>> -> BoxBoxInt.
+namespace template_test {
+
+template <class T>
+struct Box {
+    T value;
+    Box() : value{} {}
+    explicit Box(T v) : value(v) {}
+    T get() const { return value; }
+    void set(T v) { value = v; }
+};
+
+template <class A, class B>
+struct Pair {
+    A first;
+    B second;
+    Pair() : first{}, second{} {}
+    Pair(A a, B b) : first(a), second(b) {}
+};
+
+template <class T, int N>
+struct Array {
+    T head;
+    Array() : head{} {}
+    int size() const { return N; }
+};
+
+template <class T>
+struct Wrap {
+    Box<T> inner;
+};
+
+// A free FUNCTION template. Templates can't be bound, only instantiations; a
+// specialization is bound only when listed explicitly (it appears in no signature,
+// and explicit instantiation definitions are not enumerable via reflection). The
+// Python name is CamelCase like classes: identity<int> -> identityInt.
+template <class T>
+T identity(T x) { return x; }
+
+// A plain (non-template) class whose signatures reference specializations: every
+// one below is discovered and bound without being listed explicitly.
+struct UsesBoxes {
+    Box<int> bi;                              // data member          -> BoxInt
+    Box<Box<int>> nested;                     // nested type arg      -> BoxBoxInt (+ BoxInt)
+    Wrap<int> wrapped;                        // transitive (fixpoint)-> WrapInt surfaces BoxInt
+    Pair<int, double> pid;                    // multiple type args   -> PairIntDouble
+    Array<int, 3> arr;                        // non-type arg         -> ArrayInt3
+    UsesBoxes() = default;
+    Box<double> make_bd() const { return Box<double>(2.5); }   // return type -> BoxDouble
+    void take(const Box<int>& b) { bi = b; }                  // param type (dup) -> BoxInt
+};
+
+} // namespace template_test
+
+// Discovery must find exactly the user specializations reachable from the signatures
+// (and not pull in std types, which go to the caster path).
+namespace {
+consteval bool tt_has_spec(std::meta::info t) {
+    for (auto s : nb::detail::required_user_specs(^^template_test))
+        if (s == t)
+            return true;
+    return false;
+}
+}
+static_assert(tt_has_spec(^^template_test::Box<int>));
+static_assert(tt_has_spec(^^template_test::Box<double>));
+static_assert(tt_has_spec(^^template_test::Box<template_test::Box<int>>));
+static_assert(tt_has_spec(^^template_test::Wrap<int>));
+static_assert(tt_has_spec(^^template_test::Pair<int, double>));
+static_assert(tt_has_spec(^^template_test::Array<int, 3>));
+static_assert(!tt_has_spec(^^std::vector<int>));     // std -> caster path, not bound
+
 NB_MODULE(test_reflect_ext, m) {
-    nb::reflect_<^^reflect_test>(m);
+    // Box<float> is referenced by no signature; it is bound only because it is listed
+    // explicitly here (the explicit opt-in for specializations the walk can't reach).
+    // identity<int> is a free-function-template specialization, also explicit-only.
+    nb::reflect_<^^reflect_test, ^^template_test,
+                 ^^template_test::Box<float>,
+                 ^^template_test::identity<int>>(m);
 }

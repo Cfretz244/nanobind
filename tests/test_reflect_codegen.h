@@ -45,4 +45,25 @@ struct Bag {
     }
 };
 
+// A class TEMPLATE with virtual functions (roadmap #6, codegen route). Its
+// specialization Processor<int> is discovered via UsesProcessor's signature below,
+// and the generator must emit a trampoline for that specialization (spelling the
+// template-id Processor<int> as a fully-qualified C++ type) so a Python subclass can
+// override its virtuals.
+template <class T>
+struct Processor {
+    Processor() = default;
+    virtual ~Processor() = default;
+    virtual T process(T x) const = 0;            // pure virtual
+    virtual int kind() const { return 0; }       // non-pure virtual
+};
+
+inline int run_processor_int(const Processor<int>& p, int x) { return p.process(x); }
+
+// Non-template class that references Processor<int> in a signature, so the spec is
+// auto-discovered (and thus bound + given a generated trampoline).
+struct UsesProcessor {
+    Processor<int>* p = nullptr;
+};
+
 } // namespace reflect_codegen_test
