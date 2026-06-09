@@ -785,6 +785,185 @@ void flatten_secondary_bases(auto& cls) {
     };
 }
 
+// --- STL type-caster coverage ---
+//
+// nanobind needs a type_caster (from <nanobind/stl/*.h>) for each std type that
+// appears in a bound signature. These consteval helpers walk the bound signatures,
+// identify the std template instantiations used, and map each to its caster header.
+// The result drives two things: the codegen path emits the matching #includes
+// (nb_reflect_codegen.h), and the header-only path static_asserts when a caster is
+// missing (check_stl_casters below). #include cannot be emitted from template code
+// into the current TU, so the header-only path can only detect/diagnose; only the
+// codegen path can actually emit the includes.
+
+// True if any enclosing namespace of e is named "std" (handles libc++'s inline
+// namespace, where std::vector is really std::__1::vector).
+consteval bool is_in_std(std::meta::info e) {
+    for (auto p = std::meta::parent_of(e); p != ^^::; p = std::meta::parent_of(p))
+        if (std::meta::has_identifier(p) && std::meta::identifier_of(p) == "std")
+            return true;
+    return false;
+}
+
+// If `type` is a std template instantiation nanobind covers with a caster header,
+// return that header path; otherwise nullptr. cv/ref-qualifiers are ignored.
+consteval const char* stl_caster_header(std::meta::info type) {
+    type = std::meta::remove_cvref(type);
+    if (!std::meta::has_template_arguments(type))
+        return nullptr;
+    auto tmpl = std::meta::template_of(type);
+    if (!is_in_std(tmpl) || !std::meta::has_identifier(tmpl))
+        return nullptr;
+    std::string_view n = std::meta::identifier_of(tmpl);
+    if (n == "basic_string") {
+        auto args = std::meta::template_arguments_of(type);
+        return (!args.empty() && args[0] == ^^wchar_t)
+            ? "nanobind/stl/wstring.h" : "nanobind/stl/string.h";
+    }
+    if (n == "basic_string_view") return "nanobind/stl/string_view.h";
+    if (n == "vector")            return "nanobind/stl/vector.h";
+    if (n == "list")              return "nanobind/stl/list.h";
+    if (n == "array")             return "nanobind/stl/array.h";
+    if (n == "set")               return "nanobind/stl/set.h";
+    if (n == "unordered_set")     return "nanobind/stl/unordered_set.h";
+    if (n == "map")               return "nanobind/stl/map.h";
+    if (n == "unordered_map")     return "nanobind/stl/unordered_map.h";
+    if (n == "pair")              return "nanobind/stl/pair.h";
+    if (n == "tuple")             return "nanobind/stl/tuple.h";
+    if (n == "optional")          return "nanobind/stl/optional.h";
+    if (n == "variant")           return "nanobind/stl/variant.h";
+    if (n == "shared_ptr")        return "nanobind/stl/shared_ptr.h";
+    if (n == "unique_ptr")        return "nanobind/stl/unique_ptr.h";
+    if (n == "function")          return "nanobind/stl/function.h";
+    if (n == "complex")           return "nanobind/stl/complex.h";
+    return nullptr;
+}
+
+// True for std "policy" templates that appear as container parameters but are not
+// part of the value interface (allocator/comparator/hash/traits/deleter). We must
+// not recurse into these: e.g. std::map's default allocator is
+// std::allocator<std::pair<const Key,T>>, which would otherwise spuriously pull in
+// pair.h even though the map caster never needs it.
+consteval bool is_stl_policy(std::meta::info type) {
+    type = std::meta::remove_cvref(type);
+    if (!std::meta::has_template_arguments(type))
+        return false;
+    auto tmpl = std::meta::template_of(type);
+    if (!is_in_std(tmpl) || !std::meta::has_identifier(tmpl))
+        return false;
+    std::string_view n = std::meta::identifier_of(tmpl);
+    return n == "allocator" || n == "less" || n == "greater" || n == "hash" ||
+           n == "equal_to" || n == "char_traits" || n == "default_delete";
+}
+
+// Append the std caster types reachable from `type` (itself and, recursively, its
+// value-carrying template arguments) to `out`, de-duplicated by reflection.
+consteval void collect_stl_types(std::meta::info type,
+                                 std::vector<std::meta::info>& out) {
+    type = std::meta::remove_cvref(type);
+    if (!std::meta::has_template_arguments(type))
+        return;
+    if (stl_caster_header(type) != nullptr && !info_vec_contains(out, type))
+        out.push_back(type);
+    for (auto arg : std::meta::template_arguments_of(type))
+        if (std::meta::is_type(arg) && !is_stl_policy(arg))
+            collect_stl_types(arg, out);
+}
+
+// Collect std caster types from every signature directly declared in class `cls`
+// (data members, static data members, and the return/parameter types of its
+// constructors, methods, and operators). Inherited members are covered when the
+// base class is itself walked.
+consteval void collect_class_stl_types(std::meta::info cls,
+                                       std::vector<std::meta::info>& out) {
+    for (auto mem : std::meta::members_of(cls, std::meta::access_context::unchecked())) {
+        if (!std::meta::is_public(mem) || std::meta::is_template(mem))
+            continue;
+        if (std::meta::is_function(mem) && !std::meta::is_destructor(mem)) {
+            if (!std::meta::is_constructor(mem))
+                collect_stl_types(std::meta::return_type_of(mem), out);
+            for (auto p : std::meta::parameters_of(mem))
+                collect_stl_types(std::meta::type_of(p), out);
+        }
+    }
+    for (auto mem : std::meta::nonstatic_data_members_of(
+             cls, std::meta::access_context::unchecked()))
+        if (std::meta::is_public(mem))
+            collect_stl_types(std::meta::type_of(mem), out);
+    for (auto mem : std::meta::static_data_members_of(
+             cls, std::meta::access_context::unchecked()))
+        if (std::meta::is_public(mem))
+            collect_stl_types(std::meta::type_of(mem), out);
+}
+
+// Walk a namespace (recursively) collecting std caster types from its classes and
+// free functions; or, when given a class directly, just that class.
+consteval void collect_scope_stl_types(std::meta::info r,
+                                       std::vector<std::meta::info>& out) {
+    if (std::meta::is_namespace(r)) {
+        for (auto mem : std::meta::members_of(r, std::meta::access_context::unchecked())) {
+            if (std::meta::is_type(mem) && std::meta::is_class_type(mem))
+                collect_class_stl_types(mem, out);
+            else if (std::meta::is_function(mem) && !std::meta::is_template(mem)) {
+                collect_stl_types(std::meta::return_type_of(mem), out);
+                for (auto p : std::meta::parameters_of(mem))
+                    collect_stl_types(std::meta::type_of(p), out);
+            } else if (std::meta::is_namespace(mem))
+                collect_scope_stl_types(mem, out);
+        }
+    } else if (std::meta::is_type(r) && std::meta::is_class_type(r)) {
+        collect_class_stl_types(r, out);
+    }
+}
+
+consteval std::vector<std::meta::info> required_stl_types(std::meta::info r) {
+    std::vector<std::meta::info> out;
+    collect_scope_stl_types(r, out);
+    return out;
+}
+
+// The de-duplicated list of <nanobind/stl/*.h> header paths needed by R's bound
+// signatures, as a static array of const char*. Reusable by codegen and callers.
+template <std::meta::info R>
+consteval auto required_stl_headers() {
+    std::vector<std::string_view> hdrs;
+    for (auto ty : required_stl_types(R)) {
+        std::string_view h = stl_caster_header(ty);
+        bool seen = false;
+        for (auto e : hdrs) if (e == h) { seen = true; break; }
+        if (!seen) hdrs.push_back(h);
+    }
+    std::vector<const char*> out;
+    for (auto h : hdrs) out.push_back(std::define_static_string(h));
+    return std::define_static_array(out);
+}
+
+// Per-missing-type diagnostic message (P2741 constexpr static_assert message).
+template <std::meta::info Ty>
+consteval std::string_view stl_missing_caster_msg() {
+    std::string s =
+        "nb::reflect_: a bound signature uses the std type '";
+    s += std::meta::display_string_of(Ty);
+    s += "', whose nanobind type caster is not included in this translation unit. "
+         "Add: #include <";
+    s += stl_caster_header(Ty);
+    s += ">  (or use the codegen path, which emits it automatically).";
+    return std::string_view(std::define_static_string(s));
+}
+
+// Header-only diagnostic: for each std caster type used by R whose specialized
+// caster is absent (make_caster falls back to the class-binding base caster),
+// fail with a message naming the exact header to include. Runs only on types
+// reflection identifies as std templates, so user classes never trip it.
+template <std::meta::info R>
+void check_stl_casters() {
+    template for (constexpr auto ty :
+                  std::define_static_array(required_stl_types(R))) {
+        static_assert(!is_base_caster_v<make_caster<typename [:ty:]>>,
+                      stl_missing_caster_msg<ty>());
+    };
+}
+
 template <typename T>
 void reflect_class(module_& m) {
     // Idempotent: skip if T is already registered. This makes binding
@@ -895,6 +1074,9 @@ NAMESPACE_END(detail)
 ///
 template <std::meta::info... Rs>
 void reflect_(module_& m) {
+    // Diagnose any std type used in a bound signature whose <nanobind/stl/*.h>
+    // caster was not included (a no-op when every needed caster is present).
+    (detail::check_stl_casters<Rs>(), ...);
     (detail::reflect_dispatch<Rs>(m), ...);
 }
 

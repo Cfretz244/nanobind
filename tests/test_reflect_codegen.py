@@ -31,3 +31,15 @@ def test02_non_virtual_class_has_no_trampoline_issue():
     p = t.Pod()
     p.a = 5
     assert p.a == 5
+
+
+@needs_reflect
+def test03_generated_stl_caster_includes():
+    # Bag uses std::vector and std::map in its signatures, but the module TU does
+    # NOT hand-include the stl caster headers. That this module compiled and the
+    # conversions work proves the codegen emitted the required
+    # <nanobind/stl/{vector,map,string}.h> includes automatically (roadmap #5).
+    b = t.Bag()
+    b.items = [1, 2, 3]                       # std::vector<int> caster
+    assert b.items == [1, 2, 3]
+    assert b.counts() == {"1": 1, "2": 2, "3": 3}  # std::map<std::string,int> caster

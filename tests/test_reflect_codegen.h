@@ -7,7 +7,9 @@
 
 #pragma once
 
+#include <map>
 #include <string>
+#include <vector>
 
 namespace reflect_codegen_test {
 
@@ -27,6 +29,20 @@ inline std::string run_label(const Worker& w) { return w.label(); }
 struct Pod {
     int a;
     Pod() : a(0) {}
+};
+
+// Uses std::vector and std::map in its signatures. The module TU deliberately does
+// NOT #include <nanobind/stl/vector.h> / <nanobind/stl/map.h>; the generated header
+// emits those caster includes automatically (roadmap #5, codegen route).
+struct Bag {
+    std::vector<int> items;
+    Bag() = default;
+    std::map<std::string, int> counts() const {
+        std::map<std::string, int> m;
+        for (int v : items)
+            m[std::to_string(v)] = v;
+        return m;
+    }
 };
 
 } // namespace reflect_codegen_test

@@ -291,7 +291,8 @@ else:
    NB_REFLECT_TRAMPOLINE(Shape, PyShape);
 
 **Tier 2 -- generated trampoline (codegen fallback).** ``<nanobind/nb_reflect_codegen.h>``
-provides ``emit_trampolines<^^ns...>()``, which returns C++ source text containing a
+provides ``emit_trampolines<^^ns...>()``, which returns C++ source text containing the
+required ``<nanobind/stl/*.h>`` caster includes (see `STL type casters`_) plus a
 trampoline (and its ``NB_REFLECT_TRAMPOLINE``) for every class with overridable
 virtuals. A small generator program writes it to a header that the bindings TU
 includes before calling ``reflect_``. The build runs the same three steps whether or
@@ -328,6 +329,39 @@ The generated code refers to each virtual's return and parameter types via splic
 off the method's reflection, so it needs no C++ type-name printer and resolves
 overloaded virtuals correctly. Inherited virtuals are included; the destructor and
 private virtuals are skipped.
+
+STL type casters
+----------------
+
+Binding a signature that uses a std type (``std::vector``, ``std::map``,
+``std::optional``, ``std::shared_ptr``, …) requires the matching
+``<nanobind/stl/*.h>`` type-caster header. The binder detects, via reflection, which
+std types appear in a namespace's bound signatures (recursively, e.g.
+``std::map<std::string, std::vector<int>>``) and maps each to its caster header.
+Because ``#include`` cannot be emitted from template code into the current
+translation unit, this is handled differently on the two paths:
+
+- **Codegen path** -- ``emit_trampolines<^^ns...>()`` *emits* the required
+  ``#include <nanobind/stl/...>`` lines into the generated header. Since that header
+  is included before ``reflect_``, a generated module needs **no** hand-listed stl
+  casters. (``std::string`` is always available -- ``nb_reflect.h`` includes its
+  caster.)
+
+- **Header-only path** -- ``reflect_<^^ns>(m)`` in a single TU cannot inject includes,
+  so it instead *diagnoses*: if a std type's caster is missing, compilation fails with
+  a message naming the exact header, e.g.::
+
+     nb::reflect_: a bound signature uses the std type 'vector<int, allocator<int>>',
+     whose nanobind type caster is not included in this translation unit.
+     Add: #include <nanobind/stl/vector.h>
+
+  ``nb::detail::required_stl_headers<^^ns>()`` returns the full list programmatically.
+
+Only the common std types are recognized (string/string_view/wstring,
+vector/list/array/set/unordered_set, map/unordered_map, pair/tuple, optional/variant,
+shared_ptr/unique_ptr, function, complex). Container "policy" parameters (allocator,
+comparator, hash, …) are ignored. Std types used only by an *external* base class not
+itself in the reflected set are not detected.
 
 Controlling the bindings with annotations
 -----------------------------------------
@@ -401,3 +435,6 @@ Limitations
   `Controlling the bindings with annotations`_).
 - **Default-argument values** are not bound — a standard limitation, not a binder
   one (P3096 exposes only ``has_default_argument``). See `Keyword arguments`_.
+- **STL casters**: the header-only path cannot inject ``#include``s (it diagnoses
+  instead); only the common std types are recognized, and types used solely by an
+  external base outside the reflected set are not detected. See `STL type casters`_.

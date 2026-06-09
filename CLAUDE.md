@@ -8,9 +8,10 @@ repo `~/git/cpp26-reflect-nanobind` for the whole picture.
 
 A fork of [`wjakob/nanobind`](https://github.com/wjakob/nanobind) used to build an
 **automatic Python-bindings generator driven by C++26 static reflection (WG21 P2996)**.
-The work lives on branch **`mk-reflect`** and is pushed to the user's fork
-**`fork` = `git@github.com:Cfretz244/nanobind.git`**. `origin` is upstream
-`wjakob/nanobind` — **never push there.**
+The work lives on branch **`mk-reflect`**. In *this* checkout the only remote is
+**`origin` = `git@github.com:Cfretz244/nanobind.git`** (the user's fork) — push
+`mk-reflect` there. Upstream `wjakob/nanobind` is **not** configured as a remote here;
+never add it as a push target.
 
 The starting point was a community proof-of-concept by *matthewkolbe* (`nb::reflect_<^^ns>(m)`,
 fetched from his `reflect` branch). It has since been substantially extended and hardened.
@@ -38,8 +39,9 @@ thing that cannot be expressed in-language (a virtual-override **trampoline**) h
   `take_ownership`/`copy`/`move`/`reference`/`reference_internal`/`take_nothing`),
   `keep_alive{nurse, patient}`.
 - `include/nanobind/nb_reflect_codegen.h` — Tier-2 codegen fallback:
-  `emit_trampolines<^^ns...>()` returns C++ source (trampoline structs +
-  `NB_REFLECT_TRAMPOLINE` registrations) for every class with overridable virtuals;
+  `emit_trampolines<^^ns...>()` returns C++ source — the required `<nanobind/stl/*.h>`
+  caster `#include`s (see STL casters below) plus trampoline structs +
+  `NB_REFLECT_TRAMPOLINE` registrations for every class with overridable virtuals;
   `write_trampolines(path, src)` dumps it. Run by a small generator program at build time.
 - `tests/test_reflect.{cpp,py}` — the main suite. `tests/test_reflect_codegen.{h,cpp,py}`
   + `tests/test_reflect_codegen_gen.cpp` — the codegen (two-stage build) test, wired in
@@ -69,6 +71,12 @@ thing that cannot be expressed in-language (a virtual-override **trampoline**) h
 - **Keyword-argument names**: P3096 parameter names → `nb::arg("name")` on methods, static
   methods, free functions, and constructors. (Default-argument *values* are not bound — a
   C++26 standard gap, not a binder one: P3096 exposes only `has_default_argument`, no value.)
+- **STL type-caster coverage**: reflection detects which std types appear in bound signatures
+  (recursively; `stl_caster_header`/`required_stl_types` in `nb_reflect.h`) and maps them to
+  `<nanobind/stl/*.h>`. Codegen *emits* those `#include`s (truly automatic); the header-only
+  `reflect_` path can't inject includes so it *static_asserts* with the missing header name
+  (`check_stl_casters`, P2741 message). `#include` can't be emitted from template code, so the
+  header-only path is detect-and-diagnose only.
 
 Roadmap / not yet: templates (need explicit instantiation lists — naturally
 annotation-driven), per-argument ownership-transfer annotations.
@@ -132,6 +140,6 @@ nanobind's suite is upstream and not the focus here.
 
 ## Contribution workflow
 
-Commit reflection work on `mk-reflect`, push to `fork`. Keep `docs/reflection.rst` and this
+Commit reflection work on `mk-reflect`, push to `origin` (the fork). Keep `docs/reflection.rst` and this
 file in sync with behavior. The umbrella repo `~/git/cpp26-reflect-nanobind` pins the exact
 commit of this checkout as a submodule.

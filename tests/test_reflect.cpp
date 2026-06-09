@@ -344,6 +344,25 @@ struct PyShape : reflect_test::Shape {
 
 NB_REFLECT_TRAMPOLINE(reflect_test::Shape, reflect_test_tramp::PyShape);
 
+// --- Compile-time checks for the STL-caster detection core (roadmap #5) ---
+// reflect_test binds std::string (Struct::s, ...) and std::vector<int>
+// (Nested::items), and no other std container, so its required-caster set is
+// exactly {string.h, vector.h}.
+namespace {
+consteval bool reflect_test_needs(std::string_view want) {
+    for (const char* h : nb::detail::required_stl_headers<^^reflect_test>())
+        if (std::string_view(h) == want)
+            return true;
+    return false;
+}
+}
+static_assert(std::string_view(nb::detail::stl_caster_header(^^std::vector<int>)) ==
+              "nanobind/stl/vector.h");
+static_assert(nb::detail::stl_caster_header(^^int) == nullptr);
+static_assert(reflect_test_needs("nanobind/stl/string.h"));
+static_assert(reflect_test_needs("nanobind/stl/vector.h"));
+static_assert(!reflect_test_needs("nanobind/stl/map.h"));
+
 NB_MODULE(test_reflect_ext, m) {
     nb::reflect_<^^reflect_test>(m);
 }
