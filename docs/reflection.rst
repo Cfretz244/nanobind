@@ -78,6 +78,9 @@ For **classes**, ``reflect_`` automatically binds:
 - All public nonstatic methods (including overloads, and ``const``, ``noexcept``,
   and lvalue-ref-qualified (``&``) methods)
 - All public static methods
+- Overloaded operators, mapped to Python dunders (see `Operators`_)
+- Conversion functions to ``bool``/integral/floating types (``__bool__`` /
+  ``__int__`` / ``__float__``)
 - A single public base class (see `Inheritance`_)
 
 For **enums**, all enumerators are bound by name.
@@ -193,6 +196,22 @@ be passed where a bound function expects a ``Serializable&``. Member access,
 however, is preserved. Diamond hierarchies are handled without binding any
 member twice (a base reached through the primary chain is not also flattened).
 
+Operators
+---------
+
+Member ``operator@`` overloads are mapped to the corresponding Python dunder
+methods automatically -- arithmetic and bitwise (``__add__``, ``__mul__``,
+``__lshift__``, …), comparisons (``__eq__``, ``__lt__``, …), in-place
+(``__iadd__``, … -- these preserve object identity), ``operator()`` →
+``__call__``, ``operator[]`` → ``__getitem__``, unary ``-``/``+``/``~`` →
+``__neg__``/``__pos__``/``__invert__``, and conversion functions to
+``bool``/integral/floating → ``__bool__``/``__int__``/``__float__``. Operators are
+bound with ``nb::is_operator()``, so calling one with an incompatible type yields
+``NotImplemented`` (letting Python try the reflected operand) rather than raising.
+
+Skipped: free (non-member) operators, ``operator<=>``, ``++``/``--``,
+``operator->``, logical ``&&``/``||``/``!``, and assignment ``operator=``.
+
 Virtual functions (overriding from Python)
 ------------------------------------------
 
@@ -268,8 +287,9 @@ Limitations
 - ``volatile`` methods, rvalue-ref-qualified (``&&``) methods, and C-variadic
   (``...``) functions are skipped (they cannot bind meaningfully to a persistent
   Python object); the rest of the class still binds.
-- Operator overloads (``operator+``, etc.) are not yet mapped to Python
-  dunder methods (as of March 2026).
+- Member operators are mapped to Python dunders (see `Operators`_); free
+  operators, ``operator<=>``, ``++``/``--``, and logical ``&&``/``||``/``!`` are
+  skipped.
 - **Multiple inheritance**: nanobind supports a single base class. The first
   public base is the real Python base; additional bases are flattened (their
   members are exposed on the derived type, but ``isinstance``/``issubclass``

@@ -215,6 +215,23 @@ struct Quals {
 
 double free_ne(double a) noexcept { return a * 2; }         // free noexcept -> bound
 
+// --- Operators -> Python dunders ---
+
+struct Ops {
+    int x;
+    Ops() : x(0) {}
+    explicit Ops(int v) : x(v) {}
+
+    Ops operator+(const Ops& o) const { return Ops(x + o.x); }  // __add__
+    Ops operator-() const { return Ops(-x); }                   // __neg__ (unary)
+    bool operator==(const Ops& o) const { return x == o.x; }    // __eq__
+    bool operator<(const Ops& o) const { return x < o.x; }      // __lt__
+    Ops& operator+=(const Ops& o) { x += o.x; return *this; }   // __iadd__
+    int operator()(int m) const { return x * m; }               // __call__
+    int operator[](int i) const { return x + i; }               // __getitem__
+    explicit operator bool() const { return x != 0; }           // __bool__
+};
+
 // --- Virtual functions / trampoline (Tier 1: hand-written trampoline) ---
 
 struct Shape {

@@ -247,6 +247,27 @@ def test24_diamond_no_double_bind():
 
 
 @needs_reflect
+def test27_operators():
+    a = t.Ops(2)
+    b = t.Ops(3)
+    assert (a + b).x == 5          # __add__
+    assert (-a).x == -2            # __neg__
+    assert (a == t.Ops(2))         # __eq__
+    assert (a != b)                # __ne__ derived from __eq__ by Python
+    assert (a < b)                 # __lt__
+    assert t.Ops(4)(3) == 12       # __call__
+    assert t.Ops(4)[1] == 5        # __getitem__
+    assert bool(t.Ops(1)) and not bool(t.Ops(0))   # __bool__
+    # __iadd__ mutates in place, preserving object identity.
+    c = t.Ops(2)
+    cid = id(c)
+    c += b
+    assert c.x == 5 and id(c) == cid
+    # is_operator(): mismatched type yields NotImplemented, not TypeError.
+    assert a.__add__("nope") is NotImplemented
+
+
+@needs_reflect
 def test26_function_qualifiers():
     q = t.Quals()
     # noexcept / const noexcept / lvalue-ref-qualified methods are bound.

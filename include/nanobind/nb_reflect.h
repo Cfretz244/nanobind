@@ -75,12 +75,10 @@ struct reflect_method_binder;
 #define NB_REFLECT_DEFINE_METHOD_BINDER(QUALS, CONST)                          \
     template <typename T, std::meta::info fn, typename Ret, typename... Args>  \
     struct reflect_method_binder<T, fn, Ret(Args...) QUALS> {                  \
-        static void bind(auto& cls) {                                          \
-            constexpr auto name =                                              \
-                std::define_static_string(std::meta::identifier_of(fn));       \
+        static void bind(auto& cls, const char* name, auto&&... extra) {       \
             cls.def(name, [](CONST T& self, Args... args) -> Ret {            \
                 return self.[:fn:](std::forward<Args>(args)...);              \
-            });                                                                \
+            }, std::forward<decltype(extra)>(extra)...);                       \
         }                                                                      \
     };
 
@@ -105,7 +103,8 @@ void reflect_bind_method(auto& cls) {
                   !std::meta::is_rvalue_reference_qualified(fn) &&
                   !std::meta::has_ellipsis_parameter(fn)) {
         using FnType = [:std::meta::type_of(fn):];
-        reflect_method_binder<T, fn, FnType>::bind(cls);
+        reflect_method_binder<T, fn, FnType>::bind(
+            cls, std::define_static_string(std::meta::identifier_of(fn)));
     }
 }
 
@@ -180,8 +179,11 @@ NB_REFLECT_DEFINE_FREE_BINDER(noexcept)
 
 template <std::meta::info fn>
 void reflect_free_function(module_& m) {
-    // Skip C-variadic free functions (their function type matches no binder).
-    if constexpr (!std::meta::has_ellipsis_parameter(fn)) {
+    // Skip C-variadic free functions (their function type matches no binder), and
+    // free operators (operator@ has no identifier -- binding free operators as
+    // reversed dunders is future work).
+    if constexpr (!std::meta::has_ellipsis_parameter(fn) &&
+                  std::meta::has_identifier(fn)) {
         using FnType = [:std::meta::type_of(fn):];
         reflect_free_fn_binder<fn, FnType>::bind(m);
     }
@@ -283,6 +285,112 @@ consteval std::vector<std::meta::info> flatten_bases_vec() {
     return result;
 }
 
+// --- Operators and conversions ---
+
+// Map a C++ operator (and member arity: 0 = unary, 1 = binary) to its Python
+// dunder name, or nullptr if it has no clean Python equivalent (and is skipped).
+consteval const char* operator_dunder(std::meta::operators op, std::size_t arity) {
+    using enum std::meta::operators;
+    switch (op) {
+    case op_plus:              return arity == 1 ? "__add__" : "__pos__";
+    case op_minus:             return arity == 1 ? "__sub__" : "__neg__";
+    case op_star:              return arity == 1 ? "__mul__" : nullptr;  // unary * = deref
+    case op_ampersand:         return arity == 1 ? "__and__" : nullptr;  // unary & = address-of
+    case op_slash:             return "__truediv__";
+    case op_percent:           return "__mod__";
+    case op_caret:             return "__xor__";
+    case op_pipe:              return "__or__";
+    case op_tilde:             return "__invert__";
+    case op_less_less:         return "__lshift__";
+    case op_greater_greater:   return "__rshift__";
+    case op_equals_equals:     return "__eq__";
+    case op_exclamation_equals:return "__ne__";
+    case op_less:              return "__lt__";
+    case op_greater:           return "__gt__";
+    case op_less_equals:       return "__le__";
+    case op_greater_equals:    return "__ge__";
+    case op_plus_equals:       return "__iadd__";
+    case op_minus_equals:      return "__isub__";
+    case op_star_equals:       return "__imul__";
+    case op_slash_equals:      return "__itruediv__";
+    case op_percent_equals:    return "__imod__";
+    case op_caret_equals:      return "__ixor__";
+    case op_ampersand_equals:  return "__iand__";
+    case op_pipe_equals:       return "__ior__";
+    case op_less_less_equals:  return "__ilshift__";
+    case op_greater_greater_equals: return "__irshift__";
+    case op_parentheses:       return "__call__";
+    case op_square_brackets:   return "__getitem__";
+    default:                   return nullptr;  // <=>, ++/--, &&/||/!, ->, =, new/delete, ...
+    }
+}
+
+consteval bool is_inplace_operator(std::meta::operators op) {
+    using enum std::meta::operators;
+    switch (op) {
+    case op_plus_equals: case op_minus_equals: case op_star_equals:
+    case op_slash_equals: case op_percent_equals: case op_caret_equals:
+    case op_ampersand_equals: case op_pipe_equals:
+    case op_less_less_equals: case op_greater_greater_equals:
+        return true;
+    default:
+        return false;
+    }
+}
+
+template <typename T, std::meta::info fn>
+void reflect_bind_operator(auto& cls) {
+    constexpr auto op = std::meta::operator_of(fn);
+    constexpr const char* dunder =
+        operator_dunder(op, std::meta::parameters_of(fn).size());
+    if constexpr (dunder != nullptr && !std::meta::is_volatile(fn) &&
+                  !std::meta::is_rvalue_reference_qualified(fn) &&
+                  !std::meta::has_ellipsis_parameter(fn)) {
+        using FnType = [:std::meta::type_of(fn):];
+        // is_operator() makes mismatched-argument calls return NotImplemented
+        // rather than raising TypeError, matching Python operator semantics.
+        if constexpr (is_inplace_operator(op)) {
+            // In-place operators return *this; rv_policy::reference returns the
+            // existing Python object (preserving identity) instead of a copy.
+            reflect_method_binder<T, fn, FnType>::bind(
+                cls, dunder, is_operator(), rv_policy::reference);
+        } else {
+            reflect_method_binder<T, fn, FnType>::bind(cls, dunder, is_operator());
+        }
+    }
+}
+
+template <typename T, std::meta::info fn>
+void reflect_bind_conversion(auto& cls) {
+    // Use fixed concrete lambda return types (bool/long long/double) and cast the
+    // conversion result: a spliced type in a lambda signature crashes the
+    // clang-p2996 mangler.
+    constexpr auto R = std::meta::return_type_of(fn);
+    if constexpr (std::meta::is_same_type(R, ^^bool))
+        cls.def("__bool__", [](T& self) -> bool { return (bool) self.[:fn:](); });
+    else if constexpr (std::meta::is_integral_type(R))
+        cls.def("__int__", [](T& self) -> long long { return (long long) self.[:fn:](); });
+    else if constexpr (std::meta::is_floating_point_type(R))
+        cls.def("__float__", [](T& self) -> double { return (double) self.[:fn:](); });
+    // else: no standard numeric dunder -- skip.
+}
+
+// Route a public member function to the right binder. Operators and conversion
+// functions have no identifier, so they must be detected before reflect_bind_method
+// (which names the binding via identifier_of).
+template <typename T, std::meta::info fn>
+void reflect_bind_member_function(auto& cls) {
+    if constexpr (std::meta::is_operator_function(fn))
+        reflect_bind_operator<T, fn>(cls);
+    else if constexpr (std::meta::is_conversion_function(fn))
+        reflect_bind_conversion<T, fn>(cls);
+    else if constexpr (std::meta::is_static_member(fn))
+        reflect_bind_static_method<fn>(cls);
+    else if constexpr (std::meta::has_identifier(fn))
+        reflect_bind_method<T, fn>(cls);
+    // else: nameless and non-operator (e.g. a literal operator) -- skip.
+}
+
 // Bind the constructors, data members, static data members, and methods declared
 // directly in T onto an already-created class_ object. Inherited members are not
 // re-bound here -- they are exposed automatically through the Python base type.
@@ -318,7 +426,7 @@ void bind_class_contents(auto& cls) {
         }
     };
 
-    // Bind methods (instance and static)
+    // Bind methods (instance, static, operators, conversions)
     template for (constexpr auto fn :
         std::define_static_array(std::meta::members_of(
             ^^T, std::meta::access_context::unchecked()))) {
@@ -327,11 +435,7 @@ void bind_class_contents(auto& cls) {
             && !std::meta::is_constructor(fn)
             && !std::meta::is_destructor(fn)
             && !std::meta::is_special_member_function(fn)) {
-            if constexpr (std::meta::is_static_member(fn)) {
-                reflect_bind_static_method<fn>(cls);
-            } else {
-                reflect_bind_method<T, fn>(cls);
-            }
+            reflect_bind_member_function<T, fn>(cls);
         }
     };
 }
@@ -366,11 +470,7 @@ void flatten_base_members(auto& cls) {
             && !std::meta::is_constructor(fn)
             && !std::meta::is_destructor(fn)
             && !std::meta::is_special_member_function(fn)) {
-            if constexpr (std::meta::is_static_member(fn)) {
-                reflect_bind_static_method<fn>(cls);
-            } else {
-                reflect_bind_method<T, fn>(cls);
-            }
+            reflect_bind_member_function<T, fn>(cls);
         }
     };
 }
