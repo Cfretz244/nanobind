@@ -192,6 +192,72 @@ be passed where a bound function expects a ``Serializable&``. Member access,
 however, is preserved. Diamond hierarchies are handled without binding any
 member twice (a base reached through the primary chain is not also flattened).
 
+Virtual functions (overriding from Python)
+------------------------------------------
+
+Letting a *Python* subclass override a C++ ``virtual`` (so that C++ code calling
+through a base pointer dispatches into the Python override) requires nanobind's
+*trampoline*: a class derived from the bound type that overrides each virtual to
+forward into Python. A trampoline cannot be synthesized in-language (P2996 has no
+way to inject member functions), so reflection handles virtuals in **two tiers**.
+
+In both tiers, ``reflect_`` consults a trait: when a trampoline is registered for a
+class (via ``NB_REFLECT_TRAMPOLINE(Type, Trampoline)``) it is passed to nanobind as
+the ``class_`` *Alias*. The two tiers differ only in who writes the trampoline.
+
+**Tier 1 -- hand-written trampoline.** Write the trampoline as you would for plain
+nanobind and register it; ``reflect_`` wires it in and still auto-binds everything
+else:
+
+.. code-block:: cpp
+
+   struct Shape { virtual double area() const = 0; virtual ~Shape() = default; };
+
+   struct PyShape : Shape {                 // outside the reflected namespace
+       NB_TRAMPOLINE(Shape, 1);
+       double area() const override { NB_OVERRIDE_PURE(area); }
+   };
+   NB_REFLECT_TRAMPOLINE(Shape, PyShape);
+
+**Tier 2 -- generated trampoline (codegen fallback).** ``<nanobind/nb_reflect_codegen.h>``
+provides ``emit_trampolines<^^ns...>()``, which returns C++ source text containing a
+trampoline (and its ``NB_REFLECT_TRAMPOLINE``) for every class with overridable
+virtuals. A small generator program writes it to a header that the bindings TU
+includes before calling ``reflect_``. The build runs the same three steps whether or
+not any trampoline is needed (the generated header may be empty):
+
+.. code-block:: cpp
+
+   // generator.cpp
+   #include <nanobind/nb_reflect_codegen.h>
+   #include "my_types.h"
+   int main(int argc, char** argv) {
+       return nanobind::write_trampolines(
+           argv[1], nanobind::emit_trampolines<^^my_namespace>()) ? 0 : 1;
+   }
+
+.. code-block:: cmake
+
+   add_executable(gen generator.cpp)
+   target_compile_options(gen PRIVATE ${REFLECT_FLAGS})
+   add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/trampolines.gen.h
+                      COMMAND gen ${CMAKE_CURRENT_BINARY_DIR}/trampolines.gen.h
+                      DEPENDS gen)
+   nanobind_add_module(my_ext bindings.cpp ${CMAKE_CURRENT_BINARY_DIR}/trampolines.gen.h)
+   target_include_directories(my_ext PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
+.. code-block:: cpp
+
+   // bindings.cpp
+   #include "my_types.h"
+   #include "trampolines.gen.h"     // generated; may be empty
+   NB_MODULE(my_ext, m) { nanobind::reflect_<^^my_namespace>(m); }
+
+The generated code refers to each virtual's return and parameter types via splices
+off the method's reflection, so it needs no C++ type-name printer and resolves
+overloaded virtuals correctly. Inherited virtuals are included; the destructor and
+private virtuals are skipped.
+
 Limitations
 -----------
 
@@ -205,6 +271,8 @@ Limitations
   members are exposed on the derived type, but ``isinstance``/``issubclass``
   against them is ``False`` and the derived type cannot be passed where those
   bases are expected at the binding boundary). See `Multiple inheritance`_.
-- Virtual functions are not bound with trampolines, so overriding C++ virtual
-  methods from Python is not yet supported. Virtual (and diamond) inheritance
+- **Virtual functions**: overriding from Python works via a trampoline that is
+  hand-written or generated (see `Virtual functions (overriding from Python)`_),
+  since trampolines cannot be synthesized in-language. Ref-qualified
+  (``&``/``&&``) and ``final`` virtuals are not generated; virtual (diamond) base
   layouts are untested.

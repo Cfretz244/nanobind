@@ -38,6 +38,16 @@ template <typename T>
 inline constexpr bool has_reflect_trampoline =
     !std::is_same_v<reflect_trampoline_t<T>, void>;
 
+// Returns the K-th member reflection of class `Owner`. Generated trampoline code
+// (nb_reflect_codegen.h) uses this to refer to a specific virtual method by index
+// so that its return/parameter types can be spliced (typename [:type_of(...):])
+// without spelling them as text -- which also resolves overloaded virtuals to the
+// exact overload.
+template <std::meta::info Owner, std::size_t K>
+consteval std::meta::info codegen_member() {
+    return std::meta::members_of(Owner, std::meta::access_context::unchecked())[K];
+}
+
 template <typename T, std::meta::info mem>
 void reflect_bind_member(auto& cls) {
     constexpr auto name =

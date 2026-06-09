@@ -181,6 +181,31 @@ if (NB_REFLECT_FLAGS)
   nanobind_add_module(test_reflect_ext test_reflect.cpp ${NB_EXTRA_ARGS})
   target_compile_options(test_reflect_ext PRIVATE ${NB_REFLECT_FLAGS})
   target_link_options(test_reflect_ext PRIVATE ${NB_REFLECT_FLAGS})
+
+  # Codegen (tier 2) trampoline test: a generator program emits trampoline source
+  # via reflection, the build runs it to produce a header, and the bindings module
+  # includes that header. The same steps run whether or not a trampoline is needed.
+  set(NB_REFLECT_GEN_HDR
+      ${CMAKE_CURRENT_BINARY_DIR}/test_reflect_codegen_tramp.gen.h)
+
+  add_executable(test_reflect_codegen_gen test_reflect_codegen_gen.cpp)
+  target_compile_options(test_reflect_codegen_gen PRIVATE ${NB_REFLECT_FLAGS})
+  target_link_options(test_reflect_codegen_gen PRIVATE ${NB_REFLECT_FLAGS})
+  target_include_directories(test_reflect_codegen_gen
+      PRIVATE ${NB_DIR}/include ${Python_INCLUDE_DIRS})
+
+  add_custom_command(
+      OUTPUT ${NB_REFLECT_GEN_HDR}
+      COMMAND test_reflect_codegen_gen ${NB_REFLECT_GEN_HDR}
+      DEPENDS test_reflect_codegen_gen
+      COMMENT "Generating nanobind trampolines via reflection")
+  add_custom_target(test_reflect_codegen_generate DEPENDS ${NB_REFLECT_GEN_HDR})
+
+  nanobind_add_module(test_reflect_codegen_ext test_reflect_codegen.cpp ${NB_EXTRA_ARGS})
+  target_compile_options(test_reflect_codegen_ext PRIVATE ${NB_REFLECT_FLAGS})
+  target_link_options(test_reflect_codegen_ext PRIVATE ${NB_REFLECT_FLAGS})
+  target_include_directories(test_reflect_codegen_ext PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+  add_dependencies(test_reflect_codegen_ext test_reflect_codegen_generate)
 endif()
 
 add_library(
@@ -226,6 +251,7 @@ set(TEST_FILES
   test_thread.py
   test_specialization.py
   test_reflect.py
+  test_reflect_codegen.py
 
   # Stub reference files
   test_classes_ext.pyi.ref
