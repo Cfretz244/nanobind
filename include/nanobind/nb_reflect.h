@@ -1037,63 +1037,92 @@ consteval bool is_stl_policy(std::meta::info type) {
 }
 
 // Append the std caster types reachable from `type` (itself and, recursively, its
-// value-carrying template arguments) to `out`, de-duplicated by reflection.
+// value-carrying template arguments) to `out`, de-duplicated by reflection. `visited`
+// guards the *recursion* against cycles: a self-referential type whose template args
+// contain itself (e.g. nlohmann::json, whose object_t is std::map<std::string, json>
+// and array_t is std::vector<json>) would otherwise recurse forever -- the out-dedup
+// only prevents duplicate pushes, not re-descent through a non-caster cycle node.
 consteval void collect_stl_types(std::meta::info type,
-                                 std::vector<std::meta::info>& out) {
+                                 std::vector<std::meta::info>& out,
+                                 std::vector<std::meta::info>& visited) {
     type = std::meta::remove_cvref(type);
     if (!std::meta::has_template_arguments(type))
         return;
+    if (info_vec_contains(visited, type))
+        return;
+    visited.push_back(type);
     if (stl_caster_header(type) != nullptr && !info_vec_contains(out, type))
         out.push_back(type);
     for (auto arg : std::meta::template_arguments_of(type))
         if (std::meta::is_type(arg) && !is_stl_policy(arg))
-            collect_stl_types(arg, out);
+            collect_stl_types(arg, out, visited);
+}
+consteval void collect_stl_types(std::meta::info type,
+                                 std::vector<std::meta::info>& out) {
+    std::vector<std::meta::info> visited;
+    collect_stl_types(type, out, visited);
 }
 
 // Collect std caster types from every signature directly declared in class `cls`
 // (data members, static data members, and the return/parameter types of its
 // constructors, methods, and operators). Inherited members are covered when the
 // base class is itself walked.
+// A single shared `visited` is threaded through the whole class/scope walk: without it,
+// a class whose members repeatedly mention the same heavy type (e.g. nlohmann::json, whose
+// ~hundreds of members each take/return basic_json) re-walks that type's full graph once per
+// member, exploding constexpr step count (and, pushed far enough, ICEing the toolchain).
 consteval void collect_class_stl_types(std::meta::info cls,
-                                       std::vector<std::meta::info>& out) {
+                                       std::vector<std::meta::info>& out,
+                                       std::vector<std::meta::info>& visited) {
     for (auto mem : std::meta::members_of(cls, std::meta::access_context::unchecked())) {
         if (!std::meta::is_public(mem) || std::meta::is_template(mem))
             continue;
         if (std::meta::is_function(mem) && !std::meta::is_destructor(mem)) {
             if (!std::meta::is_constructor(mem))
-                collect_stl_types(std::meta::return_type_of(mem), out);
+                collect_stl_types(std::meta::return_type_of(mem), out, visited);
             for (auto p : std::meta::parameters_of(mem))
-                collect_stl_types(std::meta::type_of(p), out);
+                collect_stl_types(std::meta::type_of(p), out, visited);
         }
     }
     for (auto mem : std::meta::nonstatic_data_members_of(
              cls, std::meta::access_context::unchecked()))
         if (std::meta::is_public(mem))
-            collect_stl_types(std::meta::type_of(mem), out);
+            collect_stl_types(std::meta::type_of(mem), out, visited);
     for (auto mem : std::meta::static_data_members_of(
              cls, std::meta::access_context::unchecked()))
         if (std::meta::is_public(mem))
-            collect_stl_types(std::meta::type_of(mem), out);
+            collect_stl_types(std::meta::type_of(mem), out, visited);
+}
+consteval void collect_class_stl_types(std::meta::info cls,
+                                       std::vector<std::meta::info>& out) {
+    std::vector<std::meta::info> visited;
+    collect_class_stl_types(cls, out, visited);
 }
 
 // Walk a namespace (recursively) collecting std caster types from its classes and
 // free functions; or, when given a class directly, just that class.
 consteval void collect_scope_stl_types(std::meta::info r,
-                                       std::vector<std::meta::info>& out) {
+                                       std::vector<std::meta::info>& out,
+                                       std::vector<std::meta::info>& visited) {
     if (std::meta::is_namespace(r)) {
         for (auto mem : std::meta::members_of(r, std::meta::access_context::unchecked())) {
             if (std::meta::is_type(mem) && std::meta::is_class_type(mem))
-                collect_class_stl_types(mem, out);
+                collect_class_stl_types(mem, out, visited);
             else if (std::meta::is_function(mem) && !std::meta::is_template(mem)) {
-                collect_stl_types(std::meta::return_type_of(mem), out);
+                collect_stl_types(std::meta::return_type_of(mem), out, visited);
                 for (auto p : std::meta::parameters_of(mem))
-                    collect_stl_types(std::meta::type_of(p), out);
+                    collect_stl_types(std::meta::type_of(p), out, visited);
             } else if (std::meta::is_namespace(mem))
-                collect_scope_stl_types(mem, out);
+                collect_scope_stl_types(mem, out, visited);
         }
     } else if (std::meta::is_type(r) && std::meta::is_class_type(r)) {
-        collect_class_stl_types(r, out);
+        collect_class_stl_types(r, out, visited);
     }
+}
+consteval void collect_scope_stl_types(std::meta::info r,
+                                       std::vector<std::meta::info>& out) {
+    std::vector<std::meta::info> visited;
+    collect_scope_stl_types(r, out, visited);
 }
 
 // --- User (non-std) class-template specialization discovery ---
@@ -1123,71 +1152,84 @@ consteval bool is_user_class_template_spec(std::meta::info type) {
 // (pointer/ref/cv-unwrapped) type itself if it is one, plus, recursively, its
 // non-policy template args (Foo<Bar<int>> yields both Foo<Bar<int>> and Bar<int>)
 // -- to `out`, de-duplicated.
+// `visited` guards recursion against self-referential template args (same cycle hazard
+// as collect_stl_types: nlohmann::json's args contain json itself).
 consteval void collect_user_specs_from_type(std::meta::info type,
-                                            std::vector<std::meta::info>& out) {
+                                            std::vector<std::meta::info>& out,
+                                            std::vector<std::meta::info>& visited) {
     type = std::meta::remove_cvref(type);
     while (std::meta::is_pointer_type(type))
         type = std::meta::remove_cvref(std::meta::remove_pointer(type));
     if (!std::meta::has_template_arguments(type))
         return;
+    if (info_vec_contains(visited, type))
+        return;
+    visited.push_back(type);
     if (is_user_class_template_spec(type) && !info_vec_contains(out, type))
         out.push_back(type);
     for (auto arg : std::meta::template_arguments_of(type))
         if (std::meta::is_type(arg) && !is_stl_policy(arg))
-            collect_user_specs_from_type(arg, out);
+            collect_user_specs_from_type(arg, out, visited);
+}
+consteval void collect_user_specs_from_type(std::meta::info type,
+                                            std::vector<std::meta::info>& out) {
+    std::vector<std::meta::info> visited;
+    collect_user_specs_from_type(type, out, visited);
 }
 
 // Scan one class's own signatures -- data members, static data, the return/param
 // types of its functions, and its bases -- for user specializations. Skips template
 // members (a member template has no concrete signature) and destructors.
 consteval void collect_class_user_specs(std::meta::info cls,
-                                        std::vector<std::meta::info>& out) {
+                                        std::vector<std::meta::info>& out,
+                                        std::vector<std::meta::info>& visited) {
     for (auto mem : std::meta::members_of(cls, std::meta::access_context::unchecked())) {
         if (!std::meta::is_public(mem) || std::meta::is_template(mem))
             continue;
         if (std::meta::is_function(mem) && !std::meta::is_destructor(mem)) {
             if (!std::meta::is_constructor(mem))
-                collect_user_specs_from_type(std::meta::return_type_of(mem), out);
+                collect_user_specs_from_type(std::meta::return_type_of(mem), out, visited);
             for (auto p : std::meta::parameters_of(mem))
-                collect_user_specs_from_type(std::meta::type_of(p), out);
+                collect_user_specs_from_type(std::meta::type_of(p), out, visited);
         }
     }
     for (auto mem : std::meta::nonstatic_data_members_of(
              cls, std::meta::access_context::unchecked()))
         if (std::meta::is_public(mem))
-            collect_user_specs_from_type(std::meta::type_of(mem), out);
+            collect_user_specs_from_type(std::meta::type_of(mem), out, visited);
     for (auto mem : std::meta::static_data_members_of(
              cls, std::meta::access_context::unchecked()))
         if (std::meta::is_public(mem))
-            collect_user_specs_from_type(std::meta::type_of(mem), out);
+            collect_user_specs_from_type(std::meta::type_of(mem), out, visited);
     for (auto b : std::meta::bases_of(cls, std::meta::access_context::unchecked()))
         if (std::meta::is_public(b))
-            collect_user_specs_from_type(std::meta::type_of(b), out);
+            collect_user_specs_from_type(std::meta::type_of(b), out, visited);
 }
 
 // Seed pass: walk a namespace (recursively) collecting user specs from its classes
 // and free functions; or, given a class/spec or function directly, from that entity
 // (including the entity itself when it is a spec).
 consteval void collect_scope_user_specs(std::meta::info r,
-                                        std::vector<std::meta::info>& out) {
+                                        std::vector<std::meta::info>& out,
+                                        std::vector<std::meta::info>& visited) {
     if (std::meta::is_namespace(r)) {
         for (auto mem : std::meta::members_of(r, std::meta::access_context::unchecked())) {
             if (std::meta::is_type(mem) && std::meta::is_class_type(mem))
-                collect_class_user_specs(mem, out);
+                collect_class_user_specs(mem, out, visited);
             else if (std::meta::is_function(mem) && !std::meta::is_template(mem)) {
-                collect_user_specs_from_type(std::meta::return_type_of(mem), out);
+                collect_user_specs_from_type(std::meta::return_type_of(mem), out, visited);
                 for (auto p : std::meta::parameters_of(mem))
-                    collect_user_specs_from_type(std::meta::type_of(p), out);
+                    collect_user_specs_from_type(std::meta::type_of(p), out, visited);
             } else if (std::meta::is_namespace(mem))
-                collect_scope_user_specs(mem, out);
+                collect_scope_user_specs(mem, out, visited);
         }
     } else if (std::meta::is_type(r) && std::meta::is_class_type(r)) {
-        collect_user_specs_from_type(r, out);     // r itself, if a spec
-        collect_class_user_specs(r, out);         // and its members/bases
+        collect_user_specs_from_type(r, out, visited);     // r itself, if a spec
+        collect_class_user_specs(r, out, visited);         // and its members/bases
     } else if (std::meta::is_function(r)) {
-        collect_user_specs_from_type(std::meta::return_type_of(r), out);
+        collect_user_specs_from_type(std::meta::return_type_of(r), out, visited);
         for (auto p : std::meta::parameters_of(r))
-            collect_user_specs_from_type(std::meta::type_of(p), out);
+            collect_user_specs_from_type(std::meta::type_of(p), out, visited);
     }
 }
 
@@ -1197,16 +1239,16 @@ consteval void collect_scope_user_specs(std::meta::info r,
 // Box<int>). The index loop over the growing vector plus the dedup is a worklist
 // fixpoint that visits each spec once -- terminating on CRTP/self-referential specs.
 consteval std::vector<std::meta::info> required_user_specs(std::meta::info r) {
-    std::vector<std::meta::info> out;
-    collect_scope_user_specs(r, out);
+    std::vector<std::meta::info> out, visited;
+    collect_scope_user_specs(r, out, visited);
     for (std::size_t i = 0; i < out.size(); ++i)
-        collect_class_user_specs(out[i], out);
+        collect_class_user_specs(out[i], out, visited);
     return out;
 }
 
 consteval std::vector<std::meta::info> required_stl_types(std::meta::info r) {
-    std::vector<std::meta::info> out;
-    collect_scope_stl_types(r, out);
+    std::vector<std::meta::info> out, visited;
+    collect_scope_stl_types(r, out, visited);
     return out;
 }
 
@@ -1217,10 +1259,10 @@ consteval std::vector<std::meta::info> required_stl_types(std::meta::info r) {
 // -- the codegen path (emit_stl_includes), which must emit the #includes, calls this;
 // the header-only path leaves spec-member casters to surface at bind time.
 consteval std::vector<std::meta::info> required_stl_types_with_specs(std::meta::info r) {
-    std::vector<std::meta::info> out;
-    collect_scope_stl_types(r, out);
+    std::vector<std::meta::info> out, visited;
+    collect_scope_stl_types(r, out, visited);
     for (auto spec : required_user_specs(r))
-        collect_class_stl_types(spec, out);
+        collect_class_stl_types(spec, out, visited);
     return out;
 }
 
