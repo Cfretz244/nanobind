@@ -867,11 +867,13 @@ void bind_class_contents(auto& cls) {
         }
     };
 
-    // Bind data members
+    // Bind data members. Skip unnamed members (anonymous union/struct fields, e.g. glm's
+    // x/y/z/w swizzle aliasing): identifier_of() is ill-formed on them, and a pointer-to-member
+    // of the enclosing class cannot be formed for an anonymous-union member anyway.
     template for (constexpr auto mem :
         std::define_static_array(std::meta::nonstatic_data_members_of(
             ^^T, std::meta::access_context::unchecked()))) {
-        if constexpr (std::meta::is_public(mem)) {
+        if constexpr (std::meta::is_public(mem) && std::meta::has_identifier(mem)) {
             reflect_bind_member<T, mem>(cls);
         }
     };
@@ -880,7 +882,7 @@ void bind_class_contents(auto& cls) {
     template for (constexpr auto mem :
         std::define_static_array(std::meta::static_data_members_of(
             ^^T, std::meta::access_context::unchecked()))) {
-        if constexpr (std::meta::is_public(mem)) {
+        if constexpr (std::meta::is_public(mem) && std::meta::has_identifier(mem)) {
             reflect_bind_static_member<T, mem>(cls);
         }
     };

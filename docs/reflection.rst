@@ -522,6 +522,10 @@ Limitations
 - Requires a compiler with P2996 support. As of March 2026, mainline Clang
   and MSVC do not implement the proposal.
 - Private and protected members are skipped.
+- **Unnamed data members** (e.g. the components of an anonymous union/struct, as in
+  glm's ``vec`` swizzle aliasing) are skipped: no pointer-to-member can be formed for
+  an anonymous-union member, so they cannot be exposed by name. The class still binds
+  (constructors, ``operator[]``, methods, etc.).
 - ``volatile`` methods, rvalue-ref-qualified (``&&``) methods, and C-variadic
   (``...``) functions are skipped (they cannot bind meaningfully to a persistent
   Python object); the rest of the class still binds.
