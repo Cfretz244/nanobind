@@ -247,6 +247,42 @@ def test24_diamond_no_double_bind():
 
 
 @needs_reflect
+def test28_annotation_skip_rename_doc():
+    # skip: class, method, data member, and free function are absent.
+    assert not hasattr(t, 'HiddenClass')
+    assert not hasattr(t, 'hidden_free')
+    a = t.Annotated()
+    assert hasattr(a, 'kept') and hasattr(a, 'visible')
+    assert not hasattr(a, 'secret')
+    assert not hasattr(a, 'hidden_method')
+    # rename: present under the new name, absent under the old.
+    assert a.renamed() == 7
+    assert not hasattr(a, 'original_name')
+    assert t.renamed_free() == 3
+    assert not hasattr(t, 'original_free')
+    # doc: docstring is attached.
+    assert a.documented() == 9
+    assert t.Annotated.documented.__doc__ is not None
+    assert 'documented method' in t.Annotated.documented.__doc__
+
+
+@needs_reflect
+def test29_annotation_lifetime():
+    # reference_internal: repeated access returns the SAME Python object (proof the
+    # return-value policy was applied; a default ref return would copy).
+    h = t.Holder()
+    assert h.get_inner() is h.get_inner()
+    # the returned view stays valid while the parent lives
+    h.get_inner().v = 5
+    assert h.get_inner().v == 5
+    # keep_alive-annotated method binds and works.
+    x = t.KA()
+    y = t.KA()
+    x.absorb(y)
+    assert x.total == 1
+
+
+@needs_reflect
 def test27_operators():
     a = t.Ops(2)
     b = t.Ops(3)

@@ -1,4 +1,5 @@
 #include <nanobind/nb_reflect.h>
+#include <nanobind/nb_reflect_annotations.h>
 #include <nanobind/trampoline.h>
 #include <nanobind/stl/vector.h>
 #include <nanobind/stl/string.h>
@@ -7,6 +8,7 @@
 #include <vector>
 
 namespace nb = nanobind;
+namespace r = nanobind::reflect;
 
 // A base class that lives OUTSIDE the reflected namespace and is never passed to
 // reflect_<...>. It must still be bound transitively so the derived class works.
@@ -214,6 +216,47 @@ struct Quals {
 };
 
 double free_ne(double a) noexcept { return a * 2; }         // free noexcept -> bound
+
+// --- Annotation-driven control (skip / rename / doc / lifetime) ---
+
+struct [[=r::skip{}]] HiddenClass {
+    int x;
+    HiddenClass() : x(0) {}
+};
+
+struct Annotated {
+    int kept;
+    [[=r::skip{}]] int secret;                    // skipped data member
+    Annotated() : kept(0), secret(0) {}
+
+    int visible() const { return kept; }
+    [[=r::skip{}]] int hidden_method() const { return 1; }        // skipped
+    [[=r::rename{"renamed"}]] int original_name() const { return 7; }
+    [[=r::doc{"documented method"}]] int documented() const { return 9; }
+};
+
+struct Inner {
+    int v;
+    Inner() : v(0) {}
+};
+
+struct Holder {
+    Inner inner;
+    Holder() = default;
+    // reference_internal: repeated calls return the SAME Python object (and keep
+    // the Holder alive); without the annotation a ref return would be copied.
+    [[=r::reference_internal]] Inner& get_inner() { return inner; }
+};
+
+struct KA {
+    int total;
+    KA() : total(0) {}
+    // keep_alive{1,2}: nurse = self (1), patient = the argument (2).
+    [[=r::keep_alive{1, 2}]] void absorb(KA& other) { total += other.total + 1; }
+};
+
+[[=r::skip{}]] int hidden_free() { return 1; }
+[[=r::rename{"renamed_free"}]] int original_free() { return 3; }
 
 // --- Operators -> Python dunders ---
 

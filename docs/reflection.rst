@@ -278,6 +278,50 @@ off the method's reflection, so it needs no C++ type-name printer and resolves
 overloaded virtuals correctly. Inherited virtuals are included; the destructor and
 private virtuals are skipped.
 
+Controlling the bindings with annotations
+-----------------------------------------
+
+You can tag declarations in your own C++ code to control what ``reflect_`` binds and
+how, using P3394 annotation-attributes (``[[=value]]``). The vocabulary lives in a
+dependency-free header so it can be included by *library* code without pulling in
+nanobind:
+
+.. code-block:: cpp
+
+   #include <nanobind/nb_reflect_annotations.h>
+   namespace r = nanobind::reflect;
+
+   struct [[=r::skip{}]] Internal { ... };        // never bound
+
+   struct Widget {
+       int width;
+       [[=r::skip{}]] int cache;                   // data member omitted
+
+       [[=r::rename{"size"}]] int get_size() const;     // bound as "size"
+       [[=r::doc{"Reset to defaults."}]] void reset();   // docstring
+
+       // Return-value lifetime/ownership policy (maps to nanobind's rv_policy):
+       [[=r::reference_internal]] Buffer& buffer();
+       [[=r::reference]] Manager* manager() const;
+   };
+
+   // Tie lifetimes: keep argument 1 (the parent) alive as long as the return lives.
+   [[=r::keep_alive{0, 1}]] Child* make_child(Parent& parent);
+
+Available annotations:
+
+- ``skip`` — exclude a class, enum, member, data member, constructor, or free function.
+- ``rename{"name"}`` — bind under a different Python name.
+- ``doc{"text"}`` — attach a docstring (functions, methods, data members).
+- ``return_policy{...}`` / the shorthands ``take_ownership``, ``copy``, ``move``,
+  ``reference``, ``reference_internal``, ``take_nothing`` — set the return-value policy on
+  a function or method.
+- ``keep_alive{nurse, patient}`` — tie one argument's/return's lifetime to another
+  (index 0 = return, 1 = ``self`` / first argument, ...; see nanobind's ``keep_alive``).
+
+Annotations are read at compile time; an unannotated entity uses the defaults, so adding
+annotations is purely incremental.
+
 Limitations
 -----------
 
@@ -300,3 +344,5 @@ Limitations
   since trampolines cannot be synthesized in-language. Ref-qualified
   (``&``/``&&``) and ``final`` virtuals are not generated; virtual (diamond) base
   layouts are untested.
+- **Annotations**: class- and enum-level docstrings, and per-argument ownership
+  transfer, are not yet handled (see `Controlling the bindings with annotations`_).

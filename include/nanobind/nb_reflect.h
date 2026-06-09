@@ -15,6 +15,7 @@
 
 #include <meta>
 #include "nanobind.h"
+#include "nb_reflect_annotations.h"
 #include "stl/string.h"
 #include <string_view>
 #include <type_traits>
@@ -48,18 +49,122 @@ consteval std::meta::info codegen_member() {
     return std::meta::members_of(Owner, std::meta::access_context::unchecked())[K];
 }
 
+// --- Annotation reading (see nb_reflect_annotations.h for the vocabulary) ---
+
+// True if entity R carries an annotation of (non-template) type A.
+template <std::meta::info R, typename A>
+consteval bool has_ann() {
+    return !std::meta::annotations_of(R, ^^A).empty();
+}
+
+// Value of R's first annotation of type A (precondition: has_ann<R, A>()).
+template <std::meta::info R, typename A>
+consteval A get_ann() {
+    return [: std::meta::constant_of(std::meta::annotations_of(R, ^^A)[0]) :];
+}
+
+// rename/doc are templates (reflect::rename<N>), so they are matched by template,
+// not by exact type. Returns the stored string lifted to static storage, or the
+// fallback if absent.
+template <std::meta::info R, std::meta::info Tmpl>
+consteval const char* ann_string_or(const char* fallback) {
+    template for (constexpr auto ann :
+                  std::define_static_array(std::meta::annotations_of(R))) {
+        constexpr auto t = std::meta::type_of(ann);
+        if constexpr (std::meta::has_template_arguments(t) &&
+                      std::meta::template_of(t) == Tmpl) {
+            constexpr auto v = [: std::meta::constant_of(ann) :];
+            return std::define_static_string(
+                std::string_view(v.str.data, sizeof(v.str.data) - 1));
+        }
+    }
+    return fallback;
+}
+
+// Python name for R: an explicit reflect::rename, else its C++ identifier.
+template <std::meta::info R>
+consteval const char* entity_name() {
+    return ann_string_or<R, ^^reflect::rename>(
+        std::define_static_string(std::meta::identifier_of(R)));
+}
+
+// Docstring for R, or nullptr if none.
+template <std::meta::info R>
+consteval const char* entity_doc() {
+    return ann_string_or<R, ^^reflect::doc>(nullptr);
+}
+
+consteval rv_policy to_rv_policy(reflect::lifetime lt) {
+    switch (lt) {
+    case reflect::lifetime::take_ownership:     return rv_policy::take_ownership;
+    case reflect::lifetime::copy:               return rv_policy::copy;
+    case reflect::lifetime::move:               return rv_policy::move;
+    case reflect::lifetime::reference:          return rv_policy::reference;
+    case reflect::lifetime::reference_internal: return rv_policy::reference_internal;
+    case reflect::lifetime::none:               return rv_policy::none;
+    default:                                    return rv_policy::automatic;
+    }
+}
+
+// Return-value policy annotated on R, or rv_policy::automatic (a no-op default).
+template <std::meta::info R>
+consteval rv_policy ann_rv_policy() {
+    if constexpr (has_ann<R, reflect::return_policy>())
+        return to_rv_policy(get_ann<R, reflect::return_policy>().value);
+    else
+        return rv_policy::automatic;
+}
+
+// Invoke `emit` with the def-extras implied by R's annotations: rv_policy always
+// (automatic is a no-op), plus a docstring and/or keep_alive when present.
+template <std::meta::info R, typename F>
+void with_call_extras(F&& emit) {
+    constexpr rv_policy pol = ann_rv_policy<R>();
+    constexpr const char* d = entity_doc<R>();
+    if constexpr (has_ann<R, reflect::keep_alive>()) {
+        constexpr auto ka = get_ann<R, reflect::keep_alive>();
+        if constexpr (d != nullptr)
+            emit(d, pol, ::nanobind::keep_alive<ka.nurse, ka.patient>());
+        else
+            emit(pol, ::nanobind::keep_alive<ka.nurse, ka.patient>());
+    } else if constexpr (d != nullptr) {
+        emit(d, pol);
+    } else {
+        emit(pol);
+    }
+}
+
+// Extras for a data member: a docstring when present, and rv_policy ONLY when
+// explicitly annotated (def_rw/def_ro default to reference_internal, which we must
+// not clobber by passing automatic). keep_alive does not apply to attributes.
+template <std::meta::info R, typename F>
+void with_data_extras(F&& emit) {
+    constexpr const char* d = entity_doc<R>();
+    if constexpr (has_ann<R, reflect::return_policy>()) {
+        constexpr rv_policy pol = ann_rv_policy<R>();
+        if constexpr (d != nullptr) emit(d, pol);
+        else emit(pol);
+    } else if constexpr (d != nullptr) {
+        emit(d);
+    } else {
+        emit();
+    }
+}
+
 template <typename T, std::meta::info mem>
 void reflect_bind_member(auto& cls) {
-    constexpr auto name =
-        std::define_static_string(std::meta::identifier_of(mem));
-    // Bind via a pointer-to-data-member (&[:mem:]) rather than getter/setter
-    // lambdas: a lambda whose signature mentions the spliced member type
-    // [:type_of(mem):] crashes the clang-p2996 mangler when passed to the
-    // dependent `cls.def_*` call (placeholder-type mangling at parse time).
-    if constexpr (std::meta::is_const_type(std::meta::type_of(mem))) {
-        cls.def_ro(name, &[:mem:]);
-    } else {
-        cls.def_rw(name, &[:mem:]);
+    if constexpr (!has_ann<mem, reflect::skip>()) {
+        constexpr auto name = entity_name<mem>();
+        // Bind via a pointer-to-data-member (&[:mem:]) rather than getter/setter
+        // lambdas: a lambda whose signature mentions the spliced member type
+        // [:type_of(mem):] crashes the clang-p2996 mangler when passed to the
+        // dependent `cls.def_*` call (placeholder-type mangling at parse time).
+        with_data_extras<mem>([&](auto&&... e) {
+            if constexpr (std::meta::is_const_type(std::meta::type_of(mem)))
+                cls.def_ro(name, &[:mem:], std::forward<decltype(e)>(e)...);
+            else
+                cls.def_rw(name, &[:mem:], std::forward<decltype(e)>(e)...);
+        });
     }
 }
 
@@ -103,8 +208,10 @@ void reflect_bind_method(auto& cls) {
                   !std::meta::is_rvalue_reference_qualified(fn) &&
                   !std::meta::has_ellipsis_parameter(fn)) {
         using FnType = [:std::meta::type_of(fn):];
-        reflect_method_binder<T, fn, FnType>::bind(
-            cls, std::define_static_string(std::meta::identifier_of(fn)));
+        with_call_extras<fn>([&](auto&&... e) {
+            reflect_method_binder<T, fn, FnType>::bind(
+                cls, entity_name<fn>(), std::forward<decltype(e)>(e)...);
+        });
     }
 }
 
@@ -117,12 +224,10 @@ struct reflect_static_method_binder;
 #define NB_REFLECT_DEFINE_STATIC_BINDER(QUALS)                                 \
     template <std::meta::info fn, typename Ret, typename... Args>              \
     struct reflect_static_method_binder<fn, Ret(Args...) QUALS> {             \
-        static void bind(auto& cls) {                                          \
-            constexpr auto name =                                              \
-                std::define_static_string(std::meta::identifier_of(fn));       \
+        static void bind(auto& cls, const char* name, auto&&... extra) {       \
             cls.def_static(name, [](Args... args) -> Ret {                    \
                 return [:fn:](std::forward<Args>(args)...);                   \
-            });                                                                \
+            }, std::forward<decltype(extra)>(extra)...);                       \
         }                                                                      \
     };
 
@@ -135,7 +240,10 @@ template <std::meta::info fn>
 void reflect_bind_static_method(auto& cls) {
     if constexpr (!std::meta::has_ellipsis_parameter(fn)) {
         using FnType = [:std::meta::type_of(fn):];
-        reflect_static_method_binder<fn, FnType>::bind(cls);
+        with_call_extras<fn>([&](auto&&... e) {
+            reflect_static_method_binder<fn, FnType>::bind(
+                cls, entity_name<fn>(), std::forward<decltype(e)>(e)...);
+        });
     }
 }
 
@@ -143,14 +251,14 @@ void reflect_bind_static_method(auto& cls) {
 
 template <typename T, std::meta::info mem>
 void reflect_bind_static_member(auto& cls) {
-    constexpr auto name =
-        std::define_static_string(std::meta::identifier_of(mem));
-    // Bind via a pointer to the static (&[:mem:]); see reflect_bind_member for
-    // why spliced-type lambdas are avoided.
-    if constexpr (std::meta::is_const_type(std::meta::type_of(mem))) {
-        cls.def_ro_static(name, &[:mem:]);
-    } else {
-        cls.def_rw_static(name, &[:mem:]);
+    if constexpr (!has_ann<mem, reflect::skip>()) {
+        constexpr auto name = entity_name<mem>();
+        // Bind via a pointer to the static (&[:mem:]); see reflect_bind_member for
+        // why spliced-type lambdas are avoided.
+        if constexpr (std::meta::is_const_type(std::meta::type_of(mem)))
+            cls.def_ro_static(name, &[:mem:]);
+        else
+            cls.def_rw_static(name, &[:mem:]);
     }
 }
 
@@ -163,12 +271,10 @@ struct reflect_free_fn_binder;
 #define NB_REFLECT_DEFINE_FREE_BINDER(QUALS)                                   \
     template <std::meta::info fn, typename Ret, typename... Args>              \
     struct reflect_free_fn_binder<fn, Ret(Args...) QUALS> {                   \
-        static void bind(module_& m) {                                         \
-            constexpr auto name =                                              \
-                std::define_static_string(std::meta::identifier_of(fn));       \
+        static void bind(module_& m, const char* name, auto&&... extra) {      \
             m.def(name, [](Args... args) -> Ret {                            \
                 return [:fn:](std::forward<Args>(args)...);                   \
-            });                                                                \
+            }, std::forward<decltype(extra)>(extra)...);                       \
         }                                                                      \
     };
 
@@ -185,7 +291,10 @@ void reflect_free_function(module_& m) {
     if constexpr (!std::meta::has_ellipsis_parameter(fn) &&
                   std::meta::has_identifier(fn)) {
         using FnType = [:std::meta::type_of(fn):];
-        reflect_free_fn_binder<fn, FnType>::bind(m);
+        with_call_extras<fn>([&](auto&&... e) {
+            reflect_free_fn_binder<fn, FnType>::bind(
+                m, entity_name<fn>(), std::forward<decltype(e)>(e)...);
+        });
     }
 }
 
@@ -213,7 +322,8 @@ void reflect_bind_ctor_expand(auto& cls, std::index_sequence<Is...>) {
 
 template <std::meta::info ctor>
 void reflect_bind_ctor(auto& cls) {
-    reflect_bind_ctor_expand<ctor>(cls, std::make_index_sequence<ctor_param_count<ctor>()>{});
+    if constexpr (!has_ann<ctor, reflect::skip>())
+        reflect_bind_ctor_expand<ctor>(cls, std::make_index_sequence<ctor_param_count<ctor>()>{});
 }
 
 // --- Inheritance ---
@@ -380,7 +490,9 @@ void reflect_bind_conversion(auto& cls) {
 // (which names the binding via identifier_of).
 template <typename T, std::meta::info fn>
 void reflect_bind_member_function(auto& cls) {
-    if constexpr (std::meta::is_operator_function(fn))
+    if constexpr (has_ann<fn, reflect::skip>())
+        return;  // explicitly excluded
+    else if constexpr (std::meta::is_operator_function(fn))
         reflect_bind_operator<T, fn>(cls);
     else if constexpr (std::meta::is_conversion_function(fn))
         reflect_bind_conversion<T, fn>(cls);
@@ -494,8 +606,7 @@ void reflect_class(module_& m) {
     if (type<T>().is_valid())
         return;
 
-    constexpr auto name =
-        std::define_static_string(std::meta::identifier_of(^^T));
+    constexpr auto name = entity_name<^^T>();
 
     // nanobind supports a single base class. When T has one or more public
     // bases, bind it as class_<T, Base> using the first public base. Any
@@ -537,8 +648,7 @@ void reflect_class(module_& m) {
 
 template <typename E>
 void reflect_enum(module_& m) {
-    constexpr auto name =
-        std::define_static_string(std::meta::identifier_of(^^E));
+    constexpr auto name = entity_name<^^E>();
 
     auto e = enum_<E>(m, name);
 
@@ -556,7 +666,9 @@ void reflect_dispatch(module_& m) {
         template for (constexpr auto mem :
             std::define_static_array(std::meta::members_of(
                 r, std::meta::access_context::unchecked()))) {
-            if constexpr (std::meta::is_type(mem)
+            if constexpr (has_ann<mem, reflect::skip>()) {
+                // explicitly excluded -- bind nothing
+            } else if constexpr (std::meta::is_type(mem)
                 && std::meta::is_class_type(mem)) {
                 reflect_class<typename [:mem:]>(m);
             } else if constexpr (std::meta::is_type(mem)
