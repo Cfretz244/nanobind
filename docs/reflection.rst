@@ -236,15 +236,20 @@ methods automatically -- arithmetic and bitwise (``__add__``, ``__mul__``,
 (``__iadd__``, … -- these preserve object identity), ``operator()`` →
 ``__call__``, ``operator[]`` → ``__getitem__``, unary ``-``/``+``/``~`` →
 ``__neg__``/``__pos__``/``__invert__``, and conversion functions to
-``bool``/integral/floating → ``__bool__``/``__int__``/``__float__``. Operators are
+``bool``/integral/floating → ``__bool__``/``__int__``/``__float__``. When a class
+has *several* integral conversion operators (e.g. ``absl::int128``'s
+``operator char``/``int``/``long long``/…), only the **widest** one binds
+``__int__`` (the others have no Python equivalent and are skipped). Operators are
 bound with ``nb::is_operator()``, so calling one with an incompatible type yields
 ``NotImplemented`` (letting Python try the reflected operand) rather than raising.
 
-Binary **free (namespace-scope) operators** are mapped too. A ``operator@(L, R)``
+**Free (namespace-scope) operators** are mapped too. A binary ``operator@(L, R)``
 is attached as a dunder to its operand's class: the forward dunder (``__add__``,
 …) on ``L``, and the reversed dunder on ``R`` (``__radd__``, …; comparisons use
-the swapped operator). The reversed form is what lets a scalar-on-the-left
-expression such as ``2.0 * vec`` work when only the right operand is a bound type:
+the swapped operator). A unary free ``operator@(T)`` is attached to ``T``
+(``-``/``+``/``~`` → ``__neg__``/``__pos__``/``__invert__``). The reversed form is
+what lets a scalar-on-the-left expression such as ``2.0 * vec`` work when only the
+right operand is a bound type:
 
 .. code-block:: cpp
 
@@ -253,6 +258,7 @@ expression such as ``2.0 * vec`` work when only the right operand is a bound typ
    Vec  operator*(double s, const Vec& v);   // -> Vec.__rmul__
    Vec  operator+(const Vec& a, const Vec& b);  // -> Vec.__add__
    bool operator==(const Vec& a, const Vec& b); // -> Vec.__eq__
+   Vec  operator-(const Vec& v);             // -> Vec.__neg__ (unary)
 
 .. code-block:: python
 
@@ -538,8 +544,9 @@ Limitations
 - ``volatile`` methods, rvalue-ref-qualified (``&&``) methods, and C-variadic
   (``...``) functions are skipped (they cannot bind meaningfully to a persistent
   Python object); the rest of the class still binds.
-- Member and binary free operators are mapped to Python dunders (see `Operators`_);
-  ``operator<=>``, ``++``/``--``, and logical ``&&``/``||``/``!`` are skipped.
+- Member and free (unary + binary) operators are mapped to Python dunders (see
+  `Operators`_); ``operator<=>``, ``++``/``--``, and logical ``&&``/``||``/``!``
+  are skipped.
 - **Multiple inheritance**: nanobind supports a single base class. The first
   public base is the real Python base; additional bases are flattened (their
   members are exposed on the derived type, but ``isinstance``/``issubclass``

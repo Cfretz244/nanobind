@@ -275,6 +275,20 @@ struct Ops {
     explicit operator bool() const { return x != 0; }           // __bool__
 };
 
+// Multiple integral conversion operators: only the WIDEST binds __int__ (each used
+// to bind it, last-bound silently winning -- `int`, declared after `long long`
+// here, would truncate). bool still binds __bool__. Mirrors absl::int128's
+// operator char/int/long/... cluster.
+struct ManyConv {
+    long long v;
+    ManyConv() : v(0) {}
+    explicit ManyConv(long long n) : v(n) {}
+    explicit operator char() const { return (char) v; }       // narrow -- skipped
+    explicit operator long long() const { return v; }         // widest -> __int__
+    explicit operator int() const { return (int) v; }         // declared last -- skipped
+    explicit operator bool() const { return v != 0; }         // __bool__ unaffected
+};
+
 // --- Virtual functions / trampoline (Tier 1: hand-written trampoline) ---
 
 struct Shape {
@@ -329,6 +343,10 @@ Vec operator*(const Vec& v, double s) { return Vec(v.x * s, v.y * s); }
 Vec operator*(double s, const Vec& v) { return Vec(s * v.x, s * v.y); }
 // Comparison free operator -> __eq__.
 bool operator==(const Vec& a, const Vec& b) { return a.x == b.x && a.y == b.y; }
+// Unary free operators -> __neg__ / __invert__ (binary-only was the old limit;
+// absl::int128's negation is a free operator-(int128)).
+Vec operator-(const Vec& v) { return Vec(-v.x, -v.y); }
+Vec operator~(const Vec& v) { return Vec(v.y, v.x); }  // arbitrary, observable: swap
 
 // --- Array data members are skipped (BINDER-0006); scalar siblings still bind. ---
 

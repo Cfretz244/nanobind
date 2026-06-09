@@ -174,7 +174,12 @@ set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS_OLD}")
 if (NB_HAS_REFLECTION_GCC)
   set(NB_REFLECT_FLAGS -std=c++26 -freflection)
 elseif(NB_HAS_REFLECTION_BLOOMBERG)
-  set(NB_REFLECT_FLAGS -std=c++26 -freflection-latest -stdlib=libc++)
+  # The raised -fconstexpr-steps covers the whole-namespace consteval walks
+  # (required_stl_types / required_user_specs) over the growing test fixture
+  # namespace; the default budget is no longer enough. Safe since the TC-0002
+  # Sema use-after-free fix (the budget itself was never the bug).
+  set(NB_REFLECT_FLAGS -std=c++26 -freflection-latest -stdlib=libc++
+      -fconstexpr-steps=100000000)
 endif()
 
 if (NB_REFLECT_FLAGS)

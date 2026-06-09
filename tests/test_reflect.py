@@ -304,6 +304,17 @@ def test27_operators():
 
 
 @needs_reflect
+def test27b_widest_int_conversion():
+    # Multiple integral conversion operators: only the widest (long long) binds
+    # __int__. 5e9 exceeds int32, so the previously-last-bound `operator int`
+    # would have truncated it.
+    big = 5_000_000_000
+    m = t.ManyConv(big)
+    assert int(m) == big
+    assert bool(m) and not bool(t.ManyConv(0))  # __bool__ unaffected
+
+
+@needs_reflect
 def test26_function_qualifiers():
     q = t.Quals()
     # noexcept / const noexcept / lvalue-ref-qualified methods are bound.
@@ -395,6 +406,12 @@ def test32_free_operators():
     # Free operator== -> __eq__.
     assert a == t.Vec(1.0, 2.0)
     assert not (a == b)
+
+    # Unary free operator- / operator~ -> __neg__ / __invert__.
+    n = -a
+    assert n.x == -1.0 and n.y == -2.0
+    w = ~a
+    assert w.x == 2.0 and w.y == 1.0
 
 
 @needs_reflect

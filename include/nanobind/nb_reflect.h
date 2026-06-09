@@ -695,6 +695,33 @@ void reflect_bind_operator(auto& cls) {
     }
 }
 
+// Among T's public, non-template, non-skipped integral conversion operators (bool
+// excluded -- it feeds __bool__), the reflection of the one with the widest result
+// type, or ^^void if there is none. Multiple integral conversions would otherwise
+// each bind __int__ with the last-bound silently winning, which can pick an
+// arbitrarily narrow result (absl::int128's operator char/int/long/...).
+template <typename T>
+consteval std::meta::info widest_integral_conversion() {
+    std::meta::info best = ^^void;
+    std::size_t best_size = 0;
+    for (auto fn : std::meta::members_of(^^T, std::meta::access_context::unchecked())) {
+        if (!std::meta::is_function(fn) || std::meta::is_template(fn))
+            continue;
+        if (!std::meta::is_public(fn) || !std::meta::is_conversion_function(fn))
+            continue;
+        if (!std::meta::annotations_of(fn, ^^reflect::skip).empty())
+            continue;
+        auto R = std::meta::return_type_of(fn);
+        if (!std::meta::is_integral_type(R) || std::meta::is_same_type(R, ^^bool))
+            continue;
+        if (best == ^^void || std::meta::size_of(R) > best_size) {
+            best = fn;
+            best_size = std::meta::size_of(R);
+        }
+    }
+    return best;
+}
+
 template <typename T, std::meta::info fn>
 void reflect_bind_conversion(auto& cls) {
     // Use fixed concrete lambda return types (bool/long long/double) and cast the
@@ -703,8 +730,12 @@ void reflect_bind_conversion(auto& cls) {
     constexpr auto R = std::meta::return_type_of(fn);
     if constexpr (std::meta::is_same_type(R, ^^bool))
         cls.def("__bool__", [](T& self) -> bool { return (bool) self.[:fn:](); });
-    else if constexpr (std::meta::is_integral_type(R))
-        cls.def("__int__", [](T& self) -> long long { return (long long) self.[:fn:](); });
+    else if constexpr (std::meta::is_integral_type(R)) {
+        // Only the widest integral conversion binds __int__ (see
+        // widest_integral_conversion); the others have no Python equivalent.
+        if constexpr (fn == widest_integral_conversion<T>())
+            cls.def("__int__", [](T& self) -> long long { return (long long) self.[:fn:](); });
+    }
     else if constexpr (std::meta::is_floating_point_type(R))
         cls.def("__float__", [](T& self) -> double { return (double) self.[:fn:](); });
     // else: no standard numeric dunder -- skip.
@@ -716,8 +747,9 @@ void reflect_bind_conversion(auto& cls) {
 // operands. The forward dunder (`__add__`, ...) goes on the LEFT operand's class;
 // the reversed dunder (`__radd__`, or a swapped comparison) goes on the RIGHT
 // operand's class -- the latter is what makes `2.0 * vec` work when only the right
-// operand is a bound type. Binding happens while that class is being reflected, so
-// its class_ object is in hand (no re-registration of an existing type).
+// operand is a bound type. A free unary `operator@(T)` is attached to T's class
+// (`__neg__`/`__pos__`/`__invert__`). Binding happens while that class is being
+// reflected, so its class_ object is in hand (no re-registration of an existing type).
 //
 // The forwarding lambda keeps the real Ret/P0/P1 template parameters in its
 // signature (from the function-type partial specialization) and only splices the
@@ -763,6 +795,32 @@ NB_REFLECT_DEFINE_FREE_OP_BINDER(noexcept)
 
 #undef NB_REFLECT_DEFINE_FREE_OP_BINDER
 
+// Unary free operator (operator-(T) / operator+(T) / operator~(T)) -> __neg__ /
+// __pos__ / __invert__ on T's class. operator_dunder(op, 0) is the member-arity-0
+// mapping, which already yields nullptr for the unary forms with no Python
+// equivalent (deref *, address-of &, !, prefix ++/--) -- those are skipped. A
+// postfix ++/-- (the (T, int) form) routes to the binary specialization, where
+// op_plus_plus/op_minus_minus also map to nullptr.
+#define NB_REFLECT_DEFINE_FREE_UNARY_OP_BINDER(QUALS)                               \
+    template <typename T, std::meta::info fn, typename Ret, typename P0>           \
+    struct reflect_free_operator_binder<T, fn, Ret(P0) QUALS> {                    \
+        using A = std::remove_cvref_t<P0>;                                         \
+        static void bind(auto& cls) {                                              \
+            constexpr auto op = std::meta::operator_of(fn);                        \
+            if constexpr (std::is_same_v<T, A>) {                                  \
+                constexpr const char* d = operator_dunder(op, 0);                  \
+                if constexpr (d != nullptr)                                        \
+                    cls.def(d, [](P0 a) -> Ret { return [:fn:](a); },              \
+                            is_operator());                                        \
+            }                                                                      \
+        }                                                                          \
+    };
+
+NB_REFLECT_DEFINE_FREE_UNARY_OP_BINDER()
+NB_REFLECT_DEFINE_FREE_UNARY_OP_BINDER(noexcept)
+
+#undef NB_REFLECT_DEFINE_FREE_UNARY_OP_BINDER
+
 // True if any parameter of fn is a std::basic_ostream / basic_istream / basic_iostream — i.e.
 // fn is a stream I/O operator such as `operator<<(std::ostream&, T)`. nanobind has no caster for
 // stream types (and they're typically incomplete at the binding site), so such free operators are
@@ -791,22 +849,24 @@ consteval bool involves_stream_type(std::meta::info fn) {
     return false;
 }
 
-// True if fn is a binary namespace-scope operator the binder can attach as a dunder.
-// Kept in a consteval helper so the vector from parameters_of() is fully consumed
+// True if fn is a unary or binary namespace-scope operator the binder can attach as a
+// dunder. Kept in a consteval helper so the vector from parameters_of() is fully consumed
 // within one constant evaluation (an inline parameters_of().size() in the if-constexpr
 // condition leaves the constant evaluator unable to prove the allocation is freed).
 template <std::meta::info fn>
 consteval bool is_bindable_free_operator() {
-    return std::meta::is_function(fn)
-        && std::meta::is_operator_function(fn)
-        && !std::meta::is_template(fn)
-        && !std::meta::has_ellipsis_parameter(fn)
-        && !involves_stream_type(fn)
-        && std::meta::parameters_of(fn).size() == 2;
+    if (!std::meta::is_function(fn)
+        || !std::meta::is_operator_function(fn)
+        || std::meta::is_template(fn)
+        || std::meta::has_ellipsis_parameter(fn)
+        || involves_stream_type(fn))
+        return false;
+    std::size_t n = std::meta::parameters_of(fn).size();
+    return n == 1 || n == 2;
 }
 
-// Scan T's enclosing namespace for binary free operators involving T and bind each
-// onto T's class_ (`cls`). Runs once per class (reflect_class is idempotent), so a
+// Scan T's enclosing namespace for unary/binary free operators involving T and bind
+// each onto T's class_ (`cls`). Runs once per class (reflect_class is idempotent), so a
 // given (class, operator, side) pair binds exactly once. O(classes x namespace
 // members); fine at this prove-out's scale.
 // If T is insertable into a std::ostream (via a member or free `operator<<(ostream&, T)`),
