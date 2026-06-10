@@ -138,7 +138,7 @@ Fast front-end check (no build/link; run from this directory):
 ```bash
 TC=../toolchain
 PYINC=$(/opt/homebrew/bin/python3.12 -c 'import sysconfig;print(sysconfig.get_path("include"))')
-$TC/bin/clang++ -std=c++26 -freflection-latest -stdlib=libc++ \
+$TC/bin/clang++ -std=c++26 -freflection-latest -fentity-proxy-reflection -stdlib=libc++ \
   -isysroot "$(xcrun --show-sdk-path)" -nostdinc++ -isystem $TC/include/c++/v1 \
   -I "$PYINC" -I include -fsyntax-only tests/test_reflect.cpp
 ```
