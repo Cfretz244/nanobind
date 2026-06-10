@@ -284,11 +284,20 @@ consteval rv_policy ann_rv_policy() {
         return rv_policy::automatic;
 }
 
-// True if R returns a bare pointer to a class type (after dealiasing; cv on the
-// pointer or pointee is irrelevant).
-consteval bool returns_raw_class_pointer(std::meta::info fn) {
-    auto t = std::meta::remove_cv(
-        std::meta::dealias(std::meta::return_type_of(fn)));
+// True if R returns a borrowed indirection to a class type: a bare pointer OR
+// an lvalue reference (after dealiasing; cv is irrelevant). References joined
+// the set in wave 2: a T& return fell through to rv_policy::automatic, which
+// nanobind resolves to COPY for references -- a runtime abort for
+// non-copyable classes (tf::Taskflow&/tf::Executor& accessors) and a silently
+// detached copy for copyable ones, both wrong for accessor semantics.
+consteval bool returns_borrowed_class_indirection(std::meta::info fn) {
+    auto t = std::meta::dealias(std::meta::return_type_of(fn));
+    if (std::meta::is_lvalue_reference_type(t)) {
+        auto r = std::meta::remove_cv(
+            std::meta::dealias(std::meta::remove_reference(t)));
+        return std::meta::is_class_type(r);
+    }
+    t = std::meta::remove_cv(t);
     if (!std::meta::is_pointer_type(t))
         return false;
     auto p = std::meta::remove_cv(
@@ -298,7 +307,8 @@ consteval bool returns_raw_class_pointer(std::meta::info fn) {
 
 // The rv_policy a reflected callable actually binds with. An explicit
 // [[=reflect::return_policy]] annotation always wins. Otherwise a bare
-// class-pointer return does NOT get nanobind's `automatic` (= take_ownership):
+// class-pointer OR class-lvalue-reference return does NOT get nanobind's
+// `automatic` (= take_ownership for pointers, COPY for references):
 // reflected APIs overwhelmingly return BORROWED pointers (fluent builders
 // returning self, accessors into owned containers -- CLI11's add_option()
 // returns an Option* the App owns), and take_ownership double-frees them the
@@ -312,7 +322,7 @@ consteval rv_policy effective_rv_policy() {
     constexpr rv_policy ann = ann_rv_policy<R>();
     if (ann != rv_policy::automatic)
         return ann;
-    if (returns_raw_class_pointer(R)) {
+    if (returns_borrowed_class_indirection(R)) {
         if (std::meta::is_static_member(R)
             || std::meta::is_namespace(std::meta::parent_of(R)))
             return rv_policy::reference;
@@ -622,8 +632,14 @@ consteval bool is_unbindable_shape(std::meta::info t) {
     }
     t = std::meta::remove_cv(t);
     if (std::meta::is_pointer_type(t)) {
-        auto p = std::meta::remove_cv(
-            std::meta::dealias(std::meta::remove_pointer(t)));
+        auto pte = std::meta::dealias(std::meta::remove_pointer(t));
+        auto p = std::meta::remove_cv(pte);
+        // cv-qualified void* (SQLiteCpp's Column::getBlob() -> const void*):
+        // nanobind's capsule caster takes plain void* only, so the const
+        // mismatch is a hard error in the forwarding lambda -- skip instead.
+        if ((std::meta::is_const_type(pte) || std::meta::is_volatile_type(pte))
+            && std::meta::is_same_type(p, ^^void))
+            return true;
         return std::meta::is_pointer_type(p) || std::meta::is_function_type(p);
     }
     return false;
@@ -750,6 +766,49 @@ void reflect_free_function(module_& m) {
 
 // --- Constructors ---
 
+// nb::init constructs with BRACES (`new (p) T{args...}`), which a reflected
+// constructor must not use: if the class also has an initializer_list ctor,
+// braces hijack to it (immer::vector's (size_type, T) fill ctor brace-selects
+// initializer_list<int> and the size_type NARROWS: a hard error; in
+// non-narrowing shapes it silently runs the WRONG constructor). The binder
+// binds a REAL declared constructor, so parens -- which select exactly the
+// reflected overload -- are correct; braces remain only for the aggregate
+// case (no parens ctor to select). Mirrors nb::init's body otherwise
+// (Args... are real template parameters, so no spliced lambda signature).
+template <typename T, typename... A>
+NB_INLINE void reflect_construct_at(void *p, A&&... a) {
+    if constexpr (std::is_constructible_v<T, A...>)
+        new (p) T((A&&) a...);
+    else
+        new (p) T{(A&&) a...};   // aggregate-init fallback
+}
+
+template <typename... Args>
+struct reflect_init : def_visitor<reflect_init<Args...>> {
+    NB_INLINE reflect_init() {}
+
+    template <typename Class, typename... Extra>
+    NB_INLINE static void execute(Class &cl, const Extra&... extra) {
+        using Type = typename Class::Type;
+        using Alias = typename Class::Alias;
+        cl.def(
+            "__init__",
+            [](pointer_and_handle<Type> v, Args... args) {
+                if constexpr (!std::is_same_v<Type, Alias> &&
+                              std::is_constructible_v<Type, Args...>) {
+                    if (!detail::nb_inst_python_derived(v.h.ptr())) {
+                        reflect_construct_at<Type>(
+                            (void *) v.p, (detail::forward_t<Args>) args...);
+                        return;
+                    }
+                }
+                reflect_construct_at<Alias>(
+                    (void *) v.p, (detail::forward_t<Args>) args...);
+            },
+            extra...);
+    }
+};
+
 template <std::meta::info ctor>
 consteval std::size_t ctor_param_count() {
     return std::meta::parameters_of(ctor).size();
@@ -763,16 +822,16 @@ consteval auto ctor_param_infos() {
 template <std::meta::info ctor, std::size_t... Is>
 void reflect_bind_ctor_expand(auto& cls, std::index_sequence<Is...>) {
     if constexpr (sizeof...(Is) == 0) {
-        cls.def(init<>());
+        cls.def(reflect_init<>());
     } else {
         constexpr auto params = ctor_param_infos<ctor>();
         // Attach nb::arg("name") per ctor parameter so Python callers can use
         // keywords (e.g. T(i=1, j=2)); see with_arg_call_extras for the rule.
         if constexpr (fn_any_param_named<ctor>())
-            cls.def(init<typename [:std::meta::type_of(params[Is]):]...>(),
+            cls.def(reflect_init<typename [:std::meta::type_of(params[Is]):]...>(),
                     ::nanobind::arg(param_name<ctor, Is>())...);
         else
-            cls.def(init<typename [:std::meta::type_of(params[Is]):]...>());
+            cls.def(reflect_init<typename [:std::meta::type_of(params[Is]):]...>());
     }
 }
 
@@ -1386,6 +1445,30 @@ void reflect_bind_property(auto& cls) {
     reflect_bind_property_impl<getter, find_property_setter<T, getter>()>(cls);
 }
 
+// True if T declares a public, non-template, non-deleted INSTANCE method named
+// `name`. nanobind cannot make one Python attribute both an instancemethod and
+// a staticmethod: binding a member and a same-named static (SQLiteCpp's
+// Database::getHeaderInfo -- const member + static overload) compiles clean
+// and then ABORTS at import during type finalization. The instance method
+// wins; the shadowed static is skipped.
+template <typename T>
+consteval bool instance_method_shadows(std::string_view name) {
+    for (auto m : std::meta::members_of(
+             ^^T, std::meta::access_context::unchecked())) {
+        if (is_using_proxy(m) || !std::meta::is_function(m)
+            || std::meta::is_template(m))
+            continue;
+        if (std::meta::is_public(m) && !std::meta::is_deleted(m)
+            && !std::meta::is_static_member(m)
+            && !std::meta::is_constructor(m) && !std::meta::is_destructor(m)
+            && !std::meta::is_special_member_function(m)
+            && std::meta::has_identifier(m)
+            && std::meta::identifier_of(m) == name)
+            return true;
+    }
+    return false;
+}
+
 // Route a public member function to the right binder. Operators and conversion
 // functions have no identifier, so they must be detected before reflect_bind_method
 // (which names the binding via identifier_of).
@@ -1403,8 +1486,13 @@ void reflect_bind_member_function(auto& cls) {
         reflect_bind_operator<T, fn>(cls);
     else if constexpr (std::meta::is_conversion_function(fn))
         reflect_bind_conversion<T, fn>(cls);
-    else if constexpr (std::meta::is_static_member(fn))
-        reflect_bind_static_method<fn>(cls);
+    else if constexpr (std::meta::is_static_member(fn)) {
+        // A static shadowed by a same-named instance method is skipped
+        // (nanobind aborts at import binding both under one name).
+        if constexpr (!std::meta::has_identifier(fn)
+                      || !instance_method_shadows<T>(std::meta::identifier_of(fn)))
+            reflect_bind_static_method<fn>(cls);
+    }
     else if constexpr (std::meta::has_identifier(fn))
         reflect_bind_method<T, fn>(cls);
     // else: nameless and non-operator (e.g. a literal operator) -- skip.
@@ -1455,7 +1543,9 @@ void reflect_bind_member_template(auto& cls) {
                     std::meta::identifier_of(tmpl));
                 if constexpr (std::meta::is_static_member(spec)) {
                     if constexpr (requires {
-                            sizeof(reflect_static_method_binder<spec, FnType>); }) {
+                            sizeof(reflect_static_method_binder<spec, FnType>); }
+                        && !instance_method_shadows<T>(
+                               std::meta::identifier_of(tmpl))) {
                         with_arg_call_extras<spec>([&](auto&&... e) {
                             reflect_static_method_binder<spec, FnType>::bind(
                                 cls, nm, std::forward<decltype(e)>(e)...);
@@ -1598,7 +1688,7 @@ void bind_class_contents(auto& cls) {
     // has no (const T&) constructor.
     if constexpr (!std::is_abstract_v<T> && !has_reflect_trampoline<T>
                   && std::is_copy_constructible_v<T>)
-        cls.def(init<const T&>());
+        cls.def(reflect_init<const T&>());
 
     // Bind data members. Skip unnamed members (anonymous union/struct fields, e.g. glm's
     // x/y/z/w swizzle aliasing): identifier_of() is ill-formed on them, and a pointer-to-member
@@ -1993,7 +2083,10 @@ consteval void collect_scope_stl_types(std::meta::info r,
                 collect_stl_types(std::meta::return_type_of(mem), out, visited, ex);
                 for (auto p : std::meta::parameters_of(mem))
                     collect_stl_types(std::meta::type_of(p), out, visited, ex);
-            } else if (std::meta::is_namespace(mem))
+            } else if (std::meta::is_namespace(mem)
+                       // An alias is a shorthand, not contents: following it
+                       // pulls the whole target namespace into the walk.
+                       && !std::meta::is_namespace_alias(mem))
                 collect_scope_stl_types(mem, out, visited, ex);
         }
     } else if (std::meta::is_type(r) && std::meta::is_class_type(r)) {
@@ -2212,7 +2305,10 @@ consteval void collect_scope_user_specs(std::meta::info r,
                 collect_user_specs_from_type(std::meta::return_type_of(mem), out, visited, ex);
                 for (auto p : std::meta::parameters_of(mem))
                     collect_user_specs_from_type(std::meta::type_of(p), out, visited, ex);
-            } else if (std::meta::is_namespace(mem))
+            } else if (std::meta::is_namespace(mem)
+                       // An alias is a shorthand, not contents: following it
+                       // pulls the whole target namespace into the walk.
+                       && !std::meta::is_namespace_alias(mem))
                 collect_scope_user_specs(mem, out, visited, walked, ex);
         }
     } else if (std::meta::is_type(r) && std::meta::is_class_type(r)) {
@@ -2282,7 +2378,10 @@ consteval void collect_seed_classes(std::meta::info r,
                     && !is_skip_annotated(mem) && !is_excluded_entity(mem, ex)
                     && !info_vec_contains(out, mem))
                     out.push_back(mem);
-            } else if (std::meta::is_namespace(mem)) {
+            } else if (std::meta::is_namespace(mem)
+                       // An alias is a shorthand, not contents: following it
+                       // pulls the whole target namespace into the walk.
+                       && !std::meta::is_namespace_alias(mem)) {
                 collect_seed_classes(mem, out, ex);
             }
         }
@@ -2413,6 +2512,31 @@ void check_stl_casters() {
     };
 }
 
+// Parent-qualified fallback name for module-level collisions: two enums (or
+// classes) with the same unqualified identifier in different scopes (yaml-cpp's
+// NodeType::value vs EmitterStyle::value) used to register under ONE module
+// attribute, the second silently clobbering the first. When the plain name is
+// already taken in the module dict at bind time, the entity binds as
+// "<Parent>_<name>" instead.
+template <std::meta::info R>
+consteval const char* parent_qualified_name(const char* name) {
+    // Tolerate the anonymous-skip path: the caller's `if constexpr (name ==
+    // nullptr) return;` doesn't stop THIS constexpr initializer from
+    // evaluating in the same instantiation.
+    if (name == nullptr)
+        return nullptr;
+    auto p = std::meta::parent_of(R);
+    if (p != ^^:: && std::meta::has_identifier(p)
+        && (std::meta::is_namespace(p)
+            || (std::meta::is_type(p) && std::meta::is_class_type(p)))) {
+        std::string s{std::meta::identifier_of(p)};
+        s += '_';
+        s += name;
+        return std::define_static_string(s);
+    }
+    return name;   // no scoped parent to qualify with: keep the plain name
+}
+
 // The Python name for a class/enum reached through declaration `Named` (the
 // namespace member or explicit reflect_ argument -- possibly a TYPEDEF over an
 // anonymous record, the C idiom `typedef struct {...} point_t;`). The resolved
@@ -2472,19 +2596,26 @@ void reflect_class(module_& m) {
         reflect_class<typename [:python_base_for<T, Rs...>():], ^^void, Rs...>(m);
     }
 
+    // A DIFFERENT type already bound under this module attribute (same
+    // unqualified identifier in another scope) would be silently clobbered:
+    // fall back to the parent-qualified name (BINDER-0022). T itself being
+    // registered already returned above.
+    constexpr auto qual_name = parent_qualified_name<^^T>(name);
+    const char* py_name = hasattr(m, name) ? qual_name : name;
+
     // Construct the class_ with the right template arguments. The lambda's return
     // type is deduced from whichever if-constexpr branch is active. with_doc_extra
     // supplies the optional [[=r::doc]] string as a trailing const char* extra.
     auto cls = with_doc_extra<^^T>([&](auto&&... doc) {
         if constexpr (HasBase && HasTramp)
             return class_<T, typename [:python_base_for<T, Rs...>():],
-                          reflect_trampoline_t<T>>(m, name, doc...);
+                          reflect_trampoline_t<T>>(m, py_name, doc...);
         else if constexpr (HasBase)
-            return class_<T, typename [:python_base_for<T, Rs...>():]>(m, name, doc...);
+            return class_<T, typename [:python_base_for<T, Rs...>():]>(m, py_name, doc...);
         else if constexpr (HasTramp)
-            return class_<T, reflect_trampoline_t<T>>(m, name, doc...);
+            return class_<T, reflect_trampoline_t<T>>(m, py_name, doc...);
         else
-            return class_<T>(m, name, doc...);
+            return class_<T>(m, py_name, doc...);
     });
 
     bind_class_contents<T, Rs...>(cls);
@@ -2507,8 +2638,20 @@ void reflect_enum(module_& m) {
     if constexpr (name == nullptr)
         return;
 
+    // Idempotent, like reflect_class: an enum reached twice (explicit arg +
+    // namespace walk) must not re-register -- and must not trip the collision
+    // fallback below into binding the SAME enum under a second name.
+    if (type<E>().is_valid())
+        return;
+
+    // Module-attribute collision (yaml-cpp's NodeType::value vs
+    // EmitterStyle::value): the second same-named enum binds parent-qualified
+    // instead of silently clobbering the first (BINDER-0022).
+    constexpr auto qual_name = parent_qualified_name<^^E>(name);
+    const char* py_name = hasattr(m, name) ? qual_name : name;
+
     auto e = with_doc_extra<^^E>([&](auto&&... doc) {
-        return enum_<E>(m, name, doc...);
+        return enum_<E>(m, py_name, doc...);
     });
 
     template for (constexpr auto val :
@@ -2558,7 +2701,11 @@ void reflect_dispatch(module_& m) {
                 && !std::meta::is_template(mem)) {
                 if constexpr (!fn_mentions_excluded(mem, excluded_v<Rs...>))
                     reflect_free_function<mem>(m);
-            } else if constexpr (std::meta::is_namespace(mem)) {
+            } else if constexpr (std::meta::is_namespace(mem)
+                && !std::meta::is_namespace_alias(mem)) {
+                // A namespace ALIAS member is a shorthand, not a declaration of
+                // contents -- following it binds the entire aliased namespace
+                // (a fixture's `namespace sd = simdjson;` pulled in the world).
                 reflect_dispatch<mem, Rs...>(m);
             }
         };

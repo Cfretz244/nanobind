@@ -156,6 +156,23 @@ thing that cannot be expressed in-language (a virtual-override **trampoline**) h
   investigation — per-overload exclusion itself NOT reproduced, repros under
   `corpus/findings/repros/BINDER-0016/`).
 
+- **Wave-2 parallel-corpus hardening (BINDER-0022..0028):** module name
+  collisions bind parent-qualified instead of clobbering (`yamlcpp`'s
+  NodeType::value vs EmitterStyle::value; reflect_enum also gained the
+  is_valid idempotence guard); cv-qualified `void*` joins the unbindable
+  shapes (sqlitecpp's getBlob); a static shadowed by a same-named instance
+  method skips instead of aborting nanobind at import (sqlitecpp's
+  getHeaderInfo); `T&` class returns borrow like `T*`
+  (returns_borrowed_class_indirection; taskflow's accessors aborted under
+  policy=copy); reflected ctors construct with PARENS via reflect_init
+  (immer's initializer_list hijack/narrowing); namespace-alias members are
+  not followed by any walk (simdjson's fixture alias bound the world);
+  0027 (exclusions vs std::function arg types) recorded OPEN. Wave 2 also
+  drove four toolchain fixes (TC-0014 DescriptionOf builtin templates,
+  TC-0015 guide-spec mangling, TC-0016 linkage-spec walk truncation -- what
+  hid every post-Python.h global from reflection -- and TC-0017 NEON
+  Long-element mangling).
+
 Roadmap / not yet: per-argument ownership-transfer annotations; member function templates
 needing explicit arguments; trampoline hardening for final/ref-qualified virtuals.
 

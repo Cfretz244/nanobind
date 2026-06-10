@@ -723,6 +723,67 @@ def test44_anonymous_typedef_names():
 
 
 @needs_reflect
+def test46_unbindable_cv_void_ptr():
+    # BINDER-0023: a cv-qualified void* return (SQLiteCpp's getBlob) skips
+    # gracefully instead of hard-erroring in the void* caster.
+    g = t.Gadget()
+    assert g.ok() == 1
+    assert not hasattr(t.Gadget, "blob")
+
+
+@needs_reflect
+def test47_enum_name_collision_qualifies():
+    # BINDER-0022: same-named enums in sibling namespaces no longer clobber one
+    # module attribute; the second binds parent-qualified. Bind order follows
+    # the reflect_ pack (collide_a first).
+    assert t.shade.LIGHT.value == 1 and t.shade.DARK.value == 2
+    assert t.collide_b_shade.RED.value == 10 and t.collide_b_shade.BLUE.value == 20
+    assert t.shade is not t.collide_b_shade
+
+
+@needs_reflect
+def test48_static_shadowed_by_instance_method():
+    # BINDER-0024: a static method shadowed by a same-named instance method is
+    # skipped (binding both under one name aborted nanobind at import -- this
+    # module importing at all is most of the test).
+    c = t.Conn()
+    assert c.info() == 3
+    assert t.Conn.probe() == 17       # unshadowed static still binds
+    with pytest.raises(TypeError):
+        t.Conn.info(5)                # the static overload is gone
+
+
+@needs_reflect
+def test49_namespace_alias_not_followed():
+    # BINDER-0028: a namespace-alias member of a reflected namespace is a
+    # shorthand, not contents -- the walk must not pull the aliased namespace
+    # into the bind set (a fixture's `namespace sd = simdjson;` bound the world).
+    assert t.forty_two() == 42
+    assert not hasattr(t, "LeakedInner")
+
+
+@needs_reflect
+def test50_lvalue_ref_return_borrows():
+    # BINDER-0025: a T& class return binds reference_internal (a live view),
+    # not automatic (= COPY, which aborts for non-copyable T and silently
+    # detaches for copyable T).
+    h = t.CellHolder()
+    view = h.edit()
+    assert view.get() == 7
+    view.set(41)
+    assert h.edit().get() == 41       # mutation visible through the holder
+
+
+@needs_reflect
+def test51_ctor_parens_no_initializer_list_hijack():
+    # BINDER-0026: reflected ctors construct with parens; the (size_t, int)
+    # fill ctor must run as a fill, not brace-hijack to initializer_list.
+    f = t.FillVec(3, 9)
+    assert f.size() == 3
+    assert f.sum() == 27
+
+
+@needs_reflect
 def test45_static_const_by_value():
     # BINDER-0020: constant-readable static const members bind by VALUE (no
     # ODR-use). In-class-initialized statics with no out-of-line definition

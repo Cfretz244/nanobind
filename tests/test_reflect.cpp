@@ -803,10 +803,68 @@ struct Gadget {
     bool peek(Gadget*& out) noexcept { out = this; return true; }  // T*& out-param
     void on_event(void (*cb)(int)) { cb(v); }        // function-pointer param
     Opaque* impl() const { return nullptr; }         // incomplete-pointee return
+    const void* blob() const { return &v; }          // cv void* return (BINDER-0023)
     int ok() const { return v; }                     // binds
 };
 
 } // namespace unbindable_shapes
+
+// BINDER-0022: same-named enums in sibling scopes used to clobber one module
+// attribute (yaml-cpp's NodeType::value vs EmitterStyle::value); the second
+// now binds parent-qualified. BINDER-0024: a static shadowed by a same-named
+// instance method used to ABORT nanobind at import; it now skips.
+// BINDER-0028: a namespace-alias member is not followed by the walks.
+namespace collide_a { enum class shade { LIGHT = 1, DARK = 2 }; }
+namespace collide_b { enum class shade { RED = 10, BLUE = 20 }; }
+
+namespace shadow_test {
+struct Conn {
+    int id = 3;
+    int info() const { return id; }                  // binds
+    static int info(int x) { return x * 2; }         // shadowed: skipped
+    static int probe() { return 17; }                // unshadowed static binds
+};
+} // namespace shadow_test
+
+namespace alias_leak_target {
+struct LeakedInner { int z = 1; };
+} // namespace alias_leak_target
+
+namespace alias_fixture {
+namespace shorthand = alias_leak_target;             // NOT followed (BINDER-0028)
+inline int forty_two() { return 42; }
+} // namespace alias_fixture
+
+// BINDER-0025: T& class returns borrow (reference_internal), not copy.
+namespace ref_return_test {
+struct Cell {
+    int v = 7;
+    Cell() = default;
+    Cell(const Cell&) = delete;                      // copy policy would abort
+    int get() const { return v; }
+    void set(int x) { v = x; }
+};
+struct CellHolder {
+    Cell cell;
+    CellHolder() = default;
+    CellHolder(const CellHolder&) = delete;
+    Cell& edit() { return cell; }                    // borrowed reference
+};
+} // namespace ref_return_test
+
+// BINDER-0026: reflected ctors construct with PARENS -- an initializer_list
+// ctor must not hijack a braced init (immer::vector's (size_type, T) fill
+// ctor narrowed and hard-errored; non-narrowing shapes silently ran the
+// wrong ctor).
+namespace parens_init_test {
+struct FillVec {
+    std::vector<int> data;
+    FillVec(std::initializer_list<int> il) : data(il) {}
+    FillVec(std::size_t n, int v) : data(n, v) {}    // must bind AND run as fill
+    int size() const { return (int) data.size(); }
+    int sum() const { int s = 0; for (int x : data) s += x; return s; }
+};
+} // namespace parens_init_test
 
 // BINDER-0017: a bare class-pointer return defaults to a BORROWING policy
 // (reference_internal on methods, reference on statics/free functions), not
@@ -890,5 +948,8 @@ NB_MODULE(test_reflect_ext, m) {
                  ^^member_template_test, ^^proxy_test,
                  ^^exclude_test, ^^EX_MARKER,
                  ^^unbindable_shapes, ^^ownership_test,
-                 ^^anon_typedef_test, ^^static_const_test>(m);
+                 ^^anon_typedef_test, ^^static_const_test,
+                 ^^collide_a, ^^collide_b, ^^shadow_test,
+                 ^^alias_fixture, ^^ref_return_test,
+                 ^^parens_init_test>(m);
 }

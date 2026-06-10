@@ -665,6 +665,24 @@ Limitations
   members): binding by address would ODR-use a member that may have no
   out-of-line definition (an undefined symbol at link). Mutable statics keep
   the read-write address binding.
+- **cv-qualified** ``void*`` returns/params (``const void*`` blob accessors)
+  are skipped (nanobind's capsule caster takes plain ``void*`` only).
+- **Lvalue-reference class returns borrow too**: an un-annotated ``T&`` return
+  binds ``reference_internal``/``reference`` like ``T*`` does — nanobind's
+  ``automatic`` resolves to COPY for references, which aborts for non-copyable
+  classes and silently detaches for copyable ones.
+- **Reflected constructors construct with PARENS** (selecting exactly the
+  reflected overload); braces remain only for aggregates. An
+  ``initializer_list`` constructor can no longer hijack a reflected
+  ``(size_t, T)``-style constructor.
+- **Module name collisions qualify**: a second same-named class/enum from a
+  different scope binds as ``<Parent>_<name>`` instead of silently clobbering
+  the first.
+- **A static method shadowed by a same-named instance method is skipped**
+  (binding both under one Python name aborts nanobind at import).
+- **Namespace-alias members are not followed** by the walks: an alias is a
+  shorthand, not a declaration of contents (``namespace sd = simdjson;`` in a
+  reflected fixture namespace would otherwise bind the entire library).
 - **Deleted functions** (``= delete``) are skipped on every path — constructors,
   methods, operators, conversions, member-template default instantiations,
   ``using`` re-exports, free functions, and free operators — and their
