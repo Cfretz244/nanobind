@@ -1239,6 +1239,17 @@ void bind_class_contents(auto& cls) {
         };
     }
 
+    // Python-side COPY construction (BINDER-0013, found via tl::expected): the
+    // pass above skips copy/move ctors (a bound init<T&&> would gut its Python
+    // source object), but copying a bound instance is part of any copyable
+    // type's real API -- bind init<const T&> when T is publicly
+    // copy-constructible. Trampolined classes are excluded: nb::init
+    // placement-news the Alias for Python-derived instances, and a trampoline
+    // has no (const T&) constructor.
+    if constexpr (!std::is_abstract_v<T> && !has_reflect_trampoline<T>
+                  && std::is_copy_constructible_v<T>)
+        cls.def(init<const T&>());
+
     // Bind data members. Skip unnamed members (anonymous union/struct fields, e.g. glm's
     // x/y/z/w swizzle aliasing): identifier_of() is ill-formed on them, and a pointer-to-member
     // of the enclosing class cannot be formed for an anonymous-union member anyway.

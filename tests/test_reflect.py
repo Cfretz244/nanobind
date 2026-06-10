@@ -639,3 +639,14 @@ def test39_deleted_functions_not_bound():
     with pytest.raises(TypeError):
         t.OnlyDeletedCtors()
     assert t.OnlyDeletedCtors.probe() == 7
+
+
+@needs_reflect
+def test40_copy_construction():
+    # A publicly copy-constructible class binds init<const T&>: Python can copy
+    # a bound instance (BINDER-0013, found via tl::expected's copy-ctor
+    # differential). The copy is a distinct object with the same state.
+    n = t.NoDefault(21)
+    c = t.NoDefault(n)
+    assert c is not n
+    assert c.dbl() == 42
