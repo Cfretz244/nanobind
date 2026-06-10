@@ -563,6 +563,68 @@ hand-named class (e.g. ``Pair<int,double>`` → ``PairIntDouble`` vs. a class li
 named ``PairIntDouble``); such a collision surfaces as nanobind's double-registration
 warning.
 
+Excluding entities (nb::exclude_)
+---------------------------------
+
+``[[=r::skip]]`` requires editing the declaration, which is impossible for
+headers you do not own. ``nb::exclude_`` is the call-site equivalent: a marker
+type passed anywhere in the ``reflect_`` pack whose arguments name entities the
+binder must treat as **nonexistent**:
+
+.. code-block:: cpp
+
+   nb::reflect_<^^Eigen::Matrix<double, 3, 1>,
+                ^^nb::exclude_<^^Eigen::Transpose,    // a class template: ALL specializations
+                               ^^Eigen::internal,     // a namespace: everything inside
+                               ^^SomeConcreteType,    // a single type
+                               bad_member()>>(m);     // a MEMBER, by reflection (see below)
+
+An excluded entity is opaque on every path: it is never bound, never walked by
+the specialization/caster discovery fixpoints, never flattened as a base, and
+any member whose signature mentions one -- including transitively, as a
+template argument (``EigenBase<PermutationWrapper<M>>``) or behind a member
+typedef (signatures are dealiased first) -- is gracefully skipped.
+
+This is what makes **expression-template libraries** bindable. Eigen's facade
+methods return ever-deeper new specializations (``transpose()`` returns
+``Transpose<Derived>``, whose facade has ``Transpose<Transpose<Derived>>``,
+...), so unrestricted discovery diverges -- and some minted specializations
+are outright hard errors to walk. Discovery guards against the forgotten-
+exclusion case: past 1024 discovered specializations it fails with a pointed
+diagnostic (a call to the non-constexpr ``reflect_discovery_diverged``) naming
+this mechanism, instead of exhausting the constexpr step budget.
+
+**Member-level exclusion** is the escape hatch for declarations whose BODIES
+are lazily ill-formed for a bound specialization (Eigen's ``Matrix(x, y, z)``
+constructor is declared on every ``Matrix`` and ``static_assert``\ s the size
+in its body; binding it on a 3x3 is a hard error at ``nb::init``
+instantiation). A function body is not reflectable, so no query can detect
+this -- instead, list the exact member's reflection, computed with
+``members_of`` in the binding TU:
+
+.. code-block:: cpp
+
+   consteval std::meta::info bad_member() {
+       for (auto m : std::meta::members_of(^^Mat3,
+                                           std::meta::access_context::unchecked()))
+           if (std::meta::is_constructor(m) && /* the offending shape */)
+               return m;
+       return ^^void;
+   }
+
+Lists too long for a pack are built with ``substitute``:
+``std::meta::substitute(^^nb::exclude_, args)`` where ``args`` holds
+``std::meta::reflect_constant(entity)`` for each entry -- the resulting
+reflection is itself a valid ``reflect_`` argument (see the eigen corpus run
+for a complete worked example).
+
+Independent of exclusions, a specialization that cannot be **completed** in
+the translation unit (its template is forward-declared here but defined in a
+header that was never included -- Eigen's ``SparseView`` under
+``<Eigen/Dense>``) is automatically neither discovered nor bound, and members
+whose signatures carry one are skipped: binding would instantiate nanobind's
+caster on the incomplete type, a hard error.
+
 Limitations
 -----------
 
@@ -601,6 +663,11 @@ Limitations
   layouts are untested.
 - **Annotations**: per-argument ownership transfer is not yet handled (see
   `Controlling the bindings with annotations`_).
+- **Exclusions**: ``nb::exclude_`` (see `Excluding entities (nb::exclude_)`_)
+  handles entities and members; there is no per-overload-set or wildcard
+  matching beyond template/namespace granularity. Members with lazily
+  ill-formed bodies (shape-asserting Eigen-style members) MUST be excluded
+  manually -- bodies are not reflectable, so the binder cannot detect them.
 - **Templates**: only specializations are bound (see `Templates`_); they are
   auto-discovered from signatures or listed explicitly. A member function template
   binds via its **default instantiation** when every template parameter is

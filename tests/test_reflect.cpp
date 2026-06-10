@@ -709,6 +709,86 @@ static_assert(!tt_has_spec(^^std::vector<int>));     // std -> caster path, not 
 static_assert(tt_has_spec(^^template_test::Cont<int, template_test::Pol<int>>));
 static_assert(!tt_has_spec(^^template_test::Pol<int>));
 
+// --- nb::exclude_: call-site exclusions for code you do not own ---
+//
+// exclude_test models the expression-template shape (Eigen): Vec's methods
+// return Expr<...> specializations whose OWN members mint ever-deeper specs
+// (Expr<T>::deeper() -> Expr<Expr<T>>), so unrestricted discovery would
+// DIVERGE (caught by the reflect_discovery_diverged guard). Excluding the
+// ^^Expr template (every specialization), the ^^detail namespace, the concrete
+// ^^Opaque type, and the ^^ExBase base makes Vec bindable: any member whose
+// signature mentions an excluded entity is skipped, an excluded base is not
+// flattened, and everything else binds normally.
+namespace exclude_test {
+
+template <class T> struct Expr {
+    Expr<Expr<T>> deeper() const { return {}; }    // divergent without exclusion
+    int rank() const { return 1; }
+};
+
+namespace detail {
+struct Helper { int h = 0; };
+}  // namespace detail
+
+struct Opaque { int o = 0; };
+
+struct ExBase {
+    int from_base() const { return 9; }
+};
+
+struct XVec : ExBase {
+    int len_ = 3;
+    Expr<int> field;                                // excluded member type -> skipped
+    XVec() = default;
+    explicit XVec(int n) : len_(n) {}
+    XVec(const Opaque&) {}                           // excluded ctor param  -> skipped
+    int len() const { return len_; }                // binds
+    int doomed() const { return 1; }                // listed by REFLECTION -> skipped
+                                                    // (the per-member escape hatch for
+                                                    // lazily-ill-formed bodies in
+                                                    // unowned code; Eigen's sized ctors)
+    int dot(const Expr<int>&) const { return 7; }   // excluded param       -> skipped
+    Expr<int> expr() const { return {}; }           // excluded return      -> skipped
+    detail::Helper helper() const { return {}; }    // excluded namespace   -> skipped
+    Opaque opaque() const { return {}; }            // excluded type        -> skipped
+};
+
+inline int free_len(const XVec& v) { return v.len(); }     // binds
+inline Expr<int> free_expr(const XVec&) { return {}; }     // excluded return -> skipped
+
+} // namespace exclude_test
+
+// A member listed by its REFLECTION (not spellable as ^^name for an overload/
+// ctor in general) -- exercises the per-member exclusion path.
+consteval std::meta::info xvec_member(std::string_view name) {
+    for (auto m : std::meta::members_of(^^exclude_test::XVec,
+                                        std::meta::access_context::unchecked()))
+        if (std::meta::is_function(m) && !std::meta::is_template(m)
+            && std::meta::has_identifier(m) && std::meta::identifier_of(m) == name)
+            return m;
+    return ^^void;
+}
+
+// The marker is spelled in full at each use: a `using` alias would put an
+// ALIAS reflection in the pack, and the marker test keys on template_of.
+#define EX_MARKER                                                              \
+    nb::exclude_<^^exclude_test::Expr, ^^exclude_test::detail,                 \
+                 ^^exclude_test::Opaque, ^^exclude_test::ExBase,               \
+                 xvec_member("doomed")>
+namespace {
+consteval bool ex_has_spec(std::meta::info t) {
+    std::vector<std::meta::info> ex = nb::detail::compute_excluded<^^EX_MARKER>();
+    for (auto s : nb::detail::required_user_specs(^^exclude_test, ex))
+        if (s == t)
+            return true;
+    return false;
+}
+}
+static_assert(nb::detail::is_exclude_marker(^^EX_MARKER));
+// With the exclusions, discovery converges and surfaces NO Expr spec.
+static_assert(!ex_has_spec(^^exclude_test::Expr<int>));
+static_assert(!ex_has_spec(^^exclude_test::Expr<exclude_test::Expr<int>>));
+
 NB_MODULE(test_reflect_ext, m) {
     // Box<float> is referenced by no signature; it is bound only because it is listed
     // explicitly here (the explicit opt-in for specializations the walk can't reach).
@@ -717,5 +797,6 @@ NB_MODULE(test_reflect_ext, m) {
                  ^^template_test::Box<float>,
                  ^^template_test::identity<int>,
                  ^^stream_test::Streamable,
-                 ^^member_template_test, ^^proxy_test>(m);
+                 ^^member_template_test, ^^proxy_test,
+                 ^^exclude_test, ^^EX_MARKER>(m);
 }

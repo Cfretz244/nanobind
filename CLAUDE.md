@@ -114,6 +114,24 @@ thing that cannot be expressed in-language (a virtual-override **trampoline**) h
   (Python TypeError, the abstract-class contract).
 - **Python-side copy construction** (BINDER-0013): `init<const T&>` binds when T is
   publicly copy-constructible and has no trampoline. Move ctors never bind.
+- **Call-site exclusions + completeness gates (BINDER-0014, the eigen run's
+  feature)**: `nb::exclude_<^^Entity...>` passed in the `reflect_` pack makes
+  the listed class templates (all specializations), concrete types, namespaces
+  (transitively), or individual MEMBER reflections (the only handle on
+  members whose BODIES are lazily ill-formed for a bound spec, e.g. Eigen's
+  size-asserting `Matrix(x,y,z)` on a 3x3 -- bodies are not reflectable)
+  opaque on every path: never bound/discovered/walked/flattened, no caster
+  demands, and members whose signatures mention one (transitively through
+  template args; signatures are DEALIASED first) are skipped. This is what
+  makes expression-template libraries bindable at all (Eigen's facades mint
+  Transpose<Transpose<...>> forever -- discovery diverges; a >1024-spec
+  worklist now fails through the pointed non-constexpr
+  `reflect_discovery_diverged` diagnostic). Independent of exclusions, a spec
+  that cannot be COMPLETED in the TU (template forward-declared, definition
+  in a never-included header: Eigen's SparseView under <Eigen/Dense>) is
+  neither discovered nor bound (`is_complete_type` gates; sugar-blind on
+  unpatched toolchains, TC-0012). The completeness probes cost constexpr
+  steps: several corpus runs needed a raised `-fconstexpr-steps`.
 - **Deduction guides are stripped from the namespace walks** before the
   `define_static_array` lift (`namespace_members_for_binding`): a guide is never bindable,
   and pre-TC-0008 toolchains ICE mangling a guide reflection ("Can't mangle a deduction

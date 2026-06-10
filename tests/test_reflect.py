@@ -650,3 +650,25 @@ def test40_copy_construction():
     c = t.NoDefault(n)
     assert c is not n
     assert c.dbl() == 42
+
+
+@needs_reflect
+def test41_exclude_marker():
+    # nb::exclude_<...> call-site exclusions (the out-of-line [[=r::skip]] for
+    # code you do not own; what makes expression-template libraries bindable).
+    # The clean surface binds normally.
+    v = t.XVec(5)
+    assert v.len() == 5
+    assert t.free_len(v) == 5
+    # Excluded entities are not bound under any name.
+    for absent in ("ExprInt", "Opaque", "Helper", "ExBase"):
+        assert not hasattr(t, absent), absent
+    # Members whose signatures mention an excluded entity are skipped...
+    for absent in ("expr", "dot", "helper", "opaque", "field", "doomed"):
+        assert not hasattr(t.XVec, absent), absent
+    # ...including free functions and constructors.
+    assert not hasattr(t, "free_expr")
+    with pytest.raises(TypeError):
+        t.XVec(object())
+    # An excluded base is opaque: nothing flattened from it.
+    assert not hasattr(t.XVec, "from_base")
