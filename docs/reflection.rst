@@ -72,7 +72,13 @@ What gets bound
 
 For **classes**, ``reflect_`` automatically binds:
 
-- All public non-copy/move constructors (including default and parameterized)
+- All public non-move constructors (including default and parameterized).
+  Copy construction binds as ``__init__(self, other)`` (``nb::init<const T&>``)
+  whenever the class is publicly copy-constructible and has no trampoline;
+  move constructors never bind (a bound ``init<T&&>`` would gut its Python
+  source object). Deleted constructors never bind — a class whose only
+  constructors are deleted binds with no ``__init__`` and raises ``TypeError``
+  from Python (same contract as abstract classes).
 - All public nonstatic data members (read-write; read-only if ``const``)
 - All public static data members (read-only if ``const``, read-write otherwise)
 - All public nonstatic methods (including overloads, and ``const``, ``noexcept``,
@@ -572,6 +578,14 @@ Limitations
 - ``volatile`` methods, rvalue-ref-qualified (``&&``) methods, and C-variadic
   (``...``) functions are skipped (they cannot bind meaningfully to a persistent
   Python object); the rest of the class still binds.
+- **Deleted functions** (``= delete``) are skipped on every path — constructors,
+  methods, operators, conversions, member-template default instantiations,
+  ``using`` re-exports, free functions, and free operators — and their
+  signatures neither demand STL casters nor pull template specializations into
+  the bind set. A deleted integral conversion does not compete for ``__int__``.
+- **Deduction guides** are stripped from the namespace walks (never bindable;
+  on toolchains without the guide-mangling fix their reflections cannot even
+  appear in mangled-name position).
 - Member and free (unary + binary) operators are mapped to Python dunders (see
   `Operators`_); ``operator<=>``, ``++``/``--``, and logical ``&&``/``||``/``!``
   are skipped.

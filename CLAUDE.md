@@ -105,6 +105,19 @@ thing that cannot be expressed in-language (a virtual-override **trampoline**) h
   instantiation under the template's name (heterogeneous-lookup APIs: `contains`/`find`/
   `erase`/`operator[]` on hash/btree containers); packs (`emplace`) and
   explicit-argument templates are gracefully skipped.
+- **Deleted functions are filtered on every path** (BINDER-0012, found via tl::expected's
+  `unexpected() = delete;`): ctors, methods/operators/conversions, member-template default
+  instantiations (checked on the substituted SPEC — `is_deleted` is silently false on a
+  Template reflection), entity proxies (checked on the UNDERLYING function), flattening,
+  free functions/operators, properties, the `__int__` widest-conversion contest, and the
+  caster/spec discovery walks. A class with only deleted ctors binds with no `__init__`
+  (Python TypeError, the abstract-class contract).
+- **Python-side copy construction** (BINDER-0013): `init<const T&>` binds when T is
+  publicly copy-constructible and has no trampoline. Move ctors never bind.
+- **Deduction guides are stripped from the namespace walks** before the
+  `define_static_array` lift (`namespace_members_for_binding`): a guide is never bindable,
+  and pre-TC-0008 toolchains ICE mangling a guide reflection ("Can't mangle a deduction
+  guide name!" — tl's `unexpected(E) -> unexpected<E>` was the field shape).
 - **Using-redeclarations** (`using Base::f;`, incl. from PRIVATE bases — StatusOr's
   `value()`) bind as entity proxies. Requires `-fentity-proxy-reflection` (NOT implied by
   `-freflection-latest`); template/data-member re-exports from inaccessible bases skipped.
