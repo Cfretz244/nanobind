@@ -643,6 +643,14 @@ struct Wrap {
     Box<T> inner;
 };
 
+// A namespace-scope DEDUCTION GUIDE: enumerated by members_of like any other
+// member, never bindable, and (pre-TC-0008) unmangleable as a reflection NTTP
+// -- the binder's namespace walks must strip it before their
+// define_static_array lifts (namespace_members_for_binding). The field shape
+// is TartanLlama/expected's `unexpected(E) -> unexpected<E>`. The module
+// compiling at all is the assertion.
+template <class T> Wrap(T) -> Wrap<T>;
+
 // A "policy" template argument: Pol<int> appears ONLY as a template argument of
 // Cont (never in a callable signature), so the reachability rule keeps it out of
 // the bind set -- mirroring hash-map Hash/Eq/Alloc/Policy args. Cont's genuine

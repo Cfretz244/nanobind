@@ -519,6 +519,37 @@ consteval bool is_using_proxy(std::meta::info) { return false; }
 consteval std::meta::info proxy_underlying(std::meta::info e) { return e; }
 #endif
 
+// True if `m` reflects a DEDUCTION GUIDE. There is no is_deduction_guide
+// metafunction; a guide is the only namespace-scope function template with no
+// identifier that is not an operator/conversion/literal-operator/constructor
+// template (has_identifier is safe on a guide reflection -- it answers false).
+consteval bool is_deduction_guide_refl(std::meta::info m) {
+    return std::meta::is_function_template(m)
+        && !std::meta::has_identifier(m)
+        && !std::meta::is_operator_function_template(m)
+        && !std::meta::is_conversion_function_template(m)
+        && !std::meta::is_literal_operator_template(m)
+        && !std::meta::is_constructor_template(m);
+}
+
+// A namespace's members with deduction guides stripped. A guide is never
+// bindable (reflect_dispatch's is_template arm already skips it), and on
+// pre-TC-0008 toolchains its reflection cannot even be MANGLED as a template
+// argument -- the lift into define_static_array itself ICEs ("Can't mangle a
+// deduction guide name!", the backing array specialization's linkage name
+// embeds every element reflection). Strip guides BEFORE the lift so the
+// namespace walks stay clear of mangled-name position entirely
+// (TartanLlama/expected's `unexpected(E) -> unexpected<E>` is the field shape).
+consteval std::vector<std::meta::info> namespace_members_for_binding(
+        std::meta::info ns) {
+    std::vector<std::meta::info> out;
+    for (auto m : std::meta::members_of(
+             ns, std::meta::access_context::unchecked()))
+        if (!is_deduction_guide_refl(m))
+            out.push_back(m);
+    return out;
+}
+
 // True if a function template instantiates with ZERO explicit template
 // arguments (every parameter defaulted / SFINAE-satisfied) and has no trailing
 // parameter pack. This exactly captures the heterogeneous-lookup shape --
@@ -960,8 +991,7 @@ void bind_free_operators(auto& cls) {
     constexpr auto scope = std::meta::parent_of(^^T);
     if constexpr (std::meta::is_namespace(scope)) {
         template for (constexpr auto fn :
-            std::define_static_array(std::meta::members_of(
-                scope, std::meta::access_context::unchecked()))) {
+            std::define_static_array(namespace_members_for_binding(scope))) {
             if constexpr (is_bindable_free_operator<fn>()
                 && !has_ann<fn, reflect::skip>()) {
                 using FnType = [:std::meta::type_of(fn):];
@@ -2010,8 +2040,7 @@ template <std::meta::info r, std::meta::info... Rs>
 void reflect_dispatch(module_& m) {
     if constexpr (std::meta::is_namespace(r)) {
         template for (constexpr auto mem :
-            std::define_static_array(std::meta::members_of(
-                r, std::meta::access_context::unchecked()))) {
+            std::define_static_array(namespace_members_for_binding(r))) {
             if constexpr (std::meta::is_template(mem)) {
                 // A class/function template declaration: not bindable directly (only
                 // its specializations are). Skip it here -- the specializations used
