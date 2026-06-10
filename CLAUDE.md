@@ -130,15 +130,19 @@ needing explicit arguments; trampoline hardening for final/ref-qualified virtual
   codegen — the operator never bound, no diagnostic. The toolchain mangler now appends an
   ODR hash of the template head + pattern; substitution happens inline in
   `reflect_bind_member_template` again, and HetMap's pack-sibling `operator[]` in the test
-  suite keeps the trigger shape covered. Qualifier filtering still uses the binder-spec
+  suite keeps the trigger shape covered. Qualifier filtering uses the binder-spec
   completeness gate (`sizeof` on the undefined `reflect_method_binder` primary) — it is the
-  volatile/`&&` matrix filter, and decl predicates remain untrustworthy on proxy
-  underlyings from instantiated class templates (TC-0003 addendum, open).
+  volatile/`&&` matrix filter on every binding path, with no duplicated qualifier logic.
+  (The "decl predicates misreport on proxy underlyings" caveat is RESOLVED: the real bug
+  was `[[clang::lifetimebound]]` wrapping the method type in AttributedType sugar that
+  blinded the qualifier predicates — proxies were incidental; fixed in the toolchain as
+  TC-0005.)
 - **Entity proxies need `-fentity-proxy-reflection`** (not implied by
-  `-freflection-latest`), and proxy guards must precede kind predicates in `members_of`
-  loops (`is_constructor` on a proxy was an ICE before the local TC-0003 toolchain fix;
-  most type queries are still ill-formed on the proxy itself — use
-  `proxy_underlying`/`underlying_entity_of`).
+  `-freflection-latest`), and proxy guards still precede kind predicates in `members_of`
+  loops (`is_constructor` on a proxy was an ICE before the TC-0003 toolchain fix,
+  upstreamed as bloomberg/clang-p2996#290 / PR #291; the ordering keeps the binder
+  working on an unpatched compiler. Most type queries are still ill-formed on the proxy
+  itself — use `proxy_underlying`/`underlying_entity_of`).
 
 ## Building & testing (exact, this laptop)
 

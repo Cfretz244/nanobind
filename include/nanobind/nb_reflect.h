@@ -730,8 +730,7 @@ void reflect_bind_operator(auto& cls) {
         // completeness gate (no partial specialization exists for them; sizeof
         // on the undefined primary is a substitution failure) rather than by
         // decl predicates -- one gate for every shape the binder matrix does
-        // not model, and immune to predicate misreports on proxy underlyings
-        // from instantiated class templates (TC-0003 addendum, still open).
+        // not model, with no duplicated qualifier logic to drift.
         if constexpr (requires { sizeof(reflect_method_binder<T, fn, FnType>); }) {
             // is_operator() makes mismatched-argument calls return NotImplemented
             // rather than raising TypeError, matching Python operator semantics.
@@ -1043,9 +1042,8 @@ void reflect_bind_member_function(auto& cls) {
 // libcxx/test/.../substitute-nested-dependent.pass.cpp). The supported-
 // qualifier gate stays expressed as "does a binder partial specialization
 // exist for this exact function type" (sizeof on the undefined primary is a
-// substitution failure) instead of decl predicates, exactly as in
-// reflect_bind_proxy, whose proxy underlyings still misreport qualifiers
-// (TC-0003 addendum, open).
+// substitution failure), exactly as in reflect_bind_proxy: one gate for every
+// shape the binder matrix does not model, no duplicated qualifier logic.
 template <typename T, std::meta::info tmpl>
 void reflect_bind_member_template(auto& cls) {
     if constexpr (fn_template_default_instantiable(tmpl)) {
@@ -1114,13 +1112,14 @@ void reflect_bind_proxy(auto& cls) {
                       && !std::meta::is_special_member_function(u)
                       && !std::meta::has_ellipsis_parameter(u)
                       && !has_move_only_by_value_param(u)) {
-            // Qualifier filtering goes through the FUNCTION TYPE, not the decl
-            // predicates: through a proxy on an instantiated class template,
-            // is_rvalue_reference_qualified(u) misreports false for &&-qualified
-            // members (StatusOr<T>'s value()&& -- see TC-0003 addendum), so the
-            // supported-qualifier gate is "does a binder partial specialization
-            // exist for this exact function type" (sizeof on the undefined
-            // primary is a substitution failure for volatile/&&/unmatched).
+            // The supported-qualifier gate is "does a binder partial
+            // specialization exist for this exact function type" (sizeof on
+            // the undefined primary is a substitution failure for
+            // volatile/&&/unmatched), same as every other binding path.
+            // (Historical note: the decl predicates also used to misreport
+            // qualifiers on [[clang::lifetimebound]] accessors like
+            // StatusOr<T>'s value() -- AttributedType sugar blinded them;
+            // fixed in the toolchain, TC-0005.)
             using FnType = [:std::meta::type_of(u):];
             if constexpr (std::meta::is_operator_function(u)) {
                 if constexpr (requires {
@@ -1162,8 +1161,10 @@ void reflect_bind_proxy(auto& cls) {
 // re-bound here -- they are exposed automatically through the Python base type.
 template <typename T>
 void bind_class_contents(auto& cls) {
-    // Bind constructors. The proxy guard must come FIRST: is_constructor on an
-    // entity proxy is an UNREACHABLE in clang-p2996 (TC-0003), not a false.
+    // Bind constructors. The proxy guard comes first: is_constructor on an
+    // entity proxy was an UNREACHABLE in clang-p2996 before the TC-0003 fix
+    // (upstreamed as bloomberg/clang-p2996#290), so the binder does not rely
+    // on the patched ordering of the kind switch.
     template for (constexpr auto fn :
         std::define_static_array(std::meta::members_of(
             ^^T, std::meta::access_context::unchecked()))) {
