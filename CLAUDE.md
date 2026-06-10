@@ -123,13 +123,17 @@ needing explicit arguments; trampoline hardening for final/ref-qualified virtual
   `rename`/`doc` store text in a `fixed_string<N>` (char array) via CTAD.
 - `def_rw`/`def_ro` default to `rv_policy::reference_internal`; the binder only passes a
   policy when one is annotated, so it never clobbers that default.
-- **Substituted-spec predicates lie under nested-dependent instantiation (TC-0004)**: a
-  `substitute(tmpl, {})` performed two+ template levels deep yields a reflection whose
-  predicates (`is_operator_function`, `is_volatile`, `is_rvalue_reference_qualified`)
-  silently misreport when a pack-sibling overload exists. The binder substitutes AT THE
-  DISPATCH LOOP and passes the spec down as an NTTP; qualifier filtering uses the
-  binder-spec completeness gate (`sizeof` on the undefined `reflect_method_binder`
-  primary), never decl predicates on substituted specs or proxy underlyings (TC-0003).
+- **TC-0004 (fixed in the toolchain; workaround removed)**: same-named function-template
+  reflections as NTTPs used to mangle identically, so the two
+  `reflect_bind_member_template<T, tmpl>` instantiations for a sibling pair (raw_hash_map's
+  `operator[]` + its SFINAE-false lifetimebound twin) were silently folded into one body at
+  codegen — the operator never bound, no diagnostic. The toolchain mangler now appends an
+  ODR hash of the template head + pattern; substitution happens inline in
+  `reflect_bind_member_template` again, and HetMap's pack-sibling `operator[]` in the test
+  suite keeps the trigger shape covered. Qualifier filtering still uses the binder-spec
+  completeness gate (`sizeof` on the undefined `reflect_method_binder` primary) — it is the
+  volatile/`&&` matrix filter, and decl predicates remain untrustworthy on proxy
+  underlyings from instantiated class templates (TC-0003 addendum, open).
 - **Entity proxies need `-fentity-proxy-reflection`** (not implied by
   `-freflection-latest`), and proxy guards must precede kind predicates in `members_of`
   loops (`is_constructor` on a proxy was an ICE before the local TC-0003 toolchain fix;

@@ -729,8 +729,9 @@ void reflect_bind_operator(auto& cls) {
         // The volatile/&&-qualified shapes are excluded by the binder-spec
         // completeness gate (no partial specialization exists for them; sizeof
         // on the undefined primary is a substitution failure) rather than by
-        // decl predicates, which misreport on substituted member-template specs
-        // under nested-dependent instantiation (TC-0003 addendum).
+        // decl predicates -- one gate for every shape the binder matrix does
+        // not model, and immune to predicate misreports on proxy underlyings
+        // from instantiated class templates (TC-0003 addendum, still open).
         if constexpr (requires { sizeof(reflect_method_binder<T, fn, FnType>); }) {
             // is_operator() makes mismatched-argument calls return NotImplemented
             // rather than raising TypeError, matching Python operator semantics.
@@ -1031,45 +1032,51 @@ void reflect_bind_member_function(auto& cls) {
 // and their non-template overloads stack as normal Python overloads. Operator
 // templates route to the dunder path; constructor and conversion templates are
 // handled by their own passes' guards (still unsupported).
-// `spec` is the template's default instantiation, SUBSTITUTED AT THE DISPATCH
-// SITE and passed as an NTTP. This is load-bearing, not a convenience: a
-// substitute() performed another template level down yields a reflection whose
-// predicates (is_operator_function, is_volatile, is_rvalue_reference_qualified)
-// silently misreport under nested-dependent instantiation (TC-0003 addendum --
-// the misreports dropped raw_hash_map's operator[] without a diagnostic).
-// Freezing the spec as a template argument at the dispatch loop's level keeps
-// every query on a fully-resolved reflection. For the same reason, routing
-// happens FIRST and gates live inside each branch, with the supported-qualifier
-// gate expressed as "does a binder partial specialization exist for this exact
-// function type" (sizeof on the undefined primary is a substitution failure)
-// instead of decl predicates, exactly as in reflect_bind_proxy.
-template <typename T, std::meta::info tmpl, std::meta::info spec>
+// The default instantiation is substituted right here, two-plus dependent
+// levels deep. That shape used to require hoisting the substitute() to the
+// dispatch loop and passing the spec down as an NTTP: reflections of
+// same-named function templates (raw_hash_map's operator[] / its SFINAE-false
+// pack sibling) mangled identically as template arguments, so the two dispatch
+// instantiations were silently FOLDED into one body at codegen and the
+// operator never bound (TC-0004 -- fixed in the toolchain mangler;
+// regression-covered by HetMap's pack-sibling operator[] here and by
+// libcxx/test/.../substitute-nested-dependent.pass.cpp). The supported-
+// qualifier gate stays expressed as "does a binder partial specialization
+// exist for this exact function type" (sizeof on the undefined primary is a
+// substitution failure) instead of decl predicates, exactly as in
+// reflect_bind_proxy, whose proxy underlyings still misreport qualifiers
+// (TC-0003 addendum, open).
+template <typename T, std::meta::info tmpl>
 void reflect_bind_member_template(auto& cls) {
-    if constexpr (std::meta::is_operator_function(spec)) {
-        if constexpr (!has_ann<spec, reflect::skip>()
-                      && !has_move_only_by_value_param(spec))
-            reflect_bind_operator<T, spec>(cls);
-    } else if constexpr (std::meta::has_identifier(tmpl)) {
-        if constexpr (!has_ann<spec, reflect::skip>()
-                      && !has_move_only_by_value_param(spec)
-                      && !std::meta::has_ellipsis_parameter(spec)) {
-            using FnType = [:std::meta::type_of(spec):];
-            constexpr const char* nm = std::define_static_string(
-                std::meta::identifier_of(tmpl));
-            if constexpr (std::meta::is_static_member(spec)) {
-                if constexpr (requires {
-                        sizeof(reflect_static_method_binder<spec, FnType>); }) {
+    if constexpr (fn_template_default_instantiable(tmpl)) {
+        constexpr auto spec =
+            std::meta::substitute(tmpl, std::vector<std::meta::info>{});
+        if constexpr (std::meta::is_operator_function(spec)) {
+            if constexpr (!has_ann<spec, reflect::skip>()
+                          && !has_move_only_by_value_param(spec))
+                reflect_bind_operator<T, spec>(cls);
+        } else if constexpr (std::meta::has_identifier(tmpl)) {
+            if constexpr (!has_ann<spec, reflect::skip>()
+                          && !has_move_only_by_value_param(spec)
+                          && !std::meta::has_ellipsis_parameter(spec)) {
+                using FnType = [:std::meta::type_of(spec):];
+                constexpr const char* nm = std::define_static_string(
+                    std::meta::identifier_of(tmpl));
+                if constexpr (std::meta::is_static_member(spec)) {
+                    if constexpr (requires {
+                            sizeof(reflect_static_method_binder<spec, FnType>); }) {
+                        with_arg_call_extras<spec>([&](auto&&... e) {
+                            reflect_static_method_binder<spec, FnType>::bind(
+                                cls, nm, std::forward<decltype(e)>(e)...);
+                        });
+                    }
+                } else if constexpr (requires {
+                        sizeof(reflect_method_binder<T, spec, FnType>); }) {
                     with_arg_call_extras<spec>([&](auto&&... e) {
-                        reflect_static_method_binder<spec, FnType>::bind(
+                        reflect_method_binder<T, spec, FnType>::bind(
                             cls, nm, std::forward<decltype(e)>(e)...);
                     });
                 }
-            } else if constexpr (requires {
-                    sizeof(reflect_method_binder<T, spec, FnType>); }) {
-                with_arg_call_extras<spec>([&](auto&&... e) {
-                    reflect_method_binder<T, spec, FnType>::bind(
-                        cls, nm, std::forward<decltype(e)>(e)...);
-                });
             }
         }
     }
@@ -1208,13 +1215,7 @@ void bind_class_contents(auto& cls) {
             && std::meta::is_public(fn)
             && !std::meta::is_constructor_template(fn)
             && !std::meta::is_conversion_function_template(fn)) {
-            // The substitution MUST happen here at the dispatch level and be
-            // passed down as an NTTP (see reflect_bind_member_template).
-            if constexpr (fn_template_default_instantiable(fn)) {
-                constexpr auto spec =
-                    std::meta::substitute(fn, std::vector<std::meta::info>{});
-                reflect_bind_member_template<T, fn, spec>(cls);
-            }
+            reflect_bind_member_template<T, fn>(cls);
         } else if constexpr (is_using_proxy(fn)) {
             if constexpr (std::meta::is_public(fn))
                 reflect_bind_proxy<T, fn>(cls);
@@ -1278,11 +1279,7 @@ void flatten_base_members(auto& cls) {
             // their default instantiation -- this is where flat_hash_map's
             // heterogeneous contains/find/erase/operator[] live (declared on the
             // flattened raw_hash_map/raw_hash_set ancestry).
-            if constexpr (fn_template_default_instantiable(fn)) {
-                constexpr auto spec =
-                    std::meta::substitute(fn, std::vector<std::meta::info>{});
-                reflect_bind_member_template<T, fn, spec>(cls);
-            }
+            reflect_bind_member_template<T, fn>(cls);
         } else if constexpr (is_using_proxy(fn)) {
             // A using-redeclaration inside the flattened base re-exporting from
             // ITS OWN inaccessible base; same routing as on T itself.

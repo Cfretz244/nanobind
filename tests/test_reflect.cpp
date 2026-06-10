@@ -463,6 +463,13 @@ struct HetMap : member_template_detail::HetBase {
     std::size_t erase(const K& k) { return k > 0 ? 1u : 0u; }
     template <class K = int>
     int operator[](const K& k) const { return k + 10; }         // -> __getitem__
+    // SFINAE-false pack sibling of operator[] (TC-0004 trigger shape: mirrors absl
+    // raw_hash_map's lifetimebound pair). Never instantiable, so it must be skipped --
+    // and it must not disturb the sibling's binding (same-named function-template
+    // reflections as NTTPs used to mangle identically and fold at codegen).
+    template <class K = int, class P = double, int&...,
+              std::enable_if_t<(sizeof(K) == 0), int> = 0>
+    int operator[](const K& k) const;
     template <class K = int>
     static int sdouble(const K& k) { return k * 2; }            // static template
     template <class K>
