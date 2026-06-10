@@ -612,3 +612,30 @@ def test38_function_template_specialization():
     # only their instantiations, and only when listed explicitly.
     assert hasattr(t, "identityInt")
     assert t.identityInt(42) == 42
+
+
+@needs_reflect
+def test39_deleted_functions_not_bound():
+    # Deleted functions are public, enumerable declarations; none may bind
+    # (BINDER-0012). The module compiling at all is the primary regression --
+    # pre-fix, each deleted fixture member was a TU-wide hard error.
+    n = t.NoDefault(21)
+    assert n.dbl() == 42
+    # The deleted default ctor did not bind; the surviving int ctor did.
+    with pytest.raises(TypeError):
+        t.NoDefault()
+    # Deleted method / member template / free function: simply absent.
+    assert not hasattr(t.NoDefault, "poisoned")
+    assert not hasattr(t.NoDefault, "tpoison")
+    assert not hasattr(t, "free_deleted")
+    # The deleted operator long long lost the __int__ contest to operator int.
+    assert int(t.NoDefault(5)) == 5
+    # The deleted free operator== did not bind a dunder (identity fallback only).
+    assert t.NoDefault(1) != t.NoDefault(1)
+    # All-deleted-ctors class binds with NO __init__: TypeError on instantiation
+    # (the BINDER-0011 abstract-class contract); statics still callable.
+    with pytest.raises(TypeError):
+        t.OnlyDeletedCtors(1)
+    with pytest.raises(TypeError):
+        t.OnlyDeletedCtors()
+    assert t.OnlyDeletedCtors.probe() == 7

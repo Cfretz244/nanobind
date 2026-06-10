@@ -548,7 +548,8 @@ void reflect_free_function(module_& m) {
     // function-template specialization (identity<int>) also has no identifier, but it
     // IS bindable, so admit it via has_template_arguments (entity_name then derives
     // the CamelCase spec name from the template).
-    if constexpr (!std::meta::has_ellipsis_parameter(fn) &&
+    if constexpr (!std::meta::is_deleted(fn) &&
+                  !std::meta::has_ellipsis_parameter(fn) &&
                   !has_move_only_by_value_param(fn) &&
                   (std::meta::has_identifier(fn) ||
                    std::meta::has_template_arguments(fn))) {
@@ -768,7 +769,11 @@ consteval std::meta::info widest_integral_conversion() {
             continue;
         if (!std::meta::is_public(fn) || !std::meta::is_conversion_function(fn))
             continue;
-        if (!std::meta::annotations_of(fn, ^^reflect::skip).empty())
+        // A deleted conversion must not win the contest: it never binds, and the
+        // surviving narrower one would then fail the equality test in
+        // reflect_bind_conversion and __int__ would silently vanish (BINDER-0012).
+        if (!std::meta::annotations_of(fn, ^^reflect::skip).empty()
+            || std::meta::is_deleted(fn))
             continue;
         auto R = std::meta::return_type_of(fn);
         if (!std::meta::is_integral_type(R) || std::meta::is_same_type(R, ^^bool))
@@ -917,6 +922,7 @@ consteval bool is_bindable_free_operator() {
     if (!std::meta::is_function(fn)
         || !std::meta::is_operator_function(fn)
         || std::meta::is_template(fn)
+        || std::meta::is_deleted(fn)   // `operator==(T, T) = delete;` (BINDER-0012)
         || std::meta::has_ellipsis_parameter(fn)
         || involves_stream_type(fn)
         || has_move_only_by_value_param(fn))
@@ -977,7 +983,7 @@ consteval std::meta::info find_property_setter() {
     std::meta::info found = ^^void;
     template for (constexpr auto fn : std::define_static_array(
             std::meta::members_of(^^T, std::meta::access_context::unchecked()))) {
-        if constexpr (is_property_setter<fn>()) {
+        if constexpr (is_property_setter<fn>() && !std::meta::is_deleted(fn)) {
             if (std::string_view(prop_name<fn>()) == gname)
                 found = fn;
         }
@@ -1056,12 +1062,16 @@ void reflect_bind_member_template(auto& cls) {
     if constexpr (fn_template_default_instantiable(tmpl)) {
         constexpr auto spec =
             std::meta::substitute(tmpl, std::vector<std::meta::info>{});
+        // is_deleted must be asked of the substituted SPEC: on a Template
+        // reflection it silently answers false (BINDER-0012).
         if constexpr (std::meta::is_operator_function(spec)) {
             if constexpr (!has_ann<spec, reflect::skip>()
+                          && !std::meta::is_deleted(spec)
                           && !has_move_only_by_value_param(spec))
                 reflect_bind_operator<T, spec>(cls);
         } else if constexpr (std::meta::has_identifier(tmpl)) {
             if constexpr (!has_ann<spec, reflect::skip>()
+                          && !std::meta::is_deleted(spec)
                           && !has_move_only_by_value_param(spec)
                           && !std::meta::has_ellipsis_parameter(spec)) {
                 using FnType = [:std::meta::type_of(spec):];
@@ -1113,7 +1123,10 @@ void reflect_bind_proxy(auto& cls) {
         return;
     else {
         constexpr auto u = proxy_underlying(proxy);
+        // is_deleted must be asked of the UNDERLYING function: on the proxy
+        // itself it silently answers false (BINDER-0012).
         if constexpr (std::meta::is_function(u)
+                      && !std::meta::is_deleted(u)
                       && !std::meta::is_constructor(u)
                       && !std::meta::is_destructor(u)
                       && !std::meta::is_special_member_function(u)
@@ -1185,6 +1198,9 @@ void bind_class_contents(auto& cls) {
             if constexpr (!is_using_proxy(fn)
                 && std::meta::is_constructor(fn)
                 && std::meta::is_public(fn)
+                && !std::meta::is_deleted(fn)    // `T() = delete;` is enumerable but must
+                                                 // not bind: init<> would call it, a TU-wide
+                                                 // hard error (BINDER-0012, tl::unexpected<E>)
                 && !std::meta::is_template(fn)   // skip constructor templates (cannot reflect)
                 && !std::meta::is_copy_constructor(fn)
                 && !std::meta::is_move_constructor(fn)) {
@@ -1217,11 +1233,14 @@ void bind_class_contents(auto& cls) {
     // skipped here (see reflect_bind_member_function) and bound by the pass below.
     // Member function templates bind via their default instantiation when every
     // template parameter is defaulted (reflect_bind_member_template); others skip.
+    // Deleted functions are filtered on every path: public + enumerable, but calling
+    // one is a hard error (BINDER-0012).
     template for (constexpr auto fn :
         std::define_static_array(std::meta::members_of(
             ^^T, std::meta::access_context::unchecked()))) {
         if constexpr (std::meta::is_function(fn)
             && std::meta::is_public(fn)
+            && !std::meta::is_deleted(fn)
             && !std::meta::is_template(fn)
             && !std::meta::is_constructor(fn)
             && !std::meta::is_destructor(fn)
@@ -1247,6 +1266,7 @@ void bind_class_contents(auto& cls) {
             ^^T, std::meta::access_context::unchecked()))) {
         if constexpr (std::meta::is_function(fn)
             && std::meta::is_public(fn)
+            && !std::meta::is_deleted(fn)
             && !std::meta::is_template(fn)) {
             if constexpr (is_property_getter<fn>()) {
                 reflect_bind_property<T, fn>(cls);
@@ -1282,6 +1302,7 @@ void flatten_base_members(auto& cls) {
             Base, std::meta::access_context::unchecked()))) {
         if constexpr (std::meta::is_function(fn)
             && std::meta::is_public(fn)
+            && !std::meta::is_deleted(fn)
             && !std::meta::is_template(fn)
             && !std::meta::is_constructor(fn)
             && !std::meta::is_destructor(fn)
@@ -1464,6 +1485,7 @@ consteval void collect_own_stl_member_types(std::meta::info owner,
             auto u = proxy_underlying(mem);
             if (std::meta::is_function(u) && !std::meta::is_template(u)
                 && !std::meta::is_destructor(u) && !std::meta::is_constructor(u)
+                && !std::meta::is_deleted(u)
                 && !fn_skip_annotated(u) && !has_move_only_by_value_param(u)) {
                 collect_stl_types(std::meta::return_type_of(u), out, visited);
                 for (auto p : std::meta::parameters_of(u))
@@ -1480,7 +1502,8 @@ consteval void collect_own_stl_member_types(std::meta::info owner,
                 && !std::meta::is_conversion_function_template(mem)
                 && fn_template_default_instantiable(mem)) {
                 auto spec = std::meta::substitute(mem, std::vector<std::meta::info>{});
-                if (fn_skip_annotated(spec) || has_move_only_by_value_param(spec))
+                if (fn_skip_annotated(spec) || std::meta::is_deleted(spec)
+                    || has_move_only_by_value_param(spec))
                     continue;
                 collect_stl_types(std::meta::return_type_of(spec), out, visited);
                 for (auto p : std::meta::parameters_of(spec))
@@ -1489,6 +1512,7 @@ consteval void collect_own_stl_member_types(std::meta::info owner,
             continue;
         }
         if (std::meta::is_function(mem) && !std::meta::is_destructor(mem)
+            && !std::meta::is_deleted(mem)
             && !fn_skip_annotated(mem) && !has_move_only_by_value_param(mem)) {
             if (!std::meta::is_constructor(mem))
                 collect_stl_types(std::meta::return_type_of(mem), out, visited);
@@ -1536,6 +1560,7 @@ consteval void collect_scope_stl_types(std::meta::info r,
             if (std::meta::is_type(mem) && std::meta::is_class_type(mem))
                 collect_class_stl_types(mem, out, visited);
             else if (std::meta::is_function(mem) && !std::meta::is_template(mem)
+                     && !std::meta::is_deleted(mem)
                      && !fn_skip_annotated(mem)
                      && !has_move_only_by_value_param(mem)) {
                 collect_stl_types(std::meta::return_type_of(mem), out, visited);
@@ -1636,7 +1661,8 @@ consteval void collect_own_member_specs(std::meta::info owner,
             // underlying function's signature types.
             auto u = proxy_underlying(mem);
             if (std::meta::is_function(u) && !std::meta::is_template(u)
-                && !std::meta::is_destructor(u) && !std::meta::is_constructor(u)) {
+                && !std::meta::is_destructor(u) && !std::meta::is_constructor(u)
+                && !std::meta::is_deleted(u)) {
                 collect_user_specs_from_type(std::meta::return_type_of(u), out, visited);
                 for (auto p : std::meta::parameters_of(u))
                     collect_user_specs_from_type(std::meta::type_of(p), out, visited);
@@ -1652,13 +1678,16 @@ consteval void collect_own_member_specs(std::meta::info owner,
                 && !std::meta::is_conversion_function_template(mem)
                 && fn_template_default_instantiable(mem)) {
                 auto spec = std::meta::substitute(mem, std::vector<std::meta::info>{});
+                if (std::meta::is_deleted(spec))
+                    continue;
                 collect_user_specs_from_type(std::meta::return_type_of(spec), out, visited);
                 for (auto p : std::meta::parameters_of(spec))
                     collect_user_specs_from_type(std::meta::type_of(p), out, visited);
             }
             continue;
         }
-        if (std::meta::is_function(mem) && !std::meta::is_destructor(mem)) {
+        if (std::meta::is_function(mem) && !std::meta::is_destructor(mem)
+            && !std::meta::is_deleted(mem)) {
             if (!std::meta::is_constructor(mem))
                 collect_user_specs_from_type(std::meta::return_type_of(mem), out, visited);
             for (auto p : std::meta::parameters_of(mem))
@@ -1715,7 +1744,8 @@ consteval void collect_scope_user_specs(std::meta::info r,
                 continue;  // namespace-scope using-declaration: not a seed
             if (std::meta::is_type(mem) && std::meta::is_class_type(mem))
                 collect_class_user_specs(mem, out, visited, walked);
-            else if (std::meta::is_function(mem) && !std::meta::is_template(mem)) {
+            else if (std::meta::is_function(mem) && !std::meta::is_template(mem)
+                     && !std::meta::is_deleted(mem)) {
                 collect_user_specs_from_type(std::meta::return_type_of(mem), out, visited);
                 for (auto p : std::meta::parameters_of(mem))
                     collect_user_specs_from_type(std::meta::type_of(p), out, visited);

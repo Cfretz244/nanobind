@@ -347,6 +347,32 @@ struct ManyConv {
     explicit operator bool() const { return v != 0; }         // __bool__ unaffected
 };
 
+// Deleted functions are public, enumerable member declarations; none may bind
+// (BINDER-0012; the field case is tl::unexpected<E>'s `unexpected() = delete;`,
+// where cls.def(init<>()) called the deleted ctor -- a TU-wide hard error).
+// poisoned()'s unique_ptr reference doubles as the caster-matrix regression: a
+// deleted method must not demand the unique_ptr caster header, which this TU
+// deliberately does not include (same trick as AbstractIface).
+struct NoDefault {
+    NoDefault() = delete;                                  // ctor pass filter
+    explicit NoDefault(int n) : v(n) {}
+    int v;
+    int dbl() const { return 2 * v; }
+    void poisoned(const std::unique_ptr<int>&) = delete;   // method pass + caster walk
+    explicit operator long long() const = delete;          // loses the __int__ contest...
+    explicit operator int() const { return (int) v; }      // ...so __int__ binds from int
+    template <class T = int> void tpoison(T) = delete;     // member-template spec filter
+};
+// A class whose ONLY constructors are deleted binds with no __init__: Python
+// instantiation raises TypeError (the BINDER-0011 abstract-class contract).
+struct OnlyDeletedCtors {
+    OnlyDeletedCtors() = delete;
+    explicit OnlyDeletedCtors(int) = delete;
+    static int probe() { return 7; }
+};
+int free_deleted(int) = delete;                            // free-function pass filter
+bool operator==(const NoDefault&, const NoDefault&) = delete;  // free-operator filter
+
 // --- Virtual functions / trampoline (Tier 1: hand-written trampoline) ---
 
 struct Shape {
