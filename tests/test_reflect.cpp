@@ -10,14 +10,29 @@
 namespace nb = nanobind;
 namespace r = nanobind::reflect;
 
-// A base class that lives OUTSIDE the reflected namespace and is never passed to
-// reflect_<...>. It must still be bound transitively so the derived class works.
+// Base classes that live OUTSIDE the reflected namespace and are never passed to
+// reflect_<...>. Reachability rule: being a base does not surface a type, so none
+// of these become Python types -- their public members are FLATTENED onto the
+// derived classes instead (and an in-set ancestor further up the chain is still
+// wired as the real Python base, looked up through the unbound links).
 namespace external_bases {
 
 struct ExtBase {
     int eb;
     ExtBase() : eb(0) {}
     int ext_method() const { return eb; }
+};
+
+// A two-level unbound chain: both levels flatten onto the derived class.
+struct DeepUnbound {
+    int deep;
+    DeepUnbound() : deep(0) {}
+    int deep_method() const { return deep * 10; }
+};
+struct MidUnbound : DeepUnbound {
+    int mid;
+    MidUnbound() : mid(0) {}
+    int mid_method() const { return mid * 100; }
 };
 
 } // namespace external_bases
@@ -127,10 +142,17 @@ struct L2 : L1 {
     int m2() const { return v2; }
 };
 
-// Derived from a base outside the reflected namespace (bound transitively).
+// Derived from a base outside the reflected namespace: the base is NOT bound
+// (reachability rule) -- its public members flatten onto this class.
 struct UsesExtBase : external_bases::ExtBase {
     int ub;
     UsesExtBase() : ub(0) {}
+};
+
+// Two-level unbound chain: MidUnbound and DeepUnbound both flatten onto this.
+struct UsesDeepChain : external_bases::MidUnbound {
+    int own;
+    UsesDeepChain() : own(0) {}
 };
 
 // Multiple public bases: only the first (MixinA) becomes the nanobind base.
@@ -387,6 +409,26 @@ struct Thermo {
 
 } // namespace reflect_test
 
+// An unbound middle link between a reflected derived class and a reflected
+// ancestor: reflect_test::Base IS in the bind set, so it becomes the real
+// Python base of ChainThroughUnbound, looked up THROUGH the unbound link
+// (class_<T, Grandbase> works across an unambiguous public chain); the link's
+// own members flatten onto the derived class.
+namespace external_bases {
+struct MidToBase : reflect_test::Base {
+    int mtb;
+    MidToBase() : mtb(0) {}
+    int mtb_method() const { return mtb + 1; }
+};
+} // namespace external_bases
+
+namespace reflect_test {
+struct ChainThroughUnbound : external_bases::MidToBase {
+    int cu;
+    ChainThroughUnbound() : cu(0) {}
+};
+} // namespace reflect_test
+
 // --- Streamable: free operator<<(ostream&, T) -> __str__ (BINDER-0007), while a genuine
 //     operator<<(T, int) shift still maps to __lshift__. Reflected as a TYPE (^^stream_test::
 //     Streamable), mirroring how a real streamable library value (e.g. absl::int128) is bound.
@@ -474,6 +516,20 @@ struct Wrap {
     Box<T> inner;
 };
 
+// A "policy" template argument: Pol<int> appears ONLY as a template argument of
+// Cont (never in a callable signature), so the reachability rule keeps it out of
+// the bind set -- mirroring hash-map Hash/Eq/Alloc/Policy args. Cont's genuine
+// interface (T) still binds.
+template <class T>
+struct Pol {};
+
+template <class T, class P>
+struct Cont {
+    T v;
+    Cont() : v() {}
+    T get() const { return v; }
+};
+
 // A free FUNCTION template. Templates can't be bound, only instantiations; a
 // specialization is bound only when listed explicitly (it appears in no signature,
 // and explicit instantiation definitions are not enumerable via reflection). The
@@ -489,6 +545,7 @@ struct UsesBoxes {
     Wrap<int> wrapped;                        // transitive (fixpoint)-> WrapInt surfaces BoxInt
     Pair<int, double> pid;                    // multiple type args   -> PairIntDouble
     Array<int, 3> arr;                        // non-type arg         -> ArrayInt3
+    Cont<int, Pol<int>> cp;                   // spec bound; its Pol<int> arg is NOT
     UsesBoxes() = default;
     Box<double> make_bd() const { return Box<double>(2.5); }   // return type -> BoxDouble
     void take(const Box<int>& b) { bi = b; }                  // param type (dup) -> BoxInt
@@ -513,6 +570,9 @@ static_assert(tt_has_spec(^^template_test::Wrap<int>));
 static_assert(tt_has_spec(^^template_test::Pair<int, double>));
 static_assert(tt_has_spec(^^template_test::Array<int, 3>));
 static_assert(!tt_has_spec(^^std::vector<int>));     // std -> caster path, not bound
+// Reachability: the spec itself is bound, its policy-only template arg is not.
+static_assert(tt_has_spec(^^template_test::Cont<int, template_test::Pol<int>>));
+static_assert(!tt_has_spec(^^template_test::Pol<int>));
 
 NB_MODULE(test_reflect_ext, m) {
     // Box<float> is referenced by no signature; it is bound only because it is listed

@@ -545,25 +545,6 @@ void reflect_bind_ctor(auto& cls) {
 
 // --- Inheritance ---
 
-// Count the public base classes of T.
-template <typename T>
-consteval std::size_t public_base_count() {
-    std::size_t n = 0;
-    for (auto b : std::meta::bases_of(^^T, std::meta::access_context::unchecked()))
-        if (std::meta::is_public(b))
-            ++n;
-    return n;
-}
-
-// Reflection of T's first public base *type* (only valid when the count is > 0).
-template <typename T>
-consteval std::meta::info first_public_base() {
-    for (auto b : std::meta::bases_of(^^T, std::meta::access_context::unchecked()))
-        if (std::meta::is_public(b))
-            return std::meta::type_of(b);
-    return ^^void;  // unreachable: guarded by public_base_count<T>() > 0
-}
-
 consteval bool info_vec_contains(const std::vector<std::meta::info>& v,
                                  std::meta::info x) {
     for (auto e : v)
@@ -587,24 +568,24 @@ consteval void collect_public_base_subtree(std::meta::info type,
     }
 }
 
-// nanobind models a single base, so only T's first public base (and, through it,
-// that base's own subtree) is reachable on the Python side via the MRO. Every
-// other public base in T's subtree must have its members "flattened" directly
-// onto T. This returns exactly those base types: T's whole public-base subtree
-// minus the part already covered by the first public base. The subtraction makes
-// it correct for diamonds and for bases nested under the primary base (no member
-// is bound twice).
-template <typename T>
+// nanobind models a single base, and reflect_class wires one only when an
+// ancestor along the first-public-base chain is itself bound (`PyBase`, from
+// python_base_of; ^^void when there is none). Everything else in T's public-base
+// subtree must have its members "flattened" directly onto T. This returns
+// exactly those base types: T's whole public-base subtree minus PyBase and the
+// part already covered by it (exposed via the Python MRO). The subtraction makes
+// it correct for diamonds and for bases nested under PyBase (no member is bound
+// twice); with PyBase == ^^void the ENTIRE subtree flattens (e.g. an internal
+// facade chain like flat_hash_map -> raw_hash_map -> raw_hash_set). Note an
+// unbound link BETWEEN T and an indirect PyBase is not in PyBase's subtree, so
+// its members correctly flatten onto T.
+template <typename T, std::meta::info PyBase>
 consteval std::vector<std::meta::info> flatten_bases_vec() {
     std::vector<std::meta::info> all, covered, result;
     collect_public_base_subtree(^^T, all);
-    for (auto b : std::meta::bases_of(^^T, std::meta::access_context::unchecked())) {
-        if (std::meta::is_public(b)) {
-            auto primary = std::meta::type_of(b);
-            covered.push_back(primary);
-            collect_public_base_subtree(primary, covered);
-            break;  // only the first public base is the nanobind base
-        }
+    if (PyBase != ^^void) {
+        covered.push_back(PyBase);
+        collect_public_base_subtree(PyBase, covered);
     }
     for (auto t : all)
         if (!info_vec_contains(covered, t))
@@ -1097,12 +1078,13 @@ void flatten_base_members(auto& cls) {
     };
 }
 
-// Flatten every secondary public base (those nanobind cannot model as a real
-// Python base) onto T's class_. See flatten_bases_vec for which types these are.
-template <typename T>
-void flatten_secondary_bases(auto& cls) {
+// Flatten every public base nanobind cannot model as the real Python base
+// (everything in T's public-base subtree outside PyBase's) onto T's class_.
+// See flatten_bases_vec for which types these are.
+template <typename T, std::meta::info PyBase>
+void flatten_unmodeled_bases(auto& cls) {
     template for (constexpr auto base :
-        std::define_static_array(flatten_bases_vec<T>())) {
+        std::define_static_array(flatten_bases_vec<T, PyBase>())) {
         flatten_base_members<T, base>(cls);
     };
 }
@@ -1238,10 +1220,10 @@ consteval void collect_stl_types(std::meta::info type,
 // a class whose members repeatedly mention the same heavy type (e.g. nlohmann::json, whose
 // ~hundreds of members each take/return basic_json) re-walks that type's full graph once per
 // member, exploding constexpr step count (and, pushed far enough, ICEing the toolchain).
-consteval void collect_class_stl_types(std::meta::info cls,
-                                       std::vector<std::meta::info>& out,
-                                       std::vector<std::meta::info>& visited) {
-    for (auto mem : std::meta::members_of(cls, std::meta::access_context::unchecked())) {
+consteval void collect_own_stl_member_types(std::meta::info owner,
+                                            std::vector<std::meta::info>& out,
+                                            std::vector<std::meta::info>& visited) {
+    for (auto mem : std::meta::members_of(owner, std::meta::access_context::unchecked())) {
         if (!std::meta::is_public(mem) || std::meta::is_template(mem))
             continue;
         if (std::meta::is_function(mem) && !std::meta::is_destructor(mem)) {
@@ -1252,13 +1234,26 @@ consteval void collect_class_stl_types(std::meta::info cls,
         }
     }
     for (auto mem : std::meta::nonstatic_data_members_of(
-             cls, std::meta::access_context::unchecked()))
+             owner, std::meta::access_context::unchecked()))
         if (std::meta::is_public(mem))
             collect_stl_types(std::meta::type_of(mem), out, visited);
     for (auto mem : std::meta::static_data_members_of(
-             cls, std::meta::access_context::unchecked()))
+             owner, std::meta::access_context::unchecked()))
         if (std::meta::is_public(mem))
             collect_stl_types(std::meta::type_of(mem), out, visited);
+}
+// A class's bound surface includes its public-base subtree (exposed via the real
+// Python base or flattened by flatten_unmodeled_bases), so std types in base
+// member signatures need casters too -- e.g. flat_hash_map's surface is almost
+// entirely raw_hash_map/raw_hash_set members mentioning std::pair et al.
+consteval void collect_class_stl_types(std::meta::info cls,
+                                       std::vector<std::meta::info>& out,
+                                       std::vector<std::meta::info>& visited) {
+    collect_own_stl_member_types(cls, out, visited);
+    std::vector<std::meta::info> bases;
+    collect_public_base_subtree(cls, bases);
+    for (auto b : bases)
+        collect_own_stl_member_types(b, out, visited);
 }
 consteval void collect_class_stl_types(std::meta::info cls,
                                        std::vector<std::meta::info>& out) {
@@ -1320,9 +1315,18 @@ consteval bool is_user_class_template_spec(std::meta::info type) {
 }
 
 // Append the user class-template specializations reachable from `type` -- the
-// (pointer/ref/cv-unwrapped) type itself if it is one, plus, recursively, its
-// non-policy template args (Foo<Bar<int>> yields both Foo<Bar<int>> and Bar<int>)
-// -- to `out`, de-duplicated.
+// (pointer/ref/cv-unwrapped) type itself if it is one, or, recursively through
+// NON-user templates, any user spec in their args (std::vector<Foo<int>> yields
+// Foo<int>; std::pair<It, bool> yields It) -- to `out`, de-duplicated.
+//
+// Reachability rule: a user spec found in a signature is bound, but its OWN
+// template arguments do not qualify anything for binding -- policy arguments
+// (raw_hash_map<FlatHashMapPolicy<K,V>, Hash, Eq, Alloc>'s policies) never
+// appear in callable signatures and must not be dragged in. The spec's genuine
+// interface types still surface: the fixpoint in required_user_specs walks every
+// discovered spec's own member signatures (Box<Box<int>>'s `Box<int> value`
+// member surfaces Box<int>).
+//
 // `visited` memoizes already-walked types to avoid redundant re-descent (same performance
 // purpose as in collect_stl_types; not needed for termination -- arg trees are finite).
 consteval void collect_user_specs_from_type(std::meta::info type,
@@ -1336,8 +1340,11 @@ consteval void collect_user_specs_from_type(std::meta::info type,
     if (info_vec_contains(visited, type))
         return;
     visited.push_back(type);
-    if (is_user_class_template_spec(type) && !info_vec_contains(out, type))
-        out.push_back(type);
+    if (is_user_class_template_spec(type)) {
+        if (!info_vec_contains(out, type))
+            out.push_back(type);
+        return;  // do not recurse into the spec's own template args
+    }
     for (auto arg : std::meta::template_arguments_of(type))
         if (std::meta::is_type(arg) && !is_stl_policy(arg))
             collect_user_specs_from_type(arg, out, visited);
@@ -1348,13 +1355,13 @@ consteval void collect_user_specs_from_type(std::meta::info type,
     collect_user_specs_from_type(type, out, visited);
 }
 
-// Scan one class's own signatures -- data members, static data, the return/param
-// types of its functions, and its bases -- for user specializations. Skips template
-// members (a member template has no concrete signature) and destructors.
-consteval void collect_class_user_specs(std::meta::info cls,
+// Scan the member signatures declared directly in `owner` -- data members, static
+// data, the return/param types of its functions -- for user specializations. Skips
+// template members (a member template has no concrete signature) and destructors.
+consteval void collect_own_member_specs(std::meta::info owner,
                                         std::vector<std::meta::info>& out,
                                         std::vector<std::meta::info>& visited) {
-    for (auto mem : std::meta::members_of(cls, std::meta::access_context::unchecked())) {
+    for (auto mem : std::meta::members_of(owner, std::meta::access_context::unchecked())) {
         if (!std::meta::is_public(mem) || std::meta::is_template(mem))
             continue;
         if (std::meta::is_function(mem) && !std::meta::is_destructor(mem)) {
@@ -1365,38 +1372,63 @@ consteval void collect_class_user_specs(std::meta::info cls,
         }
     }
     for (auto mem : std::meta::nonstatic_data_members_of(
-             cls, std::meta::access_context::unchecked()))
+             owner, std::meta::access_context::unchecked()))
         if (std::meta::is_public(mem))
             collect_user_specs_from_type(std::meta::type_of(mem), out, visited);
     for (auto mem : std::meta::static_data_members_of(
-             cls, std::meta::access_context::unchecked()))
+             owner, std::meta::access_context::unchecked()))
         if (std::meta::is_public(mem))
             collect_user_specs_from_type(std::meta::type_of(mem), out, visited);
-    for (auto b : std::meta::bases_of(cls, std::meta::access_context::unchecked()))
-        if (std::meta::is_public(b))
-            collect_user_specs_from_type(std::meta::type_of(b), out, visited);
+}
+
+// Scan one class's full bound surface for user specializations: its own member
+// signatures plus those of every base in its public-base subtree (base members
+// are part of the bound surface either way -- through the real Python base or
+// flattened). Base TYPES themselves no longer qualify for binding (reachability
+// rule: being a base does not surface a type; see python_base_of). `walked`
+// memoizes classes whose own-member scan already ran, so a base shared by many
+// derived classes is scanned once per fixpoint, not once per derived class.
+consteval void collect_class_user_specs(std::meta::info cls,
+                                        std::vector<std::meta::info>& out,
+                                        std::vector<std::meta::info>& visited,
+                                        std::vector<std::meta::info>& walked) {
+    if (!info_vec_contains(walked, cls)) {
+        walked.push_back(cls);
+        collect_own_member_specs(cls, out, visited);
+    }
+    std::vector<std::meta::info> bases;
+    collect_public_base_subtree(cls, bases);
+    for (auto b : bases) {
+        if (!info_vec_contains(walked, b)) {
+            walked.push_back(b);
+            collect_own_member_specs(b, out, visited);
+        }
+    }
 }
 
 // Seed pass: walk a namespace (recursively) collecting user specs from its classes
 // and free functions; or, given a class/spec or function directly, from that entity
-// (including the entity itself when it is a spec).
+// (including the entity itself when it is a spec -- collect_user_specs_from_type
+// pushes a seed spec without recursing into its template args, so an explicitly
+// listed container's policy args stay unbound).
 consteval void collect_scope_user_specs(std::meta::info r,
                                         std::vector<std::meta::info>& out,
-                                        std::vector<std::meta::info>& visited) {
+                                        std::vector<std::meta::info>& visited,
+                                        std::vector<std::meta::info>& walked) {
     if (std::meta::is_namespace(r)) {
         for (auto mem : std::meta::members_of(r, std::meta::access_context::unchecked())) {
             if (std::meta::is_type(mem) && std::meta::is_class_type(mem))
-                collect_class_user_specs(mem, out, visited);
+                collect_class_user_specs(mem, out, visited, walked);
             else if (std::meta::is_function(mem) && !std::meta::is_template(mem)) {
                 collect_user_specs_from_type(std::meta::return_type_of(mem), out, visited);
                 for (auto p : std::meta::parameters_of(mem))
                     collect_user_specs_from_type(std::meta::type_of(p), out, visited);
             } else if (std::meta::is_namespace(mem))
-                collect_scope_user_specs(mem, out, visited);
+                collect_scope_user_specs(mem, out, visited, walked);
         }
     } else if (std::meta::is_type(r) && std::meta::is_class_type(r)) {
-        collect_user_specs_from_type(r, out, visited);     // r itself, if a spec
-        collect_class_user_specs(r, out, visited);         // and its members/bases
+        collect_user_specs_from_type(r, out, visited);       // r itself, if a spec
+        collect_class_user_specs(r, out, visited, walked);   // and its bound surface
     } else if (std::meta::is_function(r)) {
         collect_user_specs_from_type(std::meta::return_type_of(r), out, visited);
         for (auto p : std::meta::parameters_of(r))
@@ -1406,15 +1438,103 @@ consteval void collect_scope_user_specs(std::meta::info r,
 
 // The de-duplicated, fixpoint-closed list of user class-template specializations a
 // reflected entity needs bound. Seeds from the entity's concrete signatures, then
-// expands each newly found spec by scanning ITS members/bases (so Wrap<int> surfaces
-// Box<int>). The index loop over the growing vector plus the dedup is a worklist
-// fixpoint that visits each spec once -- terminating on CRTP/self-referential specs.
+// expands each newly found spec by scanning ITS members (and base-subtree members;
+// so Wrap<int> surfaces Box<int>). The index loop over the growing vector plus the
+// dedup is a worklist fixpoint that visits each spec once -- terminating on
+// CRTP/self-referential specs.
 consteval std::vector<std::meta::info> required_user_specs(std::meta::info r) {
-    std::vector<std::meta::info> out, visited;
-    collect_scope_user_specs(r, out, visited);
+    std::vector<std::meta::info> out, visited, walked;
+    collect_scope_user_specs(r, out, visited, walked);
     for (std::size_t i = 0; i < out.size(); ++i)
-        collect_class_user_specs(out[i], out, visited);
+        collect_class_user_specs(out[i], out, visited, walked);
     return out;
+}
+
+// --- Reachability-based bind set ---
+//
+// The set of class types reflect_<Rs...> registers: the seeds themselves (the
+// namespace members reflect_dispatch walks, or directly listed classes/specs)
+// plus every user template specialization reachable from bound signatures
+// (required_user_specs). Base classes are NOT in the set merely for being
+// bases: a base becomes the real Python base only when it is independently in
+// this set; otherwise its public members are flattened onto the derived class
+// (python_base_of / reflect_class).
+
+// The class types reflect_dispatch would bind for seed `r` (mirrors its walk:
+// skips templates and [[=reflect::skip]] types, recurses into sub-namespaces).
+consteval void collect_seed_classes(std::meta::info r,
+                                    std::vector<std::meta::info>& out) {
+    if (std::meta::is_namespace(r)) {
+        for (auto mem : std::meta::members_of(r, std::meta::access_context::unchecked())) {
+            if (std::meta::is_template(mem))
+                continue;
+            if (std::meta::is_type(mem) && std::meta::is_class_type(mem)) {
+                if (!is_skip_annotated(mem) && !info_vec_contains(out, mem))
+                    out.push_back(mem);
+            } else if (std::meta::is_namespace(mem)) {
+                collect_seed_classes(mem, out);
+            }
+        }
+    } else if (std::meta::is_type(r) && std::meta::is_class_type(r)) {
+        auto t = std::meta::remove_cvref(r);
+        if (!info_vec_contains(out, t))
+            out.push_back(t);
+    }
+}
+
+template <std::meta::info... Rs>
+consteval std::vector<std::meta::info> compute_bind_set() {
+    std::vector<std::meta::info> out;
+    (collect_seed_classes(Rs, out), ...);
+    auto merge = [&](std::vector<std::meta::info> specs) {
+        for (auto s : specs)
+            if (!info_vec_contains(out, s))
+                out.push_back(s);
+    };
+    (merge(required_user_specs(Rs)), ...);
+    return out;
+}
+
+// Memoized once per reflect_ pack: the (expensive) seed+fixpoint computation
+// runs a single time and every per-class membership query is a cheap scan.
+template <std::meta::info... Rs>
+inline constexpr auto bind_set_v = std::define_static_array(compute_bind_set<Rs...>());
+
+// The first type along `type`'s first-public-base chain that is in the bind
+// set, or ^^void. nanobind can only wire a REGISTERED type as the Python base,
+// so an unbound first base is looked through to ITS first public base, and so
+// on. Members of the looked-through (unbound) links are flattened onto the
+// derived class by flatten_unmodeled_bases.
+consteval std::meta::info python_base_of(std::meta::info type,
+                                         std::span<const std::meta::info> set) {
+    for (auto t = type;;) {
+        std::meta::info fb = ^^void;
+        for (auto b : std::meta::bases_of(t, std::meta::access_context::unchecked()))
+            if (std::meta::is_public(b)) {
+                fb = std::meta::type_of(b);
+                break;
+            }
+        if (fb == ^^void)
+            return ^^void;
+        bool in_set = false;
+        for (auto e : set)
+            if (e == fb) {
+                in_set = true;
+                break;
+            }
+        if (in_set)
+            return fb;
+        t = fb;
+    }
+}
+
+// reflect_class's entry point to the above. A consteval function (immediately
+// invoked at each use, incl. inside lambdas) rather than a constexpr local:
+// a local variable of consteval-only type cannot be referenced from the
+// class_-construction lambda's body.
+template <typename T, std::meta::info... Rs>
+consteval std::meta::info python_base_for() {
+    return python_base_of(^^T, bind_set_v<Rs...>);
 }
 
 consteval std::vector<std::meta::info> required_stl_types(std::meta::info r) {
@@ -1479,10 +1599,10 @@ void check_stl_casters() {
     };
 }
 
-template <typename T>
+template <typename T, std::meta::info... Rs>
 void reflect_class(module_& m) {
     // Idempotent: skip if T is already registered. This makes binding
-    // order-independent and lets a base be reached both directly (via the
+    // order-independent and lets a class be reached both directly (via the
     // namespace walk / another reflect_ argument) and transitively (below)
     // without triggering nanobind's "already registered" warning.
     if (type<T>().is_valid())
@@ -1490,23 +1610,28 @@ void reflect_class(module_& m) {
 
     constexpr auto name = entity_name<^^T>();
 
-    // nanobind supports a single base class. When T has one or more public
-    // bases, bind it as class_<T, Base> using the first public base. Any
-    // additional (secondary) public bases cannot be real Python bases, so their
-    // members are flattened directly onto T instead (see flatten_secondary_bases);
-    // the only thing lost for those bases is the isinstance/issubclass relation.
+    // nanobind supports a single base class -- and only a REGISTERED type can be
+    // one. Reachability rule: a base is wired as the real Python base only when
+    // it is independently in the reflect_<Rs...> bind set (a reflected-namespace
+    // member, an explicit argument, or signature-reachable); python_base_of
+    // returns the first such ancestor along the first-public-base chain (an
+    // unbound link is looked through). Every other base in T's public-base
+    // subtree -- secondary bases, unbound links, whole unbound facade chains
+    // like flat_hash_map's container_internal ancestry -- has its public
+    // members flattened directly onto T instead (flatten_unmodeled_bases); the
+    // only thing lost is the isinstance/issubclass relation to those types.
     //
     // When a trampoline is registered for T, it is passed as the class_ "Alias"
     // (the extra template arg that nanobind distinguishes from the base via
     // is_base_of<T, Alias>), enabling Python subclasses to override C++ virtuals.
-    constexpr bool HasBase = public_base_count<T>() > 0;
+    constexpr bool HasBase = (python_base_for<T, Rs...>() != ^^void);
     constexpr bool HasTramp = has_reflect_trampoline<T>;
 
     if constexpr (HasBase) {
         // Ensure the base (and, recursively, its ancestors) is bound first --
         // nanobind requires the base registered before the derived type. The
         // guard above keeps this a no-op if the base is already bound.
-        reflect_class<typename [:first_public_base<T>():]>(m);
+        reflect_class<typename [:python_base_for<T, Rs...>():], Rs...>(m);
     }
 
     // Construct the class_ with the right template arguments. The lambda's return
@@ -1514,10 +1639,10 @@ void reflect_class(module_& m) {
     // supplies the optional [[=r::doc]] string as a trailing const char* extra.
     auto cls = with_doc_extra<^^T>([&](auto&&... doc) {
         if constexpr (HasBase && HasTramp)
-            return class_<T, typename [:first_public_base<T>():],
+            return class_<T, typename [:python_base_for<T, Rs...>():],
                           reflect_trampoline_t<T>>(m, name, doc...);
         else if constexpr (HasBase)
-            return class_<T, typename [:first_public_base<T>():]>(m, name, doc...);
+            return class_<T, typename [:python_base_for<T, Rs...>():]>(m, name, doc...);
         else if constexpr (HasTramp)
             return class_<T, reflect_trampoline_t<T>>(m, name, doc...);
         else
@@ -1525,8 +1650,9 @@ void reflect_class(module_& m) {
     });
 
     bind_class_contents<T>(cls);
-    if constexpr (HasBase)
-        flatten_secondary_bases<T>(cls);
+    // Unconditional: even with no Python base there can be unbound bases to
+    // flatten (the no-bases case is an empty list).
+    flatten_unmodeled_bases<T, python_base_for<T, Rs...>()>(cls);
     // Attach namespace-scope operators that take T as an operand (e.g. a free
     // operator+(T, T) or a scalar operator*(double, T)) as dunders on T.
     bind_free_operators<T>(cls);
@@ -1551,7 +1677,10 @@ void reflect_enum(module_& m) {
     };
 }
 
-template <std::meta::info r>
+// `r` is the entity being dispatched; `Rs...` is the WHOLE reflect_ pack,
+// threaded through so reflect_class can consult the pack-wide bind set
+// (bind_set_v<Rs...>) when deciding Python-base wiring.
+template <std::meta::info r, std::meta::info... Rs>
 void reflect_dispatch(module_& m) {
     if constexpr (std::meta::is_namespace(r)) {
         template for (constexpr auto mem :
@@ -1567,7 +1696,7 @@ void reflect_dispatch(module_& m) {
                 // explicitly excluded -- bind nothing
             } else if constexpr (std::meta::is_type(mem)
                 && std::meta::is_class_type(mem)) {
-                reflect_class<typename [:mem:]>(m);
+                reflect_class<typename [:mem:], Rs...>(m);
             } else if constexpr (std::meta::is_type(mem)
                 && std::meta::is_enum_type(mem)) {
                 reflect_enum<typename [:mem:]>(m);
@@ -1575,7 +1704,7 @@ void reflect_dispatch(module_& m) {
                 && !std::meta::is_template(mem)) {
                 reflect_free_function<mem>(m);
             } else if constexpr (std::meta::is_namespace(mem)) {
-                reflect_dispatch<mem>(m);
+                reflect_dispatch<mem, Rs...>(m);
             }
         };
     } else if constexpr (std::meta::is_type(r)) {
@@ -1583,7 +1712,7 @@ void reflect_dispatch(module_& m) {
         // ill-formed on a non-type reflection (e.g. a function-template
         // specialization like ^^identity<int> passed directly to reflect_).
         if constexpr (std::meta::is_class_type(r))
-            reflect_class<typename [:r:]>(m);
+            reflect_class<typename [:r:], Rs...>(m);
         else if constexpr (std::meta::is_enum_type(r))
             reflect_enum<typename [:r:]>(m);
     } else if constexpr (std::meta::is_function(r)) {
@@ -1594,12 +1723,12 @@ void reflect_dispatch(module_& m) {
 // Bind every user class-template specialization discovered in R's signatures (see
 // required_user_specs). Specializations are not namespace members, so reflect_dispatch
 // never reaches them; this pre-pass does. reflect_class's is_valid() guard makes each
-// bind idempotent, so a spec also reached transitively (as a base/member) binds once.
-template <std::meta::info R>
+// bind idempotent, so a spec also reached transitively (as a member type) binds once.
+template <std::meta::info R, std::meta::info... Rs>
 void reflect_user_specs(module_& m) {
     template for (constexpr auto ty :
                   std::define_static_array(required_user_specs(R))) {
-        reflect_class<typename [:ty:]>(m);
+        reflect_class<typename [:ty:], Rs...>(m);
     };
 }
 
@@ -1617,9 +1746,11 @@ void reflect_(module_& m) {
     (detail::check_stl_casters<Rs>(), ...);
     // Bind user class-template specializations reachable from the signatures, then
     // the namespaces/classes/enums/functions themselves (order-independent: the
-    // reflect_class is_valid() guard dedups specs reached by both passes).
-    (detail::reflect_user_specs<Rs>(m), ...);
-    (detail::reflect_dispatch<Rs>(m), ...);
+    // reflect_class is_valid() guard dedups specs reached by both passes). Each
+    // per-entity call also receives the whole pack: Python-base wiring consults
+    // the pack-wide bind set (a base seeded by ANY pack element counts).
+    (detail::reflect_user_specs<Rs, Rs...>(m), ...);
+    (detail::reflect_dispatch<Rs, Rs...>(m), ...);
 }
 
 NAMESPACE_END(NB_NAMESPACE)

@@ -64,9 +64,14 @@ thing that cannot be expressed in-language (a virtual-override **trampoline**) h
   (formatted via `std::ostringstream`, see `bind_stream_str`), not as a shift dunder; a genuine
   `operator<<(T, int)` shift still maps to `__lshift__` (the guard keys on the operand type).
 - **Enums** → `nb::enum_` with all values.
-- **Inheritance**: first public base → real Python base (`class_<T, Base>`, bound
-  transitively + idempotently); additional bases' members **flattened** onto the derived
-  type (diamonds handled without double-binding).
+- **Inheritance (reachability rule)**: a base becomes the real Python base
+  (`class_<T, Base>`) only when it is independently in the bind set (reflected-namespace
+  member, explicit `reflect_` argument, or signature-reachable spec); python_base_of looks
+  through unbound links to the first in-set ancestor. Every other public base — secondary
+  bases, unbound/internal facade chains (e.g. `flat_hash_map`'s `container_internal`
+  ancestry) — has its public members **flattened** onto the derived type (diamonds handled
+  without double-binding). A bound spec's own template args (Hash/Eq/Alloc policies) do
+  NOT qualify types for binding; appearing in public member signatures does.
 - **Virtual functions** (Python overrides C++): two-tier — a `reflect_trampoline<T>` hook
   wires in a hand-written *or* generated trampoline as nanobind's `Alias`.
 - **Annotations**: skip / rename / doc / return-value policy / keep-alive / property. `doc` now

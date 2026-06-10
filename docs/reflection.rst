@@ -181,7 +181,7 @@ its base and transparently exposes the base's (already bound) members:
    struct Dog : Animal { int good_boy_points; };
 
    NB_MODULE(my_module, m) {
-       nb::reflect_<^^Dog>(m);   // Animal is bound automatically, too
+       nb::reflect_<^^Dog, ^^Animal>(m);   // or reflect their namespace
    }
 
 .. code-block:: python
@@ -191,20 +191,33 @@ its base and transparently exposes the base's (already bound) members:
    d.sound()                 # inherited method
    issubclass(my_module.Dog, my_module.Animal)   # True
 
-The base class is bound **transitively**: if a derived class's base was not
-itself passed to ``reflect_`` (for example, it lives in another namespace or a
-library), it is bound on demand so the inheritance relationship still works.
-Binding is idempotent -- a type reached more than once is bound only the first
-time -- so ordering of types within ``reflect_`` does not matter.
+**Reachability rule.** Being a base does *not* by itself surface a type. A base
+becomes the real Python base only when it is independently part of the bound set
+-- a member of a reflected namespace, an explicit ``reflect_`` argument, or a
+template specialization reachable from bound signatures. A base **outside** that
+set (a detail/implementation base, a facade's internal ancestry such as
+``flat_hash_map``'s ``container_internal`` chain, or simply a class you chose
+not to bind) is not registered at all: its public members are *flattened*
+directly onto the derived class, so the derived type's surface stays complete --
+only the ``isinstance``/``issubclass`` relation to the unbound base is absent.
+This holds transitively (a whole unbound chain flattens), and an in-set ancestor
+further up is still wired as the real Python base, looked up *through* the
+unbound links. Binding is idempotent -- a type reached more than once is bound
+only the first time -- so ordering of types within ``reflect_`` does not matter.
+
+For the same reason, a bound template specialization's **own template
+arguments** do not qualify types for binding (a container's Hash/Eq/Alloc/policy
+arguments never appear in callable signatures); a type qualifies by appearing in
+the *public member signatures* of something bound.
 
 Multiple inheritance
 ~~~~~~~~~~~~~~~~~~~~~~
 
 nanobind models a single C++ base per Python type. When a class has more than
-one public base, the **first** public base becomes the real Python base class,
-and the public members of every **additional** base (and of that base's own
-bases) are *flattened* directly onto the derived type -- so they remain fully
-accessible from Python:
+one public base, the **first** public base *that is in the bound set* becomes
+the real Python base class, and the public members of every **other** base (and
+of that base's own bases) are *flattened* directly onto the derived type -- so
+they remain fully accessible from Python:
 
 .. code-block:: cpp
 

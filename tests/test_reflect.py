@@ -178,17 +178,47 @@ def test20_multilevel_chain():
 
 
 @needs_reflect
-def test21_external_base_transitive():
-    # ExtBase lives outside reflect_test and was never passed to reflect_<...>;
-    # it must have been bound transitively because UsesExtBase derives from it.
-    assert hasattr(t, 'ExtBase')
+def test21_external_base_flattened():
+    # ExtBase lives outside reflect_test and was never passed to reflect_<...>,
+    # so it is NOT in the bind set: being a base does not surface a type
+    # (reachability rule). Its public members are flattened onto UsesExtBase
+    # instead, and UsesExtBase has no Python base.
+    assert not hasattr(t, 'ExtBase')
     u = t.UsesExtBase()
-    u.eb = 5   # inherited from the external base
+    u.eb = 5   # from the external base, flattened
     u.ub = 6   # own member
     assert u.eb == 5
     assert u.ub == 6
     assert u.ext_method() == 5
-    assert issubclass(t.UsesExtBase, t.ExtBase)
+    assert t.UsesExtBase.__bases__ == (object,)
+
+
+@needs_reflect
+def test21b_two_level_unbound_chain_flattened():
+    # MidUnbound and DeepUnbound (both outside the bind set) flatten transitively.
+    x = t.UsesDeepChain()
+    x.own = 1
+    x.mid = 2
+    x.deep = 3
+    assert x.mid_method() == 200
+    assert x.deep_method() == 30
+    assert not hasattr(t, 'MidUnbound') and not hasattr(t, 'DeepUnbound')
+    assert t.UsesDeepChain.__bases__ == (object,)
+
+
+@needs_reflect
+def test21c_python_base_through_unbound_link():
+    # ChainThroughUnbound : MidToBase(unbound) : Base(bound). The in-set ancestor
+    # is wired as the real Python base across the unbound link, whose own members
+    # flatten onto the derived class.
+    c = t.ChainThroughUnbound()
+    c.cu = 1
+    c.mtb = 2     # from the unbound link, flattened
+    c.b = 3       # from Base, via the Python base
+    assert c.mtb_method() == 3
+    assert c.base_method() == 3
+    assert issubclass(t.ChainThroughUnbound, t.Base)
+    assert not hasattr(t, 'MidToBase')
 
 
 @needs_reflect
@@ -487,6 +517,16 @@ def test35_template_specializations():
     assert t.BoxDouble(2.5).get() == 2.5
     # Explicitly-listed-only instantiation (no signature references it).
     assert t.BoxFloat().get() == 0.0
+
+
+@needs_reflect
+def test36b_policy_args_not_bound():
+    # Cont<int, Pol<int>> is signature-reachable and bound; Pol<int> appears only
+    # as its template argument (a "policy") and is not -- mirroring hash-map
+    # Hash/Eq/Alloc/Policy args.
+    c = t.ContIntPolInt()
+    assert c.get() == 0
+    assert not hasattr(t, 'PolInt')
 
 
 @needs_reflect
