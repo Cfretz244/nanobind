@@ -90,15 +90,16 @@ thing that cannot be expressed in-language (a virtual-override **trampoline**) h
   (`check_stl_casters`, P2741 message). `#include` can't be emitted from template code, so the
   header-only path is detect-and-diagnose only.
 - **Templates**: binds *specializations* of user class templates. `reflect_` **auto-discovers**
-  every user spec reachable from the reflected set's signatures (recursive fixpoint —
-  `required_user_specs`/`collect_user_specs_from_type` in `nb_reflect.h`), and additional ones
-  (incl. free-function-template specs and unreferenced classes) are listed explicitly as
-  `reflect_<^^ns, ^^Box<float>, ^^identity<int>>`. Python names are **CamelCase**
+  every user spec reachable from the reflected set's *public member signatures* (recursive
+  fixpoint — `required_user_specs`/`collect_user_specs_from_type` in `nb_reflect.h`; a
+  discovered spec's OWN template args do not qualify — policy args stay unbound), and
+  additional ones (incl. free-function-template specs and unreferenced classes) are listed
+  explicitly as `reflect_<^^ns, ^^Box<float>, ^^identity<int>>`. Python names are **CamelCase**
   (`spec_camel_name`: `Box<int>`→`BoxInt`, `Pair<int,double>`→`PairIntDouble`,
   `Array<int,3>`→`ArrayInt3`). The codegen path emits trampolines for spec'd templates with
-  virtuals (`type_spelling` writes the qualified template-id; `emit_spec_classes`). Member
-  function templates and `[[=r::instantiate]]` (infeasible — annotations can't carry types) are
-  *not* supported; explicit instantiation defs aren't auto-detected (not enumerable).
+  virtuals (`type_spelling` writes the qualified template-id; `emit_spec_classes`).
+  `[[=r::instantiate]]` (infeasible — annotations can't carry types) is *not* supported;
+  explicit instantiation defs aren't auto-detected (not enumerable).
 
 - **Member function templates** with all-defaulted parameters bind via their default
   instantiation under the template's name (heterogeneous-lookup APIs: `contains`/`find`/
@@ -122,6 +123,18 @@ needing explicit arguments; trampoline hardening for final/ref-qualified virtual
   `rename`/`doc` store text in a `fixed_string<N>` (char array) via CTAD.
 - `def_rw`/`def_ro` default to `rv_policy::reference_internal`; the binder only passes a
   policy when one is annotated, so it never clobbers that default.
+- **Substituted-spec predicates lie under nested-dependent instantiation (TC-0004)**: a
+  `substitute(tmpl, {})` performed two+ template levels deep yields a reflection whose
+  predicates (`is_operator_function`, `is_volatile`, `is_rvalue_reference_qualified`)
+  silently misreport when a pack-sibling overload exists. The binder substitutes AT THE
+  DISPATCH LOOP and passes the spec down as an NTTP; qualifier filtering uses the
+  binder-spec completeness gate (`sizeof` on the undefined `reflect_method_binder`
+  primary), never decl predicates on substituted specs or proxy underlyings (TC-0003).
+- **Entity proxies need `-fentity-proxy-reflection`** (not implied by
+  `-freflection-latest`), and proxy guards must precede kind predicates in `members_of`
+  loops (`is_constructor` on a proxy was an ICE before the local TC-0003 toolchain fix;
+  most type queries are still ill-formed on the proxy itself — use
+  `proxy_underlying`/`underlying_entity_of`).
 
 ## Building & testing (exact, this laptop)
 

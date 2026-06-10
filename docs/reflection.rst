@@ -471,10 +471,13 @@ Templates
 
 A template cannot be bound -- only its **specializations** can (``Box<int>`` is a
 concrete class; ``Box`` is not). ``reflect_`` **auto-discovers** every user
-class-template specialization reachable from the reflected set's signatures -- data
-members, static data, method/function return and parameter types, and bases --
-recursively, and binds each one. A specialization surfaced this way is bound exactly
-like any other class (constructors, members, methods, operators, inheritance):
+class-template specialization reachable from the reflected set's *public member
+signatures* -- data members, static data, method/function return and parameter
+types -- recursively, and binds each one. (Per the reachability rule, neither base
+classes nor a discovered specialization's own template arguments qualify a type:
+a container's Hash/Eq/Alloc policy arguments stay unbound; see `Inheritance`_.)
+A specialization surfaced this way is bound exactly like any other class
+(constructors, members, methods, operators, inheritance):
 
 .. code-block:: cpp
 
@@ -529,7 +532,9 @@ it explicitly in the ``reflect_`` argument pack, alongside namespaces and types:
 The same applies to **free function templates**: a function template cannot be bound,
 but a specialization (``identity<int>`` → ``identityInt``) can, and only by listing it
 explicitly -- explicit instantiation *definitions* (``template int identity<int>(int);``)
-are not enumerable via reflection. **Member** function templates are not supported.
+are not enumerable via reflection. **Member** function templates whose parameters are
+all defaulted bind automatically via their default instantiation (see `Limitations`_
+for the precise rule); ones needing explicit arguments are skipped.
 
 There is intentionally no ``[[=r::instantiate<...>]]`` annotation: a P3394 annotation
 value must be a valid template argument and cannot carry a type or a
