@@ -100,8 +100,16 @@ thing that cannot be expressed in-language (a virtual-override **trampoline**) h
   function templates and `[[=r::instantiate]]` (infeasible — annotations can't carry types) are
   *not* supported; explicit instantiation defs aren't auto-detected (not enumerable).
 
-Roadmap / not yet: per-argument ownership-transfer annotations; member function templates;
-trampoline hardening for final/ref-qualified virtuals.
+- **Member function templates** with all-defaulted parameters bind via their default
+  instantiation under the template's name (heterogeneous-lookup APIs: `contains`/`find`/
+  `erase`/`operator[]` on hash/btree containers); packs (`emplace`) and
+  explicit-argument templates are gracefully skipped.
+- **Using-redeclarations** (`using Base::f;`, incl. from PRIVATE bases — StatusOr's
+  `value()`) bind as entity proxies. Requires `-fentity-proxy-reflection` (NOT implied by
+  `-freflection-latest`); template/data-member re-exports from inaccessible bases skipped.
+
+Roadmap / not yet: per-argument ownership-transfer annotations; member function templates
+needing explicit arguments; trampoline hardening for final/ref-qualified virtuals.
 
 ## Key gotchas (clang-p2996 @ the pinned toolchain commit)
 

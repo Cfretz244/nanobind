@@ -573,11 +573,22 @@ Limitations
 - **Annotations**: per-argument ownership transfer is not yet handled (see
   `Controlling the bindings with annotations`_).
 - **Templates**: only specializations are bound (see `Templates`_); they are
-  auto-discovered from signatures or listed explicitly. Member function templates
-  (including templated constructors and conversion operators) are unsupported and are
-  *gracefully skipped*, explicit instantiation definitions are not auto-detected, and the
+  auto-discovered from signatures or listed explicitly. A member function template
+  binds via its **default instantiation** when every template parameter is
+  defaulted/SFINAE-satisfied (the heterogeneous-lookup shape:
+  ``template <class K = key_type> bool contains(const key_arg<K>&)`` — this is
+  what makes ``flat_hash_map``/``btree_map`` query APIs work); templates needing
+  explicit arguments, parameter packs (``emplace``/``try_emplace``), templated
+  constructors, and templated conversion operators are *gracefully skipped*.
+  Explicit instantiation definitions are not auto-detected, and the
   header-only path does not diagnose a missing std caster used *only* by a discovered
   specialization's members (it surfaces at bind time); the codegen path emits it.
+- **Using-redeclarations**: ``using Base::f;`` re-exports — including from
+  **private** bases (``absl::StatusOr``'s ``value()``) — bind through their
+  entity proxies. Requires the ``-fentity-proxy-reflection`` flag (NOT implied
+  by ``-freflection-latest``); without it they are invisible and skipped.
+  Re-exports of member function *templates* from inaccessible bases and of
+  *data members* are not supported (skipped).
 - **Default-argument values** are not bound — a standard limitation, not a binder
   one (P3096 exposes only ``has_default_argument``). See `Keyword arguments`_.
 - **STL casters**: the header-only path cannot inject ``#include``s (it diagnoses

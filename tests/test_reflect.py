@@ -520,6 +520,36 @@ def test35_template_specializations():
 
 
 @needs_reflect
+def test37_member_function_templates():
+    # All-defaulted member function templates bind via their default
+    # instantiation, under the TEMPLATE's name (the heterogeneous-lookup shape).
+    h = t.HetMap()
+    h.add(3)
+    assert h.contains(3) and not h.contains(4)   # from the UNBOUND base, flattened
+    assert not hasattr(t, 'HetBase')
+    assert h.at(21) == 42                        # two defaulted params
+    assert h.erase(1) == 1 and h.erase(-1) == 0
+    assert h[5] == 15                            # operator[] template -> __getitem__
+    assert t.HetMap.sdouble(8) == 16             # static member template
+    # No default / parameter packs stay skipped.
+    for absent in ('needs_explicit', 'emplace', 'try_emplace'):
+        assert not hasattr(t.HetMap, absent), absent
+
+
+@needs_reflect
+def test38_private_base_using_reexports():
+    # Members declared in a PRIVATE base and re-exported with using-declarations
+    # bind as entity proxies through the derived class (BINDER-0009); the base
+    # itself is neither bound nor flattened.
+    u = t.UsesPrivateBase()
+    assert u.own() == 1
+    assert u.pmeth() == 7              # using ProxyImpl::pmeth (private base)
+    assert u.padd(5) == 12             # with an argument
+    assert t.UsesPrivateBase.psq(3) == 9   # static re-export
+    assert not hasattr(t, 'ProxyImpl')
+
+
+@needs_reflect
 def test36b_policy_args_not_bound():
     # Cont<int, Pol<int>> is signature-reachable and bound; Pol<int> appears only
     # as its template argument (a "policy") and is not -- mirroring hash-map

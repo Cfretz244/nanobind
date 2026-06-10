@@ -429,6 +429,81 @@ struct ChainThroughUnbound : external_bases::MidToBase {
 };
 } // namespace reflect_test
 
+// --- Member function templates: the all-defaulted shape binds via its default
+//     instantiation (heterogeneous-lookup APIs: template <class K = int> bool
+//     contains(const K&)); packs and non-defaulted params stay skipped. Mirrors
+//     absl::flat_hash_map's query surface (which lives on a flattened base).
+namespace member_template_detail {
+
+// NOT reflected: HetMap's base. Its defaulted member template must reach HetMap
+// through the flattening path (like raw_hash_set's query APIs).
+struct HetBase {
+    std::vector<int> keys;
+    HetBase() {}
+    template <class K = int>
+    bool contains(const K& k) const {
+        for (int v : keys) if (v == k) return true;
+        return false;
+    }
+};
+
+} // namespace member_template_detail
+
+namespace member_template_test {
+
+struct HetMap : member_template_detail::HetBase {
+    HetMap() {}
+    // Public-base re-export: the flattening pass already exposes contains();
+    // the proxy this using-declaration creates must NOT bind a duplicate.
+    using member_template_detail::HetBase::contains;
+    void add(int k) { keys.push_back(k); }
+    template <class K = int, class P = double>
+    int at(const K& k) const { return k * 2; }                  // multi-defaulted
+    template <class K = int>
+    std::size_t erase(const K& k) { return k > 0 ? 1u : 0u; }
+    template <class K = int>
+    int operator[](const K& k) const { return k + 10; }         // -> __getitem__
+    template <class K = int>
+    static int sdouble(const K& k) { return k * 2; }            // static template
+    template <class K>
+    void needs_explicit(K) {}                                    // no default: skipped
+    template <class... Args>
+    void emplace(Args&&...) {}                                   // pure pack: skipped
+    template <class K = int, class... Args>
+    void try_emplace(K, Args&&...) {}                            // pack tail: skipped
+};
+
+} // namespace member_template_test
+
+// --- Entity proxies (BINDER-0009): members declared in a PRIVATE base and
+//     re-exported with using-declarations. Under -fentity-proxy-reflection the
+//     shadow declarations enumerate as proxies and bind THROUGH the derived
+//     class (correct access). Mirrors absl::StatusOr's value()/operator*.
+namespace proxy_detail {
+
+// NOT reflected (mirrors absl::internal_statusor).
+struct ProxyImpl {
+    int pv;
+    ProxyImpl() : pv(7) {}
+    int pmeth() const { return pv; }
+    int padd(int x) const { return pv + x; }
+    static int psq(int x) { return x * x; }
+};
+
+} // namespace proxy_detail
+
+namespace proxy_test {
+
+struct UsesPrivateBase : private proxy_detail::ProxyImpl {
+    UsesPrivateBase() {}
+    using proxy_detail::ProxyImpl::pmeth;
+    using proxy_detail::ProxyImpl::padd;
+    using proxy_detail::ProxyImpl::psq;
+    int own() const { return 1; }
+};
+
+} // namespace proxy_test
+
 // --- Streamable: free operator<<(ostream&, T) -> __str__ (BINDER-0007), while a genuine
 //     operator<<(T, int) shift still maps to __lshift__. Reflected as a TYPE (^^stream_test::
 //     Streamable), mirroring how a real streamable library value (e.g. absl::int128) is bound.
@@ -581,5 +656,6 @@ NB_MODULE(test_reflect_ext, m) {
     nb::reflect_<^^reflect_test, ^^template_test,
                  ^^template_test::Box<float>,
                  ^^template_test::identity<int>,
-                 ^^stream_test::Streamable>(m);
+                 ^^stream_test::Streamable,
+                 ^^member_template_test, ^^proxy_test>(m);
 }

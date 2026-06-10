@@ -488,6 +488,51 @@ consteval bool has_move_only_by_value_param(std::meta::info fn) {
     return false;
 }
 
+// --- Entity proxies (using-redeclarations; BINDER-0009) ---
+//
+// With -fentity-proxy-reflection (NOT implied by -freflection-latest), a
+// `using Base::f;` shadow declaration appears in members_of as an ENTITY PROXY:
+// named like the member, resolvable via underlying_entity_of, and -- crucially
+// -- spliceable as a member of the DERIVED class (self.[:proxy:](...)), so a
+// re-export from a PRIVATE base (absl::StatusOr's value(), declared in the
+// private internal_statusor::OperatorBase and re-exported with `using`) binds
+// with correct access. Most type queries (type_of, parameters_of, annotations_of)
+// are ill-formed on the proxy itself -- use the underlying function for those.
+// Without the flag, shadow declarations are simply not enumerated; these shims
+// keep the binder compiling either way (proxies then never appear).
+#if __has_feature(entity_proxy_reflection)
+consteval bool is_using_proxy(std::meta::info e) {
+    return std::meta::is_entity_proxy(e);
+}
+consteval std::meta::info proxy_underlying(std::meta::info e) {
+    return std::meta::underlying_entity_of(e);
+}
+#else
+consteval bool is_using_proxy(std::meta::info) { return false; }
+consteval std::meta::info proxy_underlying(std::meta::info e) { return e; }
+#endif
+
+// True if a function template instantiates with ZERO explicit template
+// arguments (every parameter defaulted / SFINAE-satisfied) and has no trailing
+// parameter pack. This exactly captures the heterogeneous-lookup shape --
+// template <class K = key_type> bool contains(const key_arg<K>&) -- that
+// hash/btree container query APIs use, while excluding emplace/try_emplace
+// (packs) and templates needing explicit arguments. The pack rejection probes
+// whether the template would absorb ONE MORE argument than the default
+// instantiation took; the probe argument must be ^^int, NEVER ^^void (placing
+// void into a `class...` pack forms void&& inside clang's Substitute and
+// crashes Sema).
+consteval bool fn_template_default_instantiable(std::meta::info tmpl) {
+    if (!std::meta::can_substitute(tmpl, std::vector<std::meta::info>{}))
+        return false;                       // some parameter lacks a default
+    auto spec = std::meta::substitute(tmpl, std::vector<std::meta::info>{});
+    auto args = std::meta::template_arguments_of(spec);
+    if (args.empty())
+        return false;                       // pure pack (emplace<>)
+    args.push_back(^^int);
+    return !std::meta::can_substitute(tmpl, args);  // absorbs one more => pack
+}
+
 template <std::meta::info fn>
 void reflect_free_function(module_& m) {
     // Skip C-variadic free functions (their function type matches no binder), and
@@ -972,16 +1017,133 @@ void reflect_bind_member_function(auto& cls) {
     // else: nameless and non-operator (e.g. a literal operator) -- skip.
 }
 
+// Bind a member function TEMPLATE whose default instantiation exists (see
+// fn_template_default_instantiable): substitute with zero explicit arguments and
+// route the resulting specialization through the ordinary binders. The Python
+// name is the TEMPLATE's identifier (`contains`, not `containsInt` -- the
+// defaulted argument is an implementation detail), so multiple such templates
+// and their non-template overloads stack as normal Python overloads. Operator
+// templates route to the dunder path; constructor and conversion templates are
+// handled by their own passes' guards (still unsupported).
+template <typename T, std::meta::info tmpl>
+void reflect_bind_member_template(auto& cls) {
+    if constexpr (fn_template_default_instantiable(tmpl)) {
+        constexpr auto spec =
+            std::meta::substitute(tmpl, std::vector<std::meta::info>{});
+        if constexpr (!has_ann<spec, reflect::skip>()
+                      && !has_move_only_by_value_param(spec)
+                      && !std::meta::is_volatile(spec)
+                      && !std::meta::is_rvalue_reference_qualified(spec)
+                      && !std::meta::has_ellipsis_parameter(spec)) {
+            using FnType = [:std::meta::type_of(spec):];
+            if constexpr (std::meta::is_operator_function(spec)) {
+                reflect_bind_operator<T, spec>(cls);
+            } else if constexpr (std::meta::has_identifier(tmpl)) {
+                constexpr const char* nm = std::define_static_string(
+                    std::meta::identifier_of(tmpl));
+                if constexpr (std::meta::is_static_member(spec)) {
+                    with_arg_call_extras<spec>([&](auto&&... e) {
+                        reflect_static_method_binder<spec, FnType>::bind(
+                            cls, nm, std::forward<decltype(e)>(e)...);
+                    });
+                } else {
+                    with_arg_call_extras<spec>([&](auto&&... e) {
+                        reflect_method_binder<T, spec, FnType>::bind(
+                            cls, nm, std::forward<decltype(e)>(e)...);
+                    });
+                }
+            }
+        }
+    }
+}
+
+// True if the entity a proxy re-exports is declared in T's PUBLIC base subtree.
+// Such re-exports are already exposed by the flattening pass (or the real Python
+// base); binding the proxy too would create duplicate overloads.
+template <typename T>
+consteval bool proxy_flatten_covered(std::meta::info proxy) {
+    auto owner = std::meta::parent_of(proxy_underlying(proxy));
+    std::vector<std::meta::info> bases;
+    collect_public_base_subtree(^^T, bases);
+    return info_vec_contains(bases, owner);
+}
+
+// Bind a using-redeclaration (entity proxy; see is_using_proxy). Only proxies
+// the flattening pass does NOT cover bind here -- i.e. re-exports from private/
+// protected bases, which are exactly the ones nothing else can reach. The
+// method lambda calls THROUGH the proxy (a public member of T, so the
+// inaccessible-base path is never formed); the function type and parameter
+// names come from the underlying function. Unsupported and skipped: proxies of
+// member function TEMPLATES in inaccessible bases (the substituted spec is the
+// base's member -- calling it through T would form the inaccessible path) and
+// of DATA members (a pointer-to-member of an inaccessible base is unusable).
+template <typename T, std::meta::info proxy>
+void reflect_bind_proxy(auto& cls) {
+    if constexpr (proxy_flatten_covered<T>(proxy))
+        return;
+    else {
+        constexpr auto u = proxy_underlying(proxy);
+        if constexpr (std::meta::is_function(u)
+                      && !std::meta::is_constructor(u)
+                      && !std::meta::is_destructor(u)
+                      && !std::meta::is_special_member_function(u)
+                      && !std::meta::has_ellipsis_parameter(u)
+                      && !has_move_only_by_value_param(u)) {
+            // Qualifier filtering goes through the FUNCTION TYPE, not the decl
+            // predicates: through a proxy on an instantiated class template,
+            // is_rvalue_reference_qualified(u) misreports false for &&-qualified
+            // members (StatusOr<T>'s value()&& -- see TC-0003 addendum), so the
+            // supported-qualifier gate is "does a binder partial specialization
+            // exist for this exact function type" (sizeof on the undefined
+            // primary is a substitution failure for volatile/&&/unmatched).
+            using FnType = [:std::meta::type_of(u):];
+            if constexpr (std::meta::is_operator_function(u)) {
+                if constexpr (requires {
+                        sizeof(reflect_method_binder<T, proxy, FnType>); }) {
+                    constexpr auto op = std::meta::operator_of(u);
+                    constexpr const char* d =
+                        operator_dunder(op, std::meta::parameters_of(u).size());
+                    if constexpr (d != nullptr)
+                        reflect_method_binder<T, proxy, FnType>::bind(
+                            cls, d, is_operator());
+                }
+            } else if constexpr (std::meta::is_static_member(u)) {
+                // A static member of the (public-in-itself) base is callable
+                // via the underlying entity directly.
+                if constexpr (requires {
+                        sizeof(reflect_static_method_binder<u, FnType>); }) {
+                    with_arg_call_extras<u>([&](auto&&... e) {
+                        reflect_static_method_binder<u, FnType>::bind(
+                            cls, entity_name<u>(),
+                            std::forward<decltype(e)>(e)...);
+                    });
+                }
+            } else if constexpr (std::meta::has_identifier(u)) {
+                if constexpr (requires {
+                        sizeof(reflect_method_binder<T, proxy, FnType>); }) {
+                    with_arg_call_extras<u>([&](auto&&... e) {
+                        reflect_method_binder<T, proxy, FnType>::bind(
+                            cls, entity_name<u>(),
+                            std::forward<decltype(e)>(e)...);
+                    });
+                }
+            }
+        }
+    }
+}
+
 // Bind the constructors, data members, static data members, and methods declared
 // directly in T onto an already-created class_ object. Inherited members are not
 // re-bound here -- they are exposed automatically through the Python base type.
 template <typename T>
 void bind_class_contents(auto& cls) {
-    // Bind constructors
+    // Bind constructors. The proxy guard must come FIRST: is_constructor on an
+    // entity proxy is an UNREACHABLE in clang-p2996 (TC-0003), not a false.
     template for (constexpr auto fn :
         std::define_static_array(std::meta::members_of(
             ^^T, std::meta::access_context::unchecked()))) {
-        if constexpr (std::meta::is_constructor(fn)
+        if constexpr (!is_using_proxy(fn)
+            && std::meta::is_constructor(fn)
             && std::meta::is_public(fn)
             && !std::meta::is_template(fn)   // skip constructor templates (cannot reflect)
             && !std::meta::is_copy_constructor(fn)
@@ -1012,16 +1174,26 @@ void bind_class_contents(auto& cls) {
 
     // Bind methods (instance, static, operators, conversions). Property accessors are
     // skipped here (see reflect_bind_member_function) and bound by the pass below.
+    // Member function templates bind via their default instantiation when every
+    // template parameter is defaulted (reflect_bind_member_template); others skip.
     template for (constexpr auto fn :
         std::define_static_array(std::meta::members_of(
             ^^T, std::meta::access_context::unchecked()))) {
         if constexpr (std::meta::is_function(fn)
             && std::meta::is_public(fn)
-            && !std::meta::is_template(fn)   // skip member function templates (unsupported)
+            && !std::meta::is_template(fn)
             && !std::meta::is_constructor(fn)
             && !std::meta::is_destructor(fn)
             && !std::meta::is_special_member_function(fn)) {
             reflect_bind_member_function<T, fn>(cls);
+        } else if constexpr (std::meta::is_function_template(fn)
+            && std::meta::is_public(fn)
+            && !std::meta::is_constructor_template(fn)
+            && !std::meta::is_conversion_function_template(fn)) {
+            reflect_bind_member_template<T, fn>(cls);
+        } else if constexpr (is_using_proxy(fn)) {
+            if constexpr (std::meta::is_public(fn))
+                reflect_bind_proxy<T, fn>(cls);
         }
     };
 
@@ -1069,11 +1241,25 @@ void flatten_base_members(auto& cls) {
             Base, std::meta::access_context::unchecked()))) {
         if constexpr (std::meta::is_function(fn)
             && std::meta::is_public(fn)
-            && !std::meta::is_template(fn)   // skip member function templates (unsupported)
+            && !std::meta::is_template(fn)
             && !std::meta::is_constructor(fn)
             && !std::meta::is_destructor(fn)
             && !std::meta::is_special_member_function(fn)) {
             reflect_bind_member_function<T, fn>(cls);
+        } else if constexpr (std::meta::is_function_template(fn)
+            && std::meta::is_public(fn)
+            && !std::meta::is_constructor_template(fn)
+            && !std::meta::is_conversion_function_template(fn)) {
+            // Member function templates with all-defaulted parameters bind via
+            // their default instantiation -- this is where flat_hash_map's
+            // heterogeneous contains/find/erase/operator[] live (declared on the
+            // flattened raw_hash_map/raw_hash_set ancestry).
+            reflect_bind_member_template<T, fn>(cls);
+        } else if constexpr (is_using_proxy(fn)) {
+            // A using-redeclaration inside the flattened base re-exporting from
+            // ITS OWN inaccessible base; same routing as on T itself.
+            if constexpr (std::meta::is_public(fn))
+                reflect_bind_proxy<T, fn>(cls);
         }
     };
 }
@@ -1224,8 +1410,35 @@ consteval void collect_own_stl_member_types(std::meta::info owner,
                                             std::vector<std::meta::info>& out,
                                             std::vector<std::meta::info>& visited) {
     for (auto mem : std::meta::members_of(owner, std::meta::access_context::unchecked())) {
-        if (!std::meta::is_public(mem) || std::meta::is_template(mem))
+        if (!std::meta::is_public(mem))
             continue;
+        if (is_using_proxy(mem)) {
+            // A bound using-redeclaration (reflect_bind_proxy) contributes its
+            // underlying function's signature types.
+            auto u = proxy_underlying(mem);
+            if (std::meta::is_function(u) && !std::meta::is_template(u)
+                && !std::meta::is_destructor(u) && !std::meta::is_constructor(u)) {
+                collect_stl_types(std::meta::return_type_of(u), out, visited);
+                for (auto p : std::meta::parameters_of(u))
+                    collect_stl_types(std::meta::type_of(p), out, visited);
+            }
+            continue;
+        }
+        if (std::meta::is_template(mem)) {
+            // A member function template that binds via its default instantiation
+            // (reflect_bind_member_template) contributes that instantiation's
+            // signature types to the bound surface.
+            if (std::meta::is_function_template(mem)
+                && !std::meta::is_constructor_template(mem)
+                && !std::meta::is_conversion_function_template(mem)
+                && fn_template_default_instantiable(mem)) {
+                auto spec = std::meta::substitute(mem, std::vector<std::meta::info>{});
+                collect_stl_types(std::meta::return_type_of(spec), out, visited);
+                for (auto p : std::meta::parameters_of(spec))
+                    collect_stl_types(std::meta::type_of(p), out, visited);
+            }
+            continue;
+        }
         if (std::meta::is_function(mem) && !std::meta::is_destructor(mem)) {
             if (!std::meta::is_constructor(mem))
                 collect_stl_types(std::meta::return_type_of(mem), out, visited);
@@ -1268,6 +1481,8 @@ consteval void collect_scope_stl_types(std::meta::info r,
                                        std::vector<std::meta::info>& visited) {
     if (std::meta::is_namespace(r)) {
         for (auto mem : std::meta::members_of(r, std::meta::access_context::unchecked())) {
+            if (is_using_proxy(mem))
+                continue;  // namespace-scope using-declaration: not a seed
             if (std::meta::is_type(mem) && std::meta::is_class_type(mem))
                 collect_class_stl_types(mem, out, visited);
             else if (std::meta::is_function(mem) && !std::meta::is_template(mem)) {
@@ -1362,8 +1577,35 @@ consteval void collect_own_member_specs(std::meta::info owner,
                                         std::vector<std::meta::info>& out,
                                         std::vector<std::meta::info>& visited) {
     for (auto mem : std::meta::members_of(owner, std::meta::access_context::unchecked())) {
-        if (!std::meta::is_public(mem) || std::meta::is_template(mem))
+        if (!std::meta::is_public(mem))
             continue;
+        if (is_using_proxy(mem)) {
+            // A bound using-redeclaration (reflect_bind_proxy) contributes its
+            // underlying function's signature types.
+            auto u = proxy_underlying(mem);
+            if (std::meta::is_function(u) && !std::meta::is_template(u)
+                && !std::meta::is_destructor(u) && !std::meta::is_constructor(u)) {
+                collect_user_specs_from_type(std::meta::return_type_of(u), out, visited);
+                for (auto p : std::meta::parameters_of(u))
+                    collect_user_specs_from_type(std::meta::type_of(p), out, visited);
+            }
+            continue;
+        }
+        if (std::meta::is_template(mem)) {
+            // Default-instantiable member templates bind (see
+            // reflect_bind_member_template), so their instantiation's signature
+            // types are reachable like any other bound signature.
+            if (std::meta::is_function_template(mem)
+                && !std::meta::is_constructor_template(mem)
+                && !std::meta::is_conversion_function_template(mem)
+                && fn_template_default_instantiable(mem)) {
+                auto spec = std::meta::substitute(mem, std::vector<std::meta::info>{});
+                collect_user_specs_from_type(std::meta::return_type_of(spec), out, visited);
+                for (auto p : std::meta::parameters_of(spec))
+                    collect_user_specs_from_type(std::meta::type_of(p), out, visited);
+            }
+            continue;
+        }
         if (std::meta::is_function(mem) && !std::meta::is_destructor(mem)) {
             if (!std::meta::is_constructor(mem))
                 collect_user_specs_from_type(std::meta::return_type_of(mem), out, visited);
@@ -1417,6 +1659,8 @@ consteval void collect_scope_user_specs(std::meta::info r,
                                         std::vector<std::meta::info>& walked) {
     if (std::meta::is_namespace(r)) {
         for (auto mem : std::meta::members_of(r, std::meta::access_context::unchecked())) {
+            if (is_using_proxy(mem))
+                continue;  // namespace-scope using-declaration: not a seed
             if (std::meta::is_type(mem) && std::meta::is_class_type(mem))
                 collect_class_user_specs(mem, out, visited, walked);
             else if (std::meta::is_function(mem) && !std::meta::is_template(mem)) {
@@ -1466,7 +1710,7 @@ consteval void collect_seed_classes(std::meta::info r,
                                     std::vector<std::meta::info>& out) {
     if (std::meta::is_namespace(r)) {
         for (auto mem : std::meta::members_of(r, std::meta::access_context::unchecked())) {
-            if (std::meta::is_template(mem))
+            if (std::meta::is_template(mem) || is_using_proxy(mem))
                 continue;
             if (std::meta::is_type(mem) && std::meta::is_class_type(mem)) {
                 if (!is_skip_annotated(mem) && !info_vec_contains(out, mem))
@@ -1692,6 +1936,10 @@ void reflect_dispatch(module_& m) {
                 // by the reflected set are discovered and bound by reflect_user_specs,
                 // and others can be passed explicitly. Guarded first because
                 // annotations_of (used by has_ann) is ill-formed on a template.
+            } else if constexpr (is_using_proxy(mem)) {
+                // A namespace-scope using-declaration (e.g. `using std::string;`),
+                // enumerated under -fentity-proxy-reflection. Not a binding seed;
+                // guarded before has_ann (annotations_of is ill-formed on a proxy).
             } else if constexpr (has_ann<mem, reflect::skip>()) {
                 // explicitly excluded -- bind nothing
             } else if constexpr (std::meta::is_type(mem)
