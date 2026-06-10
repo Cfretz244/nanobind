@@ -672,3 +672,65 @@ def test41_exclude_marker():
         t.XVec(object())
     # An excluded base is opaque: nothing flattened from it.
     assert not hasattr(t.XVec, "from_base")
+
+
+@needs_reflect
+def test42_unbindable_shapes_skip():
+    # BINDER-0015 + BINDER-0019: ptr-to-ptr, T*& out-params, function-pointer
+    # params, and pointers to incomplete plain classes skip gracefully (each
+    # used to be a TU-wide hard compile error). The clean surface still binds.
+    g = t.Gadget()
+    assert g.ok() == 1
+    for absent in ("mangle", "peek", "on_event", "impl"):
+        assert not hasattr(t.Gadget, absent), absent
+
+
+@needs_reflect
+def test43_raw_pointer_return_borrows():
+    # BINDER-0017: a bare class-pointer return is BORROWED by default. Under the
+    # old automatic/take_ownership default, collecting `it` (or the discarded
+    # add() return) double-freed and aborted the process (CLI11's field shape).
+    import gc
+    reg = t.Registry()
+    it = reg.add()
+    assert it.get() == 7
+    reg.add()                       # discarded return: wrapper GC'd immediately
+    del it
+    gc.collect()
+    assert reg.count() == 2         # C++ side still owns intact items
+    assert reg.sum() == 14
+    assert reg.self().count() == 2  # fluent self-return borrows too
+    # Static and free raw-pointer returns borrow (rv_policy::reference).
+    a = t.Registry.shared_item()
+    b = t.Registry.shared_item()
+    assert a.get() == 99 and b.get() == 99
+    assert t.free_shared_item().get() == 55
+    del a, b
+    gc.collect()
+    assert t.Registry.shared_item().get() == 99
+
+
+@needs_reflect
+def test44_anonymous_typedef_names():
+    # BINDER-0018: `typedef struct {...} point_t;` binds under the typedef name
+    # for linkage (the identifier_of route is ill-formed on the anonymous record).
+    p = t.point_t()
+    p.x = 3
+    p.y = 4
+    assert (p.x, p.y) == (3, 4)
+    assert t.color_t.ANON_RED.value == 1
+    assert t.color_t.ANON_GREEN.value == 2
+
+
+@needs_reflect
+def test45_static_const_by_value():
+    # BINDER-0020: constant-readable static const members bind by VALUE (no
+    # ODR-use). In-class-initialized statics with no out-of-line definition
+    # used to fail at link.
+    assert t.Config.BLOCK == 7
+    assert t.Config.BIG == (1 << 40)
+    assert t.Config.RATIO == 2.5
+    assert t.Config.counter == 3    # mutable static keeps the address path
+    t.Config.counter = 5
+    assert t.Config.counter == 5
+    t.Config.counter = 3

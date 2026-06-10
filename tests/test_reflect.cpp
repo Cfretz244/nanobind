@@ -789,6 +789,96 @@ static_assert(nb::detail::is_exclude_marker(^^EX_MARKER));
 static_assert(!ex_has_spec(^^exclude_test::Expr<int>));
 static_assert(!ex_has_spec(^^exclude_test::Expr<exclude_test::Expr<int>>));
 
+// BINDER-0015 (unbindable parameter/return shapes skip gracefully) +
+// BINDER-0019 (pointer to incomplete plain class skips like a non-completable
+// spec). Every poison member here used to be a TU-wide hard error.
+namespace unbindable_shapes {
+
+struct Opaque;                                       // pImpl idiom: never defined
+
+struct Gadget {
+    int v = 1;
+    Gadget() = default;
+    char** mangle(char** argv) { return argv; }      // ptr-to-ptr param + return
+    bool peek(Gadget*& out) noexcept { out = this; return true; }  // T*& out-param
+    void on_event(void (*cb)(int)) { cb(v); }        // function-pointer param
+    Opaque* impl() const { return nullptr; }         // incomplete-pointee return
+    int ok() const { return v; }                     // binds
+};
+
+} // namespace unbindable_shapes
+
+// BINDER-0017: a bare class-pointer return defaults to a BORROWING policy
+// (reference_internal on methods, reference on statics/free functions), not
+// nanobind's automatic/take_ownership -- the fluent-builder/accessor pattern
+// (CLI11's add_option) double-freed under the old default.
+namespace ownership_test {
+
+struct Item {
+    int v = 7;
+    int get() const { return v; }
+};
+
+class Registry {
+    std::vector<std::unique_ptr<Item>> items_;
+public:
+    Registry() = default;
+    Registry(const Registry&) = delete;
+    Item* add() {                                    // borrowed pointer into owned storage
+        items_.push_back(std::make_unique<Item>());
+        return items_.back().get();
+    }
+    Registry* self() { return this; }                // fluent self-return
+    int count() const { return (int) items_.size(); }
+    int sum() const {
+        int s = 0;
+        for (auto& i : items_) s += i->v;
+        return s;
+    }
+    static Item* shared_item() {                     // static -> rv_policy::reference
+        static Item it{99};
+        return &it;
+    }
+};
+
+inline Item* free_shared_item() {                    // free fn -> rv_policy::reference
+    static Item it{55};
+    return &it;
+}
+
+} // namespace ownership_test
+
+// BINDER-0018: C-style `typedef struct {...} name_t;` declares an ANONYMOUS
+// record; the binder used to hard-error computing its name via identifier_of.
+// It now binds under the typedef name for linkage (tinyobjloader's idiom).
+namespace anon_typedef_test {
+
+typedef struct {     // C-compatible (data only), exactly the tinyobjloader idiom
+    int x;
+    int y;
+} point_t;
+
+typedef enum { ANON_RED = 1, ANON_GREEN = 2 } color_t;
+
+} // namespace anon_typedef_test
+
+// BINDER-0020: an in-class-initialized `static const` with no out-of-line
+// definition used to bind by address (&[:mem:]), ODR-using it -> undefined
+// symbol at link (moodycamel::ConcurrentQueue's config constants). Constant-
+// readable statics now bind by value.
+namespace static_const_test {
+
+struct Config {
+    static const int BLOCK = 7;                  // in-class init, NO definition
+    static const long long BIG = 1LL << 40;      // ditto
+    static constexpr double RATIO = 2.5;         // constexpr (inline) value path
+    static int counter;                          // mutable: address path
+    int id = 0;
+};
+int Config::counter = 3;
+
+} // namespace static_const_test
+
 NB_MODULE(test_reflect_ext, m) {
     // Box<float> is referenced by no signature; it is bound only because it is listed
     // explicitly here (the explicit opt-in for specializations the walk can't reach).
@@ -798,5 +888,7 @@ NB_MODULE(test_reflect_ext, m) {
                  ^^template_test::identity<int>,
                  ^^stream_test::Streamable,
                  ^^member_template_test, ^^proxy_test,
-                 ^^exclude_test, ^^EX_MARKER>(m);
+                 ^^exclude_test, ^^EX_MARKER,
+                 ^^unbindable_shapes, ^^ownership_test,
+                 ^^anon_typedef_test, ^^static_const_test>(m);
 }

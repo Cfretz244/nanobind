@@ -181,14 +181,43 @@ consteval const char* spec_python_name(std::meta::info type) {
     return std::define_static_string(s);
 }
 
+// True if `s` is usable as a Python identifier (what a class/attr name must be).
+consteval bool is_python_identifier(std::string_view s) {
+    if (s.empty() || (s[0] >= '0' && s[0] <= '9'))
+        return false;
+    for (char c : s)
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+              || (c >= '0' && c <= '9') || c == '_'))
+            return false;
+    return true;
+}
+
+// Name for an entity with NO identifier: the C-style `typedef struct {...} name_t;`
+// idiom (every tinyobjloader type) declares an ANONYMOUS record -- identifier_of is
+// ill-formed on it -- but the typedef name for linkage survives in the display
+// string ("name_t"). Use it when it forms a valid identifier; a truly anonymous
+// type displays as "(unnamed struct at ...)" and yields nullptr, which the class/
+// enum binders treat as a graceful skip rather than a hard error.
+template <std::meta::info R>
+consteval const char* anonymous_entity_name() {
+    std::string_view s = std::meta::display_string_of(R);
+    if (is_python_identifier(s))
+        return std::define_static_string(s);
+    return nullptr;
+}
+
 // Python name for R: an explicit reflect::rename, else its C++ identifier. For a
 // template specialization, the CamelCase spec name (spec_camel_name): identifier_of
 // is ill-formed on a specialization, and a single rename could not disambiguate two
-// instantiations anyway, so rename is not consulted for specializations.
+// instantiations anyway, so rename is not consulted for specializations. An
+// identifier-less entity (typedef'd anonymous record) falls back to its typedef
+// name for linkage, or nullptr when there is none.
 template <std::meta::info R>
 consteval const char* entity_name() {
     if constexpr (std::meta::has_template_arguments(R))
         return spec_python_name(R);
+    else if constexpr (!std::meta::has_identifier(R))
+        return anonymous_entity_name<R>();
     else
         return ann_string_or<R, ^^reflect::rename>(
             std::define_static_string(std::meta::identifier_of(R)));
@@ -255,11 +284,48 @@ consteval rv_policy ann_rv_policy() {
         return rv_policy::automatic;
 }
 
+// True if R returns a bare pointer to a class type (after dealiasing; cv on the
+// pointer or pointee is irrelevant).
+consteval bool returns_raw_class_pointer(std::meta::info fn) {
+    auto t = std::meta::remove_cv(
+        std::meta::dealias(std::meta::return_type_of(fn)));
+    if (!std::meta::is_pointer_type(t))
+        return false;
+    auto p = std::meta::remove_cv(
+        std::meta::dealias(std::meta::remove_pointer(t)));
+    return std::meta::is_class_type(p);
+}
+
+// The rv_policy a reflected callable actually binds with. An explicit
+// [[=reflect::return_policy]] annotation always wins. Otherwise a bare
+// class-pointer return does NOT get nanobind's `automatic` (= take_ownership):
+// reflected APIs overwhelmingly return BORROWED pointers (fluent builders
+// returning self, accessors into owned containers -- CLI11's add_option()
+// returns an Option* the App owns), and take_ownership double-frees them the
+// moment Python collects the wrapper. The reflection default is
+// reference_internal (pointee outlives self) on instance methods and reference
+// on static/free functions; ownership-TRANSFERRING raw returns are the rare
+// case and annotate take_ownership explicitly. Smart-pointer and by-value
+// returns keep `automatic` -- their casters convey ownership correctly.
+template <std::meta::info R>
+consteval rv_policy effective_rv_policy() {
+    constexpr rv_policy ann = ann_rv_policy<R>();
+    if (ann != rv_policy::automatic)
+        return ann;
+    if (returns_raw_class_pointer(R)) {
+        if (std::meta::is_static_member(R)
+            || std::meta::is_namespace(std::meta::parent_of(R)))
+            return rv_policy::reference;
+        return rv_policy::reference_internal;
+    }
+    return rv_policy::automatic;
+}
+
 // Invoke `emit` with the def-extras implied by R's annotations: rv_policy always
 // (automatic is a no-op), plus a docstring and/or keep_alive when present.
 template <std::meta::info R, typename F>
 void with_call_extras(F&& emit) {
-    constexpr rv_policy pol = ann_rv_policy<R>();
+    constexpr rv_policy pol = effective_rv_policy<R>();
     constexpr const char* d = entity_doc<R>();
     if constexpr (has_ann<R, reflect::keep_alive>()) {
         constexpr auto ka = get_ann<R, reflect::keep_alive>();
@@ -455,16 +521,46 @@ void reflect_bind_static_method(auto& cls) {
 
 // --- Static data members ---
 
+// Probe target: `typename value_as_nttp_probe<(long double)([:mem:])>` is
+// well-formed exactly when the member's VALUE is readable at compile time and
+// arithmetic/enum -- i.e. when it can be bound by value with no ODR-use of the
+// member. (In-class initializers are only permitted on integral/enum consts
+// and constexpr members, so the arithmetic restriction loses nothing.) The
+// NTTP is a FIXED type, not `auto`: deducing an auto NTTP from a dependent
+// splice inside a requires-expression ICEs the toolchain at parse (TC-0013,
+// DeduceAutoType classifying a non-existent value).
+template <long double> struct value_as_nttp_probe;
+
 template <typename T, std::meta::info mem>
 void reflect_bind_static_member(auto& cls) {
     if constexpr (!has_ann<mem, reflect::skip>()) {
         constexpr auto name = entity_name<mem>();
-        // Bind via a pointer to the static (&[:mem:]); see reflect_bind_member for
-        // why spliced-type lambdas are avoided.
-        if constexpr (std::meta::is_const_type(std::meta::type_of(mem)))
-            cls.def_ro_static(name, &[:mem:]);
-        else
+        if constexpr (std::meta::is_const_type(std::meta::type_of(mem))) {
+            // def_ro_static binds by ADDRESS (&[:mem:]), which ODR-uses the
+            // member; an in-class-initialized `static const` with no
+            // out-of-line definition (moodycamel::ConcurrentQueue's BLOCK_SIZE
+            // et al.) then dies at link with an undefined symbol. When the
+            // value is compile-time readable, bind it by VALUE instead: no
+            // ODR-use, and a class constant surfaces as a plain read-only
+            // attribute, the Python-natural form. The getter keeps a concrete
+            // (handle) -> object signature; the splice stays in the body
+            // (spliced-signature mangler rule).
+            if constexpr (requires {
+                    typename value_as_nttp_probe<(long double)([:mem:])>; })
+                cls.def_prop_ro_static(name, [](::nanobind::handle) -> object {
+                    // The copy into `v` applies lvalue-to-rvalue IMMEDIATELY,
+                    // which is what avoids the ODR-use; passing [:mem:] to
+                    // cast() by reference would re-introduce it.
+                    auto v = [:mem:];
+                    return cast(v);
+                });
+            else
+                cls.def_ro_static(name, &[:mem:]);
+        } else {
+            // A non-const static must be inline (or out-of-line defined) to be
+            // mutable at all; the address form is required for writes.
             cls.def_rw_static(name, &[:mem:]);
+        }
     }
 }
 
@@ -504,6 +600,46 @@ consteval bool has_move_only_by_value_param(std::meta::info fn) {
         if (std::meta::is_class_type(c) && !std::meta::is_copy_constructible_type(c))
             return true;
     }
+    return false;
+}
+
+// True if `t` is a shape nanobind has no Python representation for at all: a
+// pointer to pointer (argv fronts like CLI11's ensure_utf8(char**)), a pointer
+// to function, or a non-const lvalue reference to a pointer (the T*& out-param
+// idiom -- toml++'s virtual is_homogeneous(node_type, node*&)). The method
+// binder used to synthesize a forwarding lambda for these and nanobind's
+// func_create then failed to match it: a TU-wide hard error instead of a skip.
+consteval bool is_unbindable_shape(std::meta::info t) {
+    t = std::meta::dealias(t);
+    if (std::meta::is_lvalue_reference_type(t)) {
+        auto r = std::meta::dealias(std::meta::remove_reference(t));
+        if (std::meta::is_pointer_type(std::meta::remove_cv(r))
+            && !std::meta::is_const_type(r))
+            return true;                        // T*& out-param
+        t = r;
+    } else if (std::meta::is_rvalue_reference_type(t)) {
+        t = std::meta::dealias(std::meta::remove_reference(t));
+    }
+    t = std::meta::remove_cv(t);
+    if (std::meta::is_pointer_type(t)) {
+        auto p = std::meta::remove_cv(
+            std::meta::dealias(std::meta::remove_pointer(t)));
+        return std::meta::is_pointer_type(p) || std::meta::is_function_type(p);
+    }
+    return false;
+}
+
+// Graceful-skip gate: any parameter or the return type is an unbindable shape.
+// Sits alongside has_move_only_by_value_param on every binding path (and is
+// mirrored in the STL caster-collection walk, which must not demand casters
+// for a function the binder will never bind).
+consteval bool has_unbindable_signature(std::meta::info fn) {
+    if (!std::meta::is_constructor(fn) && !std::meta::is_destructor(fn)
+        && is_unbindable_shape(std::meta::return_type_of(fn)))
+        return true;
+    for (auto p : std::meta::parameters_of(fn))
+        if (is_unbindable_shape(std::meta::type_of(p)))
+            return true;
     return false;
 }
 
@@ -601,6 +737,7 @@ void reflect_free_function(module_& m) {
     if constexpr (!std::meta::is_deleted(fn) &&
                   !std::meta::has_ellipsis_parameter(fn) &&
                   !has_move_only_by_value_param(fn) &&
+                  !has_unbindable_signature(fn) &&
                   (std::meta::has_identifier(fn) ||
                    std::meta::has_template_arguments(fn))) {
         using FnType = [:std::meta::type_of(fn):];
@@ -642,7 +779,8 @@ void reflect_bind_ctor_expand(auto& cls, std::index_sequence<Is...>) {
 template <std::meta::info ctor>
 void reflect_bind_ctor(auto& cls) {
     if constexpr (!has_ann<ctor, reflect::skip>()
-                  && !has_move_only_by_value_param(ctor))
+                  && !has_move_only_by_value_param(ctor)
+                  && !has_unbindable_signature(ctor))
         reflect_bind_ctor_expand<ctor>(cls, std::make_index_sequence<ctor_param_count<ctor>()>{});
 }
 
@@ -866,7 +1004,13 @@ void reflect_bind_conversion(auto& cls) {
 // gates (a member whose signature mentions an excluded entity is skipped).
 
 consteval bool is_exclude_marker(std::meta::info r) {
-    return std::meta::is_type(r) && std::meta::is_class_type(r)
+    if (!std::meta::is_type(r))
+        return false;
+    // Dealias: a marker reached through a `using` alias (or a consteval helper
+    // returning the alias) must still be recognized -- an unrecognized marker
+    // would silently exclude NOTHING.
+    r = std::meta::dealias(r);
+    return std::meta::is_class_type(r)
         && std::meta::has_template_arguments(r)
         && std::meta::template_of(r) == ^^exclude_;
 }
@@ -948,7 +1092,18 @@ consteval bool type_mentions_excluded(std::meta::info type,
             std::meta::remove_cvref(std::meta::remove_pointer(type)));
     if (is_excluded_entity(type, ex))
         return true;
-    if (!std::meta::is_type(type) || !std::meta::has_template_arguments(type))
+    if (!std::meta::is_type(type))
+        return false;
+    // A forward-declared, never-defined PLAIN class (pugixml's pImpl structs,
+    // `struct xml_node_struct;` behind an xml_node_struct* accessor) is as
+    // unrepresentable as a non-completable spec: routing it to nanobind
+    // instantiates typeid/is_base_of on the incomplete type, a hard error.
+    // The template-spec analogue is the gate below (BINDER-0014).
+    if (std::meta::is_class_type(type)
+        && !std::meta::has_template_arguments(type)
+        && !std::meta::is_complete_type(type))
+        return true;
+    if (!std::meta::has_template_arguments(type))
         return false;
     if (std::meta::is_class_type(type)) {
         auto tmpl = std::meta::template_of(type);
@@ -1141,7 +1296,8 @@ consteval bool is_bindable_free_operator() {
         || std::meta::is_deleted(fn)   // `operator==(T, T) = delete;` (BINDER-0012)
         || std::meta::has_ellipsis_parameter(fn)
         || involves_stream_type(fn)
-        || has_move_only_by_value_param(fn))
+        || has_move_only_by_value_param(fn)
+        || has_unbindable_signature(fn))
         return false;
     std::size_t n = std::meta::parameters_of(fn).size();
     return n == 1 || n == 2;
@@ -1239,6 +1395,8 @@ void reflect_bind_member_function(auto& cls) {
         return;  // explicitly excluded
     else if constexpr (has_move_only_by_value_param(fn))
         return;  // by-value move-only param: the class caster cannot produce it
+    else if constexpr (has_unbindable_signature(fn))
+        return;  // ptr-to-ptr / T*& out-param / function-pointer shape: no caster
     else if constexpr (is_property_accessor<fn>())
         return;  // getter/setter handled by the property pass, not as a method
     else if constexpr (std::meta::is_operator_function(fn))
@@ -1283,12 +1441,14 @@ void reflect_bind_member_template(auto& cls) {
         if constexpr (std::meta::is_operator_function(spec)) {
             if constexpr (!has_ann<spec, reflect::skip>()
                           && !std::meta::is_deleted(spec)
-                          && !has_move_only_by_value_param(spec))
+                          && !has_move_only_by_value_param(spec)
+                          && !has_unbindable_signature(spec))
                 reflect_bind_operator<T, spec>(cls);
         } else if constexpr (std::meta::has_identifier(tmpl)) {
             if constexpr (!has_ann<spec, reflect::skip>()
                           && !std::meta::is_deleted(spec)
                           && !has_move_only_by_value_param(spec)
+                          && !has_unbindable_signature(spec)
                           && !std::meta::has_ellipsis_parameter(spec)) {
                 using FnType = [:std::meta::type_of(spec):];
                 constexpr const char* nm = std::define_static_string(
@@ -1347,7 +1507,8 @@ void reflect_bind_proxy(auto& cls) {
                       && !std::meta::is_destructor(u)
                       && !std::meta::is_special_member_function(u)
                       && !std::meta::has_ellipsis_parameter(u)
-                      && !has_move_only_by_value_param(u)) {
+                      && !has_move_only_by_value_param(u)
+                      && !has_unbindable_signature(u)) {
             // The supported-qualifier gate is "does a binder partial
             // specialization exist for this exact function type" (sizeof on
             // the undefined primary is a substitution failure for
@@ -1735,6 +1896,7 @@ consteval void collect_own_stl_member_types(std::meta::info owner,
                 && !std::meta::is_destructor(u) && !std::meta::is_constructor(u)
                 && !std::meta::is_deleted(u)
                 && !fn_skip_annotated(u) && !has_move_only_by_value_param(u)
+                && !has_unbindable_signature(u)
                 && !fn_mentions_excluded(u, ex)) {
                 collect_stl_types(std::meta::return_type_of(u), out, visited, ex);
                 for (auto p : std::meta::parameters_of(u))
@@ -1753,6 +1915,7 @@ consteval void collect_own_stl_member_types(std::meta::info owner,
                 auto spec = std::meta::substitute(mem, std::vector<std::meta::info>{});
                 if (fn_skip_annotated(spec) || std::meta::is_deleted(spec)
                     || has_move_only_by_value_param(spec)
+                    || has_unbindable_signature(spec)
                     || fn_mentions_excluded(spec, ex))
                     continue;
                 collect_stl_types(std::meta::return_type_of(spec), out, visited, ex);
@@ -1764,6 +1927,7 @@ consteval void collect_own_stl_member_types(std::meta::info owner,
         if (std::meta::is_function(mem) && !std::meta::is_destructor(mem)
             && !std::meta::is_deleted(mem)
             && !fn_skip_annotated(mem) && !has_move_only_by_value_param(mem)
+            && !has_unbindable_signature(mem)
             && !fn_mentions_excluded(mem, ex)) {
             if (!std::meta::is_constructor(mem))
                 collect_stl_types(std::meta::return_type_of(mem), out, visited, ex);
@@ -1813,12 +1977,18 @@ consteval void collect_scope_stl_types(std::meta::info r,
                 continue;  // namespace-scope using-declaration: not a seed
             if (is_excluded_entity(mem, ex))
                 continue;  // nb::exclude_-listed class/namespace: opaque
-            if (std::meta::is_type(mem) && std::meta::is_class_type(mem))
-                collect_class_stl_types(mem, out, visited, ex);
+            if (std::meta::is_type(mem) && std::meta::is_class_type(mem)) {
+                // A forward-declared namespace member (`struct Opaque;`,
+                // BINDER-0019) has no members to walk -- skip, like every
+                // other walk does.
+                if (std::meta::is_complete_type(mem))
+                    collect_class_stl_types(mem, out, visited, ex);
+            }
             else if (std::meta::is_function(mem) && !std::meta::is_template(mem)
                      && !std::meta::is_deleted(mem)
                      && !fn_skip_annotated(mem)
                      && !has_move_only_by_value_param(mem)
+                     && !has_unbindable_signature(mem)
                      && !fn_mentions_excluded(mem, ex)) {
                 collect_stl_types(std::meta::return_type_of(mem), out, visited, ex);
                 for (auto p : std::meta::parameters_of(mem))
@@ -2032,8 +2202,10 @@ consteval void collect_scope_user_specs(std::meta::info r,
                 continue;  // namespace-scope using-declaration: not a seed
             if (is_excluded_entity(mem, ex))
                 continue;  // nb::exclude_-listed class/namespace: opaque
-            if (std::meta::is_type(mem) && std::meta::is_class_type(mem))
-                collect_class_user_specs(mem, out, visited, walked, ex);
+            if (std::meta::is_type(mem) && std::meta::is_class_type(mem)) {
+                if (std::meta::is_complete_type(mem))  // skip fwd decls (BINDER-0019)
+                    collect_class_user_specs(mem, out, visited, walked, ex);
+            }
             else if (std::meta::is_function(mem) && !std::meta::is_template(mem)
                      && !std::meta::is_deleted(mem)
                      && !fn_mentions_excluded(mem, ex)) {
@@ -2106,7 +2278,8 @@ consteval void collect_seed_classes(std::meta::info r,
             if (std::meta::is_template(mem) || is_using_proxy(mem))
                 continue;
             if (std::meta::is_type(mem) && std::meta::is_class_type(mem)) {
-                if (!is_skip_annotated(mem) && !is_excluded_entity(mem, ex)
+                if (std::meta::is_complete_type(mem)   // skip fwd decls (BINDER-0019)
+                    && !is_skip_annotated(mem) && !is_excluded_entity(mem, ex)
                     && !info_vec_contains(out, mem))
                     out.push_back(mem);
             } else if (std::meta::is_namespace(mem)) {
@@ -2240,16 +2413,40 @@ void check_stl_casters() {
     };
 }
 
-template <typename T, std::meta::info... Rs>
+// The Python name for a class/enum reached through declaration `Named` (the
+// namespace member or explicit reflect_ argument -- possibly a TYPEDEF over an
+// anonymous record, the C idiom `typedef struct {...} point_t;`). The resolved
+// type's own name wins when it has one; an anonymous type falls back to the
+// typedef name the caller reached it through (BINDER-0018: substitution strips
+// the alias sugar, and the record's display string is just "(anonymous type)",
+// so the alias reflection must be threaded down explicitly).
+template <typename T, std::meta::info Named>
+consteval const char* reached_entity_name() {
+    const char* tn = entity_name<^^T>();
+    if (tn != nullptr)
+        return tn;
+    if constexpr (Named != ^^void) {
+        if (std::meta::has_identifier(Named))
+            return std::define_static_string(std::meta::identifier_of(Named));
+    }
+    return nullptr;
+}
+
+template <typename T, std::meta::info Named, std::meta::info... Rs>
 void reflect_class(module_& m) {
+    // A class with no Python-expressible name (a truly anonymous record with no
+    // typedef name to reach it through) is skipped gracefully (the rest of the
+    // body still instantiates; it just never runs).
+    constexpr auto name = reached_entity_name<T, Named>();
+    if constexpr (name == nullptr)
+        return;
+
     // Idempotent: skip if T is already registered. This makes binding
     // order-independent and lets a class be reached both directly (via the
     // namespace walk / another reflect_ argument) and transitively (below)
     // without triggering nanobind's "already registered" warning.
     if (type<T>().is_valid())
         return;
-
-    constexpr auto name = entity_name<^^T>();
 
     // nanobind supports a single base class -- and only a REGISTERED type can be
     // one. Reachability rule: a base is wired as the real Python base only when
@@ -2272,7 +2469,7 @@ void reflect_class(module_& m) {
         // Ensure the base (and, recursively, its ancestors) is bound first --
         // nanobind requires the base registered before the derived type. The
         // guard above keeps this a no-op if the base is already bound.
-        reflect_class<typename [:python_base_for<T, Rs...>():], Rs...>(m);
+        reflect_class<typename [:python_base_for<T, Rs...>():], ^^void, Rs...>(m);
     }
 
     // Construct the class_ with the right template arguments. The lambda's return
@@ -2302,9 +2499,13 @@ void reflect_class(module_& m) {
     bind_stream_str<T>(cls);
 }
 
-template <typename E>
+template <typename E, std::meta::info Named = ^^void>
 void reflect_enum(module_& m) {
-    constexpr auto name = entity_name<^^E>();
+    // Same anonymous-name handling as reflect_class (`typedef enum {...} e_t;`
+    // binds under its typedef name; a truly anonymous enum is skipped).
+    constexpr auto name = reached_entity_name<E, Named>();
+    if constexpr (name == nullptr)
+        return;
 
     auto e = with_doc_extra<^^E>([&](auto&&... doc) {
         return enum_<E>(m, name, doc...);
@@ -2345,10 +2546,14 @@ void reflect_dispatch(module_& m) {
                 // nb::exclude_-listed class/enum/namespace -- bind nothing
             } else if constexpr (std::meta::is_type(mem)
                 && std::meta::is_class_type(mem)) {
-                reflect_class<typename [:mem:], Rs...>(m);
+                // A forward-declared namespace member (`struct Opaque;` -- the
+                // pImpl idiom, BINDER-0019) cannot be bound; skip it like the
+                // discovery walks do.
+                if constexpr (std::meta::is_complete_type(mem))
+                    reflect_class<typename [:mem:], mem, Rs...>(m);
             } else if constexpr (std::meta::is_type(mem)
                 && std::meta::is_enum_type(mem)) {
-                reflect_enum<typename [:mem:]>(m);
+                reflect_enum<typename [:mem:], mem>(m);
             } else if constexpr (std::meta::is_function(mem)
                 && !std::meta::is_template(mem)) {
                 if constexpr (!fn_mentions_excluded(mem, excluded_v<Rs...>))
@@ -2362,9 +2567,9 @@ void reflect_dispatch(module_& m) {
         // ill-formed on a non-type reflection (e.g. a function-template
         // specialization like ^^identity<int> passed directly to reflect_).
         if constexpr (std::meta::is_class_type(r))
-            reflect_class<typename [:r:], Rs...>(m);
+            reflect_class<typename [:r:], r, Rs...>(m);
         else if constexpr (std::meta::is_enum_type(r))
-            reflect_enum<typename [:r:]>(m);
+            reflect_enum<typename [:r:], r>(m);
     } else if constexpr (std::meta::is_function(r)) {
         reflect_free_function<r>(m);
     }
@@ -2378,7 +2583,7 @@ template <std::meta::info R, std::meta::info... Rs>
 void reflect_user_specs(module_& m) {
     template for (constexpr auto ty :
                   std::define_static_array(required_user_specs(R, excluded_v<Rs...>))) {
-        reflect_class<typename [:ty:], Rs...>(m);
+        reflect_class<typename [:ty:], ^^void, Rs...>(m);
     };
 }
 

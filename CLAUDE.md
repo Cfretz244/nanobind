@@ -140,6 +140,22 @@ thing that cannot be expressed in-language (a virtual-override **trampoline**) h
   `value()`) bind as entity proxies. Requires `-fentity-proxy-reflection` (NOT implied by
   `-freflection-latest`); template/data-member re-exports from inaccessible bases skipped.
 
+- **Wave-1 parallel-corpus hardening (BINDER-0015..0020, one commit each):**
+  unrepresentable parameter/return shapes (ptr-to-ptr, ptr-to-function, `T*&`
+  out-params) gracefully skip on every path incl. the caster walk (0015,
+  cli11/toml++); raw class-pointer returns default to BORROWING policies —
+  `reference_internal` on methods, `reference` on statics/free functions,
+  annotation wins — instead of `automatic`/take_ownership's double-free (0017,
+  cli11's fluent API); `typedef struct {...} name_t;` binds under the typedef
+  name threaded down from the walk (`reached_entity_name`; truly anonymous
+  types skip; 0018, tinyobjloader); forward-declared plain classes are opaque
+  like non-completable specs (signatures AND namespace walks; 0019, pugixml's
+  pImpl); constant-readable `static const` members bind by VALUE (no ODR-use →
+  no undefined symbol; fixed-NTTP probe because an `auto`-NTTP probe ICEs the
+  toolchain, TC-0013; 0020, moodycamel); `is_exclude_marker` dealiases (0016
+  investigation — per-overload exclusion itself NOT reproduced, repros under
+  `corpus/findings/repros/BINDER-0016/`).
+
 Roadmap / not yet: per-argument ownership-transfer annotations; member function templates
 needing explicit arguments; trampoline hardening for final/ref-qualified virtuals.
 

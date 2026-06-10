@@ -623,7 +623,11 @@ the translation unit (its template is forward-declared here but defined in a
 header that was never included -- Eigen's ``SparseView`` under
 ``<Eigen/Dense>``) is automatically neither discovered nor bound, and members
 whose signatures carry one are skipped: binding would instantiate nanobind's
-caster on the incomplete type, a hard error.
+caster on the incomplete type, a hard error. The same completeness rule covers
+plain (non-template) classes: a forward-declared, never-defined class — the
+pImpl idiom, e.g. pugixml's ``xml_node_struct`` behind ``internal_object()`` —
+is opaque on every path, and members mentioning a pointer/reference to one are
+skipped automatically (no manual ``nb::exclude_`` needed).
 
 Limitations
 -----------
@@ -640,6 +644,27 @@ Limitations
 - ``volatile`` methods, rvalue-ref-qualified (``&&``) methods, and C-variadic
   (``...``) functions are skipped (they cannot bind meaningfully to a persistent
   Python object); the rest of the class still binds.
+- **Unrepresentable parameter/return shapes are skipped**: pointer-to-pointer
+  (``char** argv`` fronts), pointer-to-function, and non-const lvalue references
+  to pointers (the ``T*&`` out-param idiom). None has a Python representation;
+  the method is skipped and demands no casters, the rest of the class binds.
+- **Raw class-pointer returns are BORROWED by default**: with no
+  ``return_policy`` annotation, a method returning ``T*`` binds with
+  ``reference_internal`` (the pointee must outlive ``self``) and a static/free
+  function with ``reference`` — NOT nanobind's ``automatic`` (=
+  ``take_ownership``), which double-frees the borrowed returns that dominate
+  real APIs (fluent builders returning self, accessors into owned storage).
+  An ownership-*transferring* raw return must be annotated
+  ``[[=r::take_ownership]]`` explicitly (it leaks otherwise). Smart-pointer and
+  by-value returns keep their normal caster semantics.
+- **C-style** ``typedef struct {...} name_t;`` types bind under their typedef
+  name for linkage (``identifier_of`` is ill-formed on the anonymous record); a
+  truly anonymous type with no typedef name is skipped.
+- **const static data members bind by value** when their value is
+  compile-time-readable (in-class-initialized integral/enum consts, constexpr
+  members): binding by address would ODR-use a member that may have no
+  out-of-line definition (an undefined symbol at link). Mutable statics keep
+  the read-write address binding.
 - **Deleted functions** (``= delete``) are skipped on every path — constructors,
   methods, operators, conversions, member-template default instantiations,
   ``using`` re-exports, free functions, and free operators — and their
