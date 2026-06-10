@@ -210,6 +210,16 @@ arguments** do not qualify types for binding (a container's Hash/Eq/Alloc/policy
 arguments never appear in callable signatures); a type qualifies by appearing in
 the *public member signatures* of something bound.
 
+**Abstract classes.** An abstract class (e.g. an interface base like
+``spdlog::sinks::sink``, bound so its concrete descendants have a real Python
+base) binds with **no constructors**: instantiating it from Python raises
+``TypeError``, exactly as instantiating an abstract class in C++ is ill-formed.
+Its non-virtual surface and its role as a base/parameter type work normally.
+The exception is an abstract class with a registered trampoline (see `Virtual
+functions (overriding from Python)`_): there the constructors do bind, since
+``nb::init`` then constructs the trampoline alias -- which is how a Python
+subclass overriding the pure virtuals gets instantiated.
+
 Multiple inheritance
 ~~~~~~~~~~~~~~~~~~~~~~
 

@@ -488,6 +488,13 @@ consteval bool has_move_only_by_value_param(std::meta::info fn) {
     return false;
 }
 
+// Value-form of has_ann<fn, reflect::skip>() for the consteval signature walks,
+// where the entity is a loop value rather than an NTTP. Do not call on an entity
+// proxy (annotations_of is ill-formed there; query the underlying function).
+consteval bool fn_skip_annotated(std::meta::info fn) {
+    return !std::meta::annotations_of(fn, ^^reflect::skip).empty();
+}
+
 // --- Entity proxies (using-redeclarations; BINDER-0009) ---
 //
 // With -fentity-proxy-reflection (NOT implied by -freflection-latest), a
@@ -1161,22 +1168,30 @@ void reflect_bind_proxy(auto& cls) {
 // re-bound here -- they are exposed automatically through the Python base type.
 template <typename T>
 void bind_class_contents(auto& cls) {
-    // Bind constructors. The proxy guard comes first: is_constructor on an
+    // Bind constructors. An abstract class WITHOUT a trampoline (e.g. an interface
+    // base bound only so its concrete descendants have a Python base, like
+    // spdlog::sinks::sink) gets none: nb::init would have to instantiate T, which is
+    // ill-formed -- Python-side instantiation raises TypeError instead (BINDER-0011).
+    // With a registered trampoline the ctors DO bind: nb::init then constructs the
+    // Alias, which is exactly how a Python subclass overriding pure virtuals is
+    // instantiated. The proxy guard comes first: is_constructor on an
     // entity proxy was an UNREACHABLE in clang-p2996 before the TC-0003 fix
     // (upstreamed as bloomberg/clang-p2996#290), so the binder does not rely
     // on the patched ordering of the kind switch.
-    template for (constexpr auto fn :
-        std::define_static_array(std::meta::members_of(
-            ^^T, std::meta::access_context::unchecked()))) {
-        if constexpr (!is_using_proxy(fn)
-            && std::meta::is_constructor(fn)
-            && std::meta::is_public(fn)
-            && !std::meta::is_template(fn)   // skip constructor templates (cannot reflect)
-            && !std::meta::is_copy_constructor(fn)
-            && !std::meta::is_move_constructor(fn)) {
-            reflect_bind_ctor<fn>(cls);
-        }
-    };
+    if constexpr (!std::is_abstract_v<T> || has_reflect_trampoline<T>) {
+        template for (constexpr auto fn :
+            std::define_static_array(std::meta::members_of(
+                ^^T, std::meta::access_context::unchecked()))) {
+            if constexpr (!is_using_proxy(fn)
+                && std::meta::is_constructor(fn)
+                && std::meta::is_public(fn)
+                && !std::meta::is_template(fn)   // skip constructor templates (cannot reflect)
+                && !std::meta::is_copy_constructor(fn)
+                && !std::meta::is_move_constructor(fn)) {
+                reflect_bind_ctor<fn>(cls);
+            }
+        };
+    }
 
     // Bind data members. Skip unnamed members (anonymous union/struct fields, e.g. glm's
     // x/y/z/w swizzle aliasing): identifier_of() is ill-formed on them, and a pointer-to-member
@@ -1438,12 +1453,18 @@ consteval void collect_own_stl_member_types(std::meta::info owner,
     for (auto mem : std::meta::members_of(owner, std::meta::access_context::unchecked())) {
         if (!std::meta::is_public(mem))
             continue;
+        // Mirror the bind-path skip predicates: a function the binder will never
+        // bind ([[=reflect::skip]] / by-value move-only param, BINDER-0010) must
+        // not demand casters for its signature either -- e.g. spdlog's
+        // set_formatter(std::unique_ptr<formatter>) is skipped at bind time but
+        // used to static_assert here for the missing unique_ptr caster.
         if (is_using_proxy(mem)) {
             // A bound using-redeclaration (reflect_bind_proxy) contributes its
             // underlying function's signature types.
             auto u = proxy_underlying(mem);
             if (std::meta::is_function(u) && !std::meta::is_template(u)
-                && !std::meta::is_destructor(u) && !std::meta::is_constructor(u)) {
+                && !std::meta::is_destructor(u) && !std::meta::is_constructor(u)
+                && !fn_skip_annotated(u) && !has_move_only_by_value_param(u)) {
                 collect_stl_types(std::meta::return_type_of(u), out, visited);
                 for (auto p : std::meta::parameters_of(u))
                     collect_stl_types(std::meta::type_of(p), out, visited);
@@ -1459,13 +1480,16 @@ consteval void collect_own_stl_member_types(std::meta::info owner,
                 && !std::meta::is_conversion_function_template(mem)
                 && fn_template_default_instantiable(mem)) {
                 auto spec = std::meta::substitute(mem, std::vector<std::meta::info>{});
+                if (fn_skip_annotated(spec) || has_move_only_by_value_param(spec))
+                    continue;
                 collect_stl_types(std::meta::return_type_of(spec), out, visited);
                 for (auto p : std::meta::parameters_of(spec))
                     collect_stl_types(std::meta::type_of(p), out, visited);
             }
             continue;
         }
-        if (std::meta::is_function(mem) && !std::meta::is_destructor(mem)) {
+        if (std::meta::is_function(mem) && !std::meta::is_destructor(mem)
+            && !fn_skip_annotated(mem) && !has_move_only_by_value_param(mem)) {
             if (!std::meta::is_constructor(mem))
                 collect_stl_types(std::meta::return_type_of(mem), out, visited);
             for (auto p : std::meta::parameters_of(mem))
@@ -1511,7 +1535,9 @@ consteval void collect_scope_stl_types(std::meta::info r,
                 continue;  // namespace-scope using-declaration: not a seed
             if (std::meta::is_type(mem) && std::meta::is_class_type(mem))
                 collect_class_stl_types(mem, out, visited);
-            else if (std::meta::is_function(mem) && !std::meta::is_template(mem)) {
+            else if (std::meta::is_function(mem) && !std::meta::is_template(mem)
+                     && !fn_skip_annotated(mem)
+                     && !has_move_only_by_value_param(mem)) {
                 collect_stl_types(std::meta::return_type_of(mem), out, visited);
                 for (auto p : std::meta::parameters_of(mem))
                     collect_stl_types(std::meta::type_of(p), out, visited);

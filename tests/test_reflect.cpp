@@ -4,6 +4,7 @@
 #include <nanobind/stl/vector.h>
 #include <nanobind/stl/string.h>
 #include <cmath>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -316,6 +317,24 @@ struct Sink {
     void put(MoveOnlyBuf) { ++n; }   // skipped: by-value move-only param
     void put(int v) { n += v; }      // stays: ordinary overload
     int get() const { return n; }
+};
+
+// An ABSTRACT interface (the spdlog::sinks::sink shape) must get NO constructor
+// bound: nb::init<> would have to instantiate it, a hard TU error (BINDER-0011).
+// Python-side instantiation raises TypeError instead, and the concrete derived
+// class binds with the abstract base as its real Python base.
+// The unique_ptr signatures double as the caster-matrix regression: both methods
+// are skipped at bind time (by-value move-only / [[=r::skip]]), so their
+// std::unique_ptr<int> must not static_assert for the unique_ptr caster header,
+// which this TU deliberately does not include.
+struct AbstractIface {
+    virtual ~AbstractIface() = default;
+    virtual int compute(int x) const = 0;
+    void consume(std::unique_ptr<int>) {}                       // skipped: move-only by value
+    [[=r::skip{}]] void hidden(const std::unique_ptr<int>&) {}  // skipped: annotation
+};
+struct ConcreteImpl : AbstractIface {
+    int compute(int x) const override { return 2 * x + 1; }
 };
 
 struct ManyConv {

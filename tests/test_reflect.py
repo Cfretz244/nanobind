@@ -356,6 +356,21 @@ def test27c_move_only_by_value_param_skipped():
 
 
 @needs_reflect
+def test27d_abstract_class_no_ctor():
+    # An abstract class binds (so derived classes get a real Python base) but gets
+    # NO constructor (BINDER-0011): instantiating it from Python raises TypeError.
+    # Its skipped unique_ptr methods must not have demanded the unique_ptr caster
+    # (this module does not include it) -- covered by the module compiling at all.
+    with pytest.raises(TypeError):
+        t.AbstractIface()
+    c = t.ConcreteImpl()
+    assert c.compute(4) == 9
+    assert isinstance(c, t.AbstractIface)
+    assert issubclass(t.ConcreteImpl, t.AbstractIface)
+    assert not hasattr(t.AbstractIface, "hidden")
+
+
+@needs_reflect
 def test26_function_qualifiers():
     q = t.Quals()
     # noexcept / const noexcept / lvalue-ref-qualified methods are bound.
