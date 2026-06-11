@@ -24,6 +24,11 @@
 #    define NB_FIXTURE_ANN(...) [[=__VA_ARGS__]]
 #  endif
 #endif
+// GCC 16 (P3394 annotations under -freflection): no __has_feature name for
+// it; key off the reflection feature-test macro instead.
+#if !defined(NB_FIXTURE_ANN) && defined(__cpp_impl_reflection)
+#  define NB_FIXTURE_ANN(...) [[=__VA_ARGS__]]
+#endif
 #ifndef NB_FIXTURE_ANN
 #  define NB_FIXTURE_ANN(...)
 #endif

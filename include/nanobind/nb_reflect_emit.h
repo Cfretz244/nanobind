@@ -476,7 +476,7 @@ consteval void append_free_function(std::string& out) {
     // Mirrors reflect_free_function's gate (deleted / variadic / move-only /
     // unbindable / nameless-non-spec), plus the emit-only spellability gate.
     if constexpr (std::meta::is_deleted(Fn)
-                  || std::meta::has_ellipsis_parameter(Fn)
+                  || nb_has_ellipsis_parameter(Fn)
                   || has_move_only_by_value_param(Fn)
                   || has_unbindable_signature(Fn)
                   || (!std::meta::has_identifier(Fn)
@@ -649,8 +649,7 @@ consteval std::meta::info emit_find_setter() {
     constexpr std::string_view gname = prop_name<Getter>();
     std::meta::info found = ^^void;
     template for (constexpr auto fn : std::define_static_array(
-                      std::meta::members_of(
-                          Cls, std::meta::access_context::unchecked()))) {
+                      liftable_class_members(Cls))) {
         if constexpr (is_property_setter<fn>() && !std::meta::is_deleted(fn)) {
             if (std::string_view(prop_name<fn>()) == gname)
                 found = fn;
@@ -808,8 +807,7 @@ consteval void append_class_contents(std::string& out,
     // rationale).
     if constexpr (class_constructs(Cls, HasTramp)) {
         template for (constexpr auto fn : std::define_static_array(
-                          std::meta::members_of(
-                              Cls, std::meta::access_context::unchecked()))) {
+                          liftable_class_members(Cls))) {
             if constexpr (ctor_binds(fn, excluded_v<Rs...>))
                 append_ctor<fn>(out);
         };
@@ -844,8 +842,7 @@ consteval void append_class_contents(std::string& out,
 
     // Methods / member templates / proxies (one shared kind-router).
     template for (constexpr auto fn : std::define_static_array(
-                      std::meta::members_of(
-                          Cls, std::meta::access_context::unchecked()))) {
+                      liftable_class_members(Cls))) {
         constexpr class_member_kind kind =
             classify_class_member(fn, excluded_v<Rs...>);
         if constexpr (kind == class_member_kind::fn)
@@ -858,8 +855,7 @@ consteval void append_class_contents(std::string& out,
 
     // Properties.
     template for (constexpr auto fn : std::define_static_array(
-                      std::meta::members_of(
-                          Cls, std::meta::access_context::unchecked()))) {
+                      liftable_class_members(Cls))) {
         if constexpr (classify_class_member(fn, excluded_v<Rs...>)
                       == class_member_kind::fn) {
             if constexpr (is_property_getter<fn>())
@@ -904,8 +900,7 @@ consteval void append_flatten_base(std::string& out,
     // `template` disambiguator for member templates is part of their callee.
     std::string call_prefix = base_spell + "::";
     template for (constexpr auto fn : std::define_static_array(
-                      std::meta::members_of(
-                          Base, std::meta::access_context::unchecked()))) {
+                      liftable_class_members(Base))) {
         constexpr class_member_kind kind =
             classify_class_member(fn, excluded_v<Rs...>);
         if constexpr (kind == class_member_kind::fn)
@@ -1456,8 +1451,7 @@ template <std::meta::info Cls, std::meta::info Owner, std::meta::info... Rs>
 consteval void probe_member_fns(std::string& out, std::string_view tag,
                                 std::size_t& n) {
     template for (constexpr auto fn : std::define_static_array(
-                      std::meta::members_of(
-                          Owner, std::meta::access_context::unchecked()))) {
+                      liftable_class_members(Owner))) {
         if constexpr (classify_class_member(fn, excluded_v<Rs...>)
                       == class_member_kind::fn) {
             constexpr member_fn_route route = classify_member_fn(Cls, fn);
@@ -1508,8 +1502,7 @@ consteval std::string probe_class_text(std::string_view tag) {
     constexpr bool has_tramp = emit_wants_trampoline<Rs...>(Cls);
     if constexpr (class_constructs(Cls, has_tramp)) {
         template for (constexpr auto fn : std::define_static_array(
-                          std::meta::members_of(
-                              Cls, std::meta::access_context::unchecked()))) {
+                          liftable_class_members(Cls))) {
             if constexpr (ctor_binds(fn, excluded_v<Rs...>))
                 append_probe_ctor<fn>(out, tag, n);
         };
@@ -1614,6 +1607,13 @@ NAMESPACE_END(detail)
 ///       return nb::write_bindings<^^my_ns>(
 ///                  argv[1], "my_ext", "#include \"my/lib.h\"\n") ? 0 : 1;
 ///   }
+// Worklist index sequence, lifted to static storage for the template-for
+// walks below. A variable template rather than a constexpr local: GCC does
+// not accept a constexpr local variable as an expansion-statement range.
+template <std::meta::info... Rs>
+inline constexpr auto emit_indices_v = std::define_static_array(
+    detail::emitgen::iota_vec(detail::emitgen::emit_worklist_v<Rs...>.size()));
+
 template <std::meta::info... Rs>
 bool write_bindings(const char* path, const char* module_name,
                     const char* preamble) {
@@ -1643,13 +1643,10 @@ bool write_bindings(const char* path, const char* module_name,
            "// Forward declarations (a derived class's bind function calls\n"
            "// its base's regardless of definition order).\n";
 
-    constexpr auto indices = std::define_static_array(
-        eg::iota_vec(eg::emit_worklist_v<Rs...>.size()));
-
     // Pass 1: forward declarations (deduplicated like the definitions).
     {
         std::vector<std::string> seen;
-        template for (constexpr auto I : indices) {
+        template for (constexpr auto I : emit_indices_v<Rs...>) {
             constexpr eg::emit_item it = eg::emit_worklist_v<Rs...>[I];
             if constexpr (it.kind != eg::emit_kind::free_fn) {
                 constexpr const char* fname = eg::emit_item_fname_v<I, Rs...>;
@@ -1670,7 +1667,7 @@ bool write_bindings(const char* path, const char* module_name,
     std::string body;
     {
         std::vector<std::string> seen;
-        template for (constexpr auto I : indices) {
+        template for (constexpr auto I : emit_indices_v<Rs...>) {
             constexpr eg::emit_item it = eg::emit_worklist_v<Rs...>[I];
             if constexpr (it.kind == eg::emit_kind::free_fn) {
                 template for (constexpr auto J : std::define_static_array(
@@ -1725,9 +1722,7 @@ bool write_spelling_probe(const char* path, const char* preamble) {
     out << preamble;
     out << "\n#include <type_traits>\n\n";
 
-    constexpr auto indices = std::define_static_array(
-        eg::iota_vec(eg::emit_worklist_v<Rs...>.size()));
-    template for (constexpr auto I : indices) {
+    template for (constexpr auto I : emit_indices_v<Rs...>) {
         template for (constexpr auto J : std::define_static_array(
                           eg::iota_vec(eg::probe_item_nchunks_v<I, Rs...>))) {
             out << eg::probe_item_chunk_v<I, J, Rs...>;

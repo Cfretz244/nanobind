@@ -173,6 +173,8 @@ set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS_OLD}")
 
 if (NB_HAS_REFLECTION_GCC)
   set(NB_REFLECT_FLAGS -std=c++26 -freflection)
+  # GCC spells the constant-evaluation budget differently from clang.
+  set(NB_REFLECT_BIG_STEPS -fconstexpr-ops-limit=2000000000)
 elseif(NB_HAS_REFLECTION_BLOOMBERG)
   # The raised -fconstexpr-steps covers the whole-namespace consteval walks
   # (required_stl_types / required_user_specs) over the growing test fixture
@@ -182,6 +184,7 @@ elseif(NB_HAS_REFLECTION_BLOOMBERG)
   # using-redeclarations enumerable so they can bind (BINDER-0009).
   set(NB_REFLECT_FLAGS -std=c++26 -freflection-latest -fentity-proxy-reflection
       -stdlib=libc++ -fconstexpr-steps=100000000)
+  set(NB_REFLECT_BIG_STEPS -fconstexpr-steps=2000000000)
 endif()
 
 if (NB_REFLECT_FLAGS)
@@ -226,7 +229,7 @@ if (NB_REFLECT_FLAGS)
   # Rendering the whole module as a consteval string outspends the default
   # walk budget; the bump is harmless (TC-0002 made budgets safe to raise).
   target_compile_options(test_reflect_emit_gen PRIVATE ${NB_REFLECT_FLAGS}
-      -fconstexpr-steps=2000000000)
+      ${NB_REFLECT_BIG_STEPS})
   target_link_options(test_reflect_emit_gen PRIVATE ${NB_REFLECT_FLAGS})
   target_include_directories(test_reflect_emit_gen
       PRIVATE ${NB_DIR}/include ${Python_INCLUDE_DIRS})

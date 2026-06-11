@@ -55,6 +55,31 @@ struct trampoline_all_ {};
 
 NAMESPACE_BEGIN(detail)
 
+// --- Compiler compatibility shims ---
+//
+// clang-p2996 and GCC 16 implement slightly different snapshots of the
+// reflection papers: the type-filtered annotation query is
+// annotations_of(r, type) on clang-p2996 but annotations_of_with_type(r, type)
+// on GCC, and the C-variadic query is has_ellipsis_parameter on clang-p2996
+// but is_vararg_function on GCC. Every call site below goes through these.
+#if defined(__clang__)
+consteval std::vector<std::meta::info>
+nb_annotations_of_type(std::meta::info r, std::meta::info type) {
+    return std::meta::annotations_of(r, type);
+}
+consteval bool nb_has_ellipsis_parameter(std::meta::info fn) {
+    return std::meta::has_ellipsis_parameter(fn);
+}
+#else
+consteval std::vector<std::meta::info>
+nb_annotations_of_type(std::meta::info r, std::meta::info type) {
+    return std::meta::annotations_of_with_type(r, type);
+}
+consteval bool nb_has_ellipsis_parameter(std::meta::info fn) {
+    return std::meta::is_vararg_function(fn);
+}
+#endif
+
 // --- Trampoline hook ---
 //
 // A trampoline (a class derived from T that overrides T's virtuals to forward
@@ -85,13 +110,13 @@ consteval std::meta::info codegen_member() {
 // True if entity R carries an annotation of (non-template) type A.
 template <std::meta::info R, typename A>
 consteval bool has_ann() {
-    return !std::meta::annotations_of(R, ^^A).empty();
+    return !nb_annotations_of_type(R, ^^A).empty();
 }
 
 // Value of R's first annotation of type A (precondition: has_ann<R, A>()).
 template <std::meta::info R, typename A>
 consteval A get_ann() {
-    return [: std::meta::constant_of(std::meta::annotations_of(R, ^^A)[0]) :];
+    return [: std::meta::constant_of(nb_annotations_of_type(R, ^^A)[0]) :];
 }
 
 // rename/doc are templates (reflect::rename<N>), so they are matched by template,
@@ -465,7 +490,7 @@ void with_arg_call_extras(F&& emit) {
 enum class data_route { skip, ro, rw };
 consteval data_route data_member_route(std::meta::info mem) {
     auto t = std::meta::type_of(mem);
-    if (!std::meta::annotations_of(mem, ^^reflect::skip).empty()
+    if (!nb_annotations_of_type(mem, ^^reflect::skip).empty()
         || std::meta::is_array_type(t))
         return data_route::skip;
     if (std::meta::is_const_type(t) || !std::meta::is_copy_assignable_type(t))
@@ -480,7 +505,7 @@ consteval data_route data_member_route(std::meta::info mem) {
 /// generated source.
 enum class static_data_route { skip, const_member, mutable_member };
 consteval static_data_route static_member_route(std::meta::info mem) {
-    if (!std::meta::annotations_of(mem, ^^reflect::skip).empty())
+    if (!nb_annotations_of_type(mem, ^^reflect::skip).empty())
         return static_data_route::skip;
     return std::meta::is_const_type(std::meta::type_of(mem))
         ? static_data_route::const_member : static_data_route::mutable_member;
@@ -515,7 +540,7 @@ void reflect_bind_member(auto& cls) {
 consteval bool method_shape_bindable(std::meta::info fn) {
     return !std::meta::is_volatile(fn)
         && !std::meta::is_rvalue_reference_qualified(fn)
-        && !std::meta::has_ellipsis_parameter(fn);
+        && !nb_has_ellipsis_parameter(fn);
 }
 
 template <typename T, std::meta::info fn, typename FnType>
@@ -585,7 +610,7 @@ NB_REFLECT_DEFINE_STATIC_BINDER(noexcept)
 
 template <std::meta::info fn>
 void reflect_bind_static_method(auto& cls) {
-    if constexpr (!std::meta::has_ellipsis_parameter(fn)) {
+    if constexpr (!nb_has_ellipsis_parameter(fn)) {
         using FnType = [:std::meta::type_of(fn):];
         with_arg_call_extras<fn>([&](auto&&... e) {
             reflect_static_method_binder<fn, FnType>::bind(
@@ -729,7 +754,7 @@ consteval bool has_unbindable_signature(std::meta::info fn) {
 // where the entity is a loop value rather than an NTTP. Do not call on an entity
 // proxy (annotations_of is ill-formed there; query the underlying function).
 consteval bool fn_skip_annotated(std::meta::info fn) {
-    return !std::meta::annotations_of(fn, ^^reflect::skip).empty();
+    return !nb_annotations_of_type(fn, ^^reflect::skip).empty();
 }
 
 // --- Entity proxies (using-redeclarations; BINDER-0009) ---
@@ -817,7 +842,7 @@ void reflect_free_function(module_& m) {
     // IS bindable, so admit it via has_template_arguments (entity_name then derives
     // the CamelCase spec name from the template).
     if constexpr (!std::meta::is_deleted(fn) &&
-                  !std::meta::has_ellipsis_parameter(fn) &&
+                  !nb_has_ellipsis_parameter(fn) &&
                   !has_move_only_by_value_param(fn) &&
                   !has_unbindable_signature(fn) &&
                   (std::meta::has_identifier(fn) ||
@@ -1047,7 +1072,7 @@ void reflect_bind_operator(auto& cls) {
     constexpr auto op = std::meta::operator_of(fn);
     constexpr const char* dunder =
         operator_dunder(op, std::meta::parameters_of(fn).size());
-    if constexpr (dunder != nullptr && !std::meta::has_ellipsis_parameter(fn)) {
+    if constexpr (dunder != nullptr && !nb_has_ellipsis_parameter(fn)) {
         using FnType = [:std::meta::type_of(fn):];
         // The volatile/&&-qualified shapes are excluded by the binder-spec
         // completeness gate (no partial specialization exists for them; sizeof
@@ -1086,7 +1111,7 @@ consteval std::meta::info widest_integral_conversion(std::meta::info cls) {
         // A deleted conversion must not win the contest: it never binds, and the
         // surviving narrower one would then fail the equality test in
         // reflect_bind_conversion and __int__ would silently vanish (BINDER-0012).
-        if (!std::meta::annotations_of(fn, ^^reflect::skip).empty()
+        if (!nb_annotations_of_type(fn, ^^reflect::skip).empty()
             || std::meta::is_deleted(fn))
             continue;
         auto R = std::meta::return_type_of(fn);
@@ -1127,12 +1152,17 @@ void reflect_bind_conversion(auto& cls) {
     constexpr const char* d = conversion_dunder(^^T, fn);
     if constexpr (d != nullptr) {
         constexpr auto R = std::meta::return_type_of(fn);
+        // The splice is hoisted out of the lambda bodies into a
+        // pointer-to-member: GCC treats a lambda whose body splices an info
+        // NTTP as consteval-only, and these capture-less concrete-signature
+        // lambdas must decay to the plain function pointer nanobind wants.
+        constexpr auto mp = &[:fn:];
         if constexpr (std::meta::is_same_type(R, ^^bool))
-            cls.def(d, [](T& self) -> bool { return (bool) self.[:fn:](); });
+            cls.def(d, [](T& self) -> bool { return (bool) (self.*mp)(); });
         else if constexpr (std::meta::is_integral_type(R))
-            cls.def(d, [](T& self) -> long long { return (long long) self.[:fn:](); });
+            cls.def(d, [](T& self) -> long long { return (long long) (self.*mp)(); });
         else
-            cls.def(d, [](T& self) -> double { return (double) self.[:fn:](); });
+            cls.def(d, [](T& self) -> double { return (double) (self.*mp)(); });
     }
 }
 
@@ -1482,7 +1512,7 @@ consteval bool is_bindable_free_operator() {
         || !std::meta::is_operator_function(fn)
         || std::meta::is_template(fn)
         || std::meta::is_deleted(fn)   // `operator==(T, T) = delete;` (BINDER-0012)
-        || std::meta::has_ellipsis_parameter(fn)
+        || nb_has_ellipsis_parameter(fn)
         || involves_stream_type(fn)
         || has_move_only_by_value_param(fn)
         || has_unbindable_signature(fn))
@@ -1677,7 +1707,7 @@ consteval member_tmpl_route classify_member_template(std::meta::info cls,
     if (std::meta::is_operator_function(spec))
         return member_tmpl_route::oper;
     if (!std::meta::has_identifier(tmpl)
-        || std::meta::has_ellipsis_parameter(spec))
+        || nb_has_ellipsis_parameter(spec))
         return member_tmpl_route::skip;
     if (std::meta::is_static_member(spec)) {
         if (instance_method_shadows(cls, std::meta::identifier_of(tmpl)))
@@ -1747,7 +1777,7 @@ consteval proxy_route classify_proxy(std::meta::info cls, std::meta::info proxy)
         || std::meta::is_constructor(u)
         || std::meta::is_destructor(u)
         || std::meta::is_special_member_function(u)
-        || std::meta::has_ellipsis_parameter(u)
+        || nb_has_ellipsis_parameter(u)
         || has_move_only_by_value_param(u)
         || has_unbindable_signature(u))
         return proxy_route::skip;
@@ -1804,6 +1834,33 @@ void reflect_bind_proxy(auto& cls) {
 /// default instantiation when one exists). proxy: a public using-redeclaration.
 /// Each kind is gated against the pack's nb::exclude_ set.
 enum class class_member_kind { skip, fn, tmpl, proxy };
+// The class-member list every `template for` walk lifts via
+// define_static_array. On GCC 16, lifting the reflection of an
+// IMPLICITLY-declared special member into static storage instantiates that
+// member's DEFINITION -- for a member that is declared but ill-formed to
+// instantiate (the vector<unique_ptr<T>> member shape: vector's copy
+// ctor/operator= are declared unconditionally and poisoned on instantiation)
+// the lift itself is a hard error. Implicit copy/move ctors and assignment
+// operators are never bound (ctor_binds / classify_class_member skip them),
+// so they are dropped BEFORE the lift; the implicit default constructor,
+// which the init<> path does consume, is kept. clang-p2996 lifts the raw
+// list unchanged.
+consteval std::vector<std::meta::info> liftable_class_members(std::meta::info cls) {
+    std::vector<std::meta::info> out;
+    for (auto m : std::meta::members_of(
+             cls, std::meta::access_context::unchecked())) {
+#if !defined(__clang__)
+        if (std::meta::is_function(m)
+            && std::meta::is_special_member_function(m)
+            && !std::meta::is_user_declared(m)
+            && !std::meta::is_default_constructor(m))
+            continue;
+#endif
+        out.push_back(m);
+    }
+    return out;
+}
+
 consteval class_member_kind classify_class_member(
         std::meta::info fn, std::span<const std::meta::info> ex) {
     if (std::meta::is_function(fn)
@@ -1839,8 +1896,7 @@ void bind_class_contents(auto& cls) {
     // hold the BINDER-0011/0012 rationale.
     if constexpr (class_constructs(^^T, has_reflect_trampoline<T>)) {
         template for (constexpr auto fn :
-            std::define_static_array(std::meta::members_of(
-                ^^T, std::meta::access_context::unchecked()))) {
+            std::define_static_array(liftable_class_members(^^T))) {
             if constexpr (ctor_binds(fn, excluded_v<Rs...>)) {
                 reflect_bind_ctor<fn>(cls);
             }
@@ -1879,8 +1935,7 @@ void bind_class_contents(auto& cls) {
     // parameter is defaulted; others skip. Deleted functions are filtered on every
     // path: public + enumerable, but calling one is a hard error (BINDER-0012).
     template for (constexpr auto fn :
-        std::define_static_array(std::meta::members_of(
-            ^^T, std::meta::access_context::unchecked()))) {
+        std::define_static_array(liftable_class_members(^^T))) {
         constexpr class_member_kind kind =
             classify_class_member(fn, excluded_v<Rs...>);
         if constexpr (kind == class_member_kind::fn)
@@ -1897,8 +1952,7 @@ void bind_class_contents(auto& cls) {
     // be excluded *before* it is instantiated (a nested if constexpr, not an &&
     // short-circuit).
     template for (constexpr auto fn :
-        std::define_static_array(std::meta::members_of(
-            ^^T, std::meta::access_context::unchecked()))) {
+        std::define_static_array(liftable_class_members(^^T))) {
         if constexpr (classify_class_member(fn, excluded_v<Rs...>)
                       == class_member_kind::fn) {
             if constexpr (is_property_getter<fn>()) {
@@ -1939,8 +1993,7 @@ void flatten_base_members(auto& cls) {
     // here is a using-redeclaration inside the flattened base re-exporting from
     // ITS OWN inaccessible base.
     template for (constexpr auto fn :
-        std::define_static_array(std::meta::members_of(
-            Base, std::meta::access_context::unchecked()))) {
+        std::define_static_array(liftable_class_members(Base))) {
         constexpr class_member_kind kind =
             classify_class_member(fn, excluded_v<Rs...>);
         if constexpr (kind == class_member_kind::fn)
@@ -1999,7 +2052,7 @@ consteval bool is_skip_annotated(std::meta::info e) {
     // (this runs in the arbitrary-type STL/spec walks).
     if (!std::meta::is_type(e) || !std::meta::is_class_type(e))
         return false;
-    if (!std::meta::annotations_of(e, ^^reflect::skip).empty())
+    if (!nb_annotations_of_type(e, ^^reflect::skip).empty())
         return true;
     return false;
 }
@@ -2479,7 +2532,14 @@ consteval void collect_scope_user_specs(std::meta::info r,
 // mint new specs (Eigen: Transpose<Derived> begets Transpose<Transpose<...>>).
 // Fix: add the offending templates (or their whole namespace) to an
 // ^^nb::exclude_<...> marker in the reflect_ pack.
+#if defined(__clang__)
 inline void reflect_discovery_diverged(std::meta::info last_discovered_spec);
+#else
+// GCC enforces that a function with a consteval-only parameter type be
+// consteval; an undefined consteval function produces the same pointed
+// "called before its definition" diagnostic when the fixpoint diverges.
+consteval void reflect_discovery_diverged(std::meta::info last_discovered_spec);
+#endif
 
 consteval std::vector<std::meta::info> required_user_specs(
         std::meta::info r, std::span<const std::meta::info> ex = {}) {
@@ -2843,6 +2903,20 @@ consteval ns_member_kind classify_namespace_member(
     return ns_member_kind::skip;
 }
 
+// Dispatch forwarders: the expanded body of a `template for` is not a
+// dependent context on GCC, so a splice of the loop variable inside a
+// DISCARDED if-constexpr branch is still checked -- and a function/namespace
+// reflection is not usable in a splice type. Routing through an info-NTTP
+// forwarder keeps the splice dependent until the branch is actually taken.
+template <std::meta::info mem, std::meta::info... Rs>
+void reflect_class_of(module_& m) {
+    reflect_class<typename [:mem:], mem, Rs...>(m);
+}
+template <std::meta::info mem>
+void reflect_enum_of(module_& m) {
+    reflect_enum<typename [:mem:], mem>(m);
+}
+
 template <std::meta::info r, std::meta::info... Rs>
 void reflect_dispatch(module_& m) {
     if constexpr (is_exclude_marker(r) || is_trampoline_marker(r)
@@ -2856,9 +2930,9 @@ void reflect_dispatch(module_& m) {
             constexpr ns_member_kind kind =
                 classify_namespace_member(mem, excluded_v<Rs...>);
             if constexpr (kind == ns_member_kind::cls)
-                reflect_class<typename [:mem:], mem, Rs...>(m);
+                reflect_class_of<mem, Rs...>(m);
             else if constexpr (kind == ns_member_kind::enum_)
-                reflect_enum<typename [:mem:], mem>(m);
+                reflect_enum_of<mem>(m);
             else if constexpr (kind == ns_member_kind::free_fn)
                 reflect_free_function<mem>(m);
             else if constexpr (kind == ns_member_kind::ns)
