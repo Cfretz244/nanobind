@@ -532,7 +532,7 @@ void reflect_bind_member(auto& cls) {
 /// Shape filter for instance methods (and the matrix the method binders below
 /// model): volatile and rvalue-ref-qualified (&&) member functions, and
 /// C-variadic functions, cannot bind meaningfully to a persistent Python
-/// instance. The operator/member-template/proxy paths express the SAME filter
+/// instance. The operator/member-template paths express the SAME filter
 /// structurally, as the binder-spec completeness gate (`sizeof` on the
 /// undefined reflect_method_binder primary is a substitution failure for any
 /// unmodeled shape) -- this predicate and that gate must accept exactly the
@@ -751,35 +751,17 @@ consteval bool has_unbindable_signature(std::meta::info fn) {
 }
 
 // Value-form of has_ann<fn, reflect::skip>() for the consteval signature walks,
-// where the entity is a loop value rather than an NTTP. Do not call on an entity
-// proxy (annotations_of is ill-formed there; query the underlying function).
+// where the entity is a loop value rather than an NTTP.
 consteval bool fn_skip_annotated(std::meta::info fn) {
     return !nb_annotations_of_type(fn, ^^reflect::skip).empty();
 }
 
-// --- Entity proxies (using-redeclarations; BINDER-0009) ---
-//
-// With -fentity-proxy-reflection (NOT implied by -freflection-latest), a
-// `using Base::f;` shadow declaration appears in members_of as an ENTITY PROXY:
-// named like the member, resolvable via underlying_entity_of, and -- crucially
-// -- spliceable as a member of the DERIVED class (self.[:proxy:](...)), so a
-// re-export from a PRIVATE base (absl::StatusOr's value(), declared in the
-// private internal_statusor::OperatorBase and re-exported with `using`) binds
-// with correct access. Most type queries (type_of, parameters_of, annotations_of)
-// are ill-formed on the proxy itself -- use the underlying function for those.
-// Without the flag, shadow declarations are simply not enumerated; these shims
-// keep the binder compiling either way (proxies then never appear).
-#if __has_feature(entity_proxy_reflection)
-consteval bool is_using_proxy(std::meta::info e) {
-    return std::meta::is_entity_proxy(e);
-}
-consteval std::meta::info proxy_underlying(std::meta::info e) {
-    return std::meta::underlying_entity_of(e);
-}
-#else
-consteval bool is_using_proxy(std::meta::info) { return false; }
-consteval std::meta::info proxy_underlying(std::meta::info e) { return e; }
-#endif
+// (Entity proxies -- binding `using Base::f;` re-exports from PRIVATE bases,
+// BINDER-0009 -- were REMOVED: P3687R1's poll 2b made `^^` on a using-declarator
+// ill-formed and deferred shadow-declaration reflection past C++26, so the
+// feature existed only as the clang-p2996 fork's -fentity-proxy-reflection
+// extension. Public-base re-exports remain covered by inheritance/flattening;
+// private-base re-exports no longer bind.)
 
 // True if `m` reflects a DEDUCTION GUIDE. There is no is_deduction_guide
 // metafunction; a guide is the only namespace-scope function template with no
@@ -1349,20 +1331,6 @@ consteval bool member_template_mentions_excluded(std::meta::info tmpl,
         std::meta::substitute(tmpl, std::vector<std::meta::info>{}), ex);
 }
 
-// Gate for a using-redeclaration: a bound proxy exposes its UNDERLYING
-// function's signature, so that is what must be clean of excluded entities
-// (and either the proxy or its underlying may be listed directly).
-consteval bool proxy_mentions_excluded(std::meta::info proxy,
-                                       std::span<const std::meta::info> ex) {
-    if (info_span_contains(ex, proxy))
-        return true;
-    auto u = proxy_underlying(proxy);
-    if (!std::meta::is_function(u) || std::meta::is_template(u)
-        || std::meta::is_constructor(u) || std::meta::is_destructor(u))
-        return false;
-    return fn_mentions_excluded(u, ex);
-}
-
 // --- Constructor classifiers (shared, see data_member_route's section note) ---
 
 /// True when class `cls` may bind declared constructors at all. An abstract
@@ -1388,16 +1356,12 @@ consteval bool binds_copy_ctor(std::meta::info cls, bool has_trampoline) {
         && std::meta::is_copy_constructible_type(cls);
 }
 
-/// The full eligibility gate for one declared constructor. The proxy guard
-/// comes first: is_constructor on an entity proxy was an UNREACHABLE in
-/// clang-p2996 before the TC-0003 fix (upstreamed as bloomberg/clang-p2996
-/// #290), so the binder does not rely on the patched ordering of the kind
-/// switch. `T() = delete;` is enumerable but must not bind: init<> would call
-/// it, a TU-wide hard error (BINDER-0012, tl::unexpected<E>). Constructor
-/// templates cannot reflect and are skipped.
+/// The full eligibility gate for one declared constructor. `T() = delete;` is
+/// enumerable but must not bind: init<> would call it, a TU-wide hard error
+/// (BINDER-0012, tl::unexpected<E>). Constructor templates cannot reflect and
+/// are skipped.
 consteval bool ctor_binds(std::meta::info fn, std::span<const std::meta::info> ex) {
-    return !is_using_proxy(fn)
-        && std::meta::is_constructor(fn)
+    return std::meta::is_constructor(fn)
         && std::meta::is_public(fn)
         && !std::meta::is_deleted(fn)
         && !std::meta::is_template(fn)
@@ -1613,8 +1577,7 @@ void reflect_bind_property(auto& cls) {
 consteval bool instance_method_shadows(std::meta::info cls, std::string_view name) {
     for (auto m : std::meta::members_of(
              cls, std::meta::access_context::unchecked())) {
-        if (is_using_proxy(m) || !std::meta::is_function(m)
-            || std::meta::is_template(m))
+        if (!std::meta::is_function(m) || std::meta::is_template(m))
             continue;
         if (std::meta::is_public(m) && !std::meta::is_deleted(m)
             && !std::meta::is_static_member(m)
@@ -1746,94 +1709,15 @@ void reflect_bind_member_template(auto& cls) {
     }
 }
 
-// True if the entity a proxy re-exports is declared in cls's PUBLIC base subtree.
-// Such re-exports are already exposed by the flattening pass (or the real Python
-// base); binding the proxy too would create duplicate overloads.
-consteval bool proxy_flatten_covered(std::meta::info cls, std::meta::info proxy) {
-    auto owner = std::meta::parent_of(proxy_underlying(proxy));
-    std::vector<std::meta::info> bases;
-    collect_public_base_subtree(cls, bases);
-    return info_vec_contains(bases, owner);
-}
-
-/// Routing for a public using-redeclaration (entity proxy; see is_using_proxy)
-/// -- a shared classifier, see data_member_route's section note. Only proxies
-/// the flattening pass does NOT cover bind -- i.e. re-exports from private/
-/// protected bases, exactly the ones nothing else can reach. is_deleted must
-/// be asked of the UNDERLYING function: on the proxy itself it silently
-/// answers false (BINDER-0012). Unsupported and skipped: proxies of member
-/// function TEMPLATES in inaccessible bases (the substituted spec is the
-/// base's member -- calling it through the derived class would form the
-/// inaccessible path) and of DATA members (a pointer-to-member of an
-/// inaccessible base is unusable). method_shape_bindable on the underlying is
-/// the value twin of the binder-spec completeness gate.
-enum class proxy_route { skip, oper, static_method, method };
-consteval proxy_route classify_proxy(std::meta::info cls, std::meta::info proxy) {
-    if (proxy_flatten_covered(cls, proxy))
-        return proxy_route::skip;
-    auto u = proxy_underlying(proxy);
-    if (!std::meta::is_function(u)
-        || std::meta::is_deleted(u)
-        || std::meta::is_constructor(u)
-        || std::meta::is_destructor(u)
-        || std::meta::is_special_member_function(u)
-        || nb_has_ellipsis_parameter(u)
-        || has_move_only_by_value_param(u)
-        || has_unbindable_signature(u))
-        return proxy_route::skip;
-    if (std::meta::is_operator_function(u))
-        return method_shape_bindable(u) ? proxy_route::oper : proxy_route::skip;
-    if (std::meta::is_static_member(u))
-        return proxy_route::static_method;
-    if (std::meta::has_identifier(u))
-        return method_shape_bindable(u) ? proxy_route::method : proxy_route::skip;
-    return proxy_route::skip;
-}
-
-// Bind a using-redeclaration (entity proxy); classify_proxy holds the routing
-// rationale. The method lambda calls THROUGH the proxy (a public member of T,
-// so the inaccessible-base path is never formed); the function type and
-// parameter names come from the underlying function. (Historical note: the
-// decl predicates also used to misreport qualifiers on [[clang::lifetimebound]]
-// accessors like StatusOr<T>'s value() -- AttributedType sugar blinded them;
-// fixed in the toolchain, TC-0005.)
-template <typename T, std::meta::info proxy>
-void reflect_bind_proxy(auto& cls) {
-    constexpr proxy_route route = classify_proxy(^^T, proxy);
-    if constexpr (route != proxy_route::skip) {
-        constexpr auto u = proxy_underlying(proxy);
-        using FnType = [:std::meta::type_of(u):];
-        if constexpr (route == proxy_route::oper) {
-            constexpr const char* d = operator_dunder(
-                std::meta::operator_of(u), std::meta::parameters_of(u).size());
-            if constexpr (d != nullptr)
-                reflect_method_binder<T, proxy, FnType>::bind(
-                    cls, d, is_operator());
-        } else if constexpr (route == proxy_route::static_method) {
-            // A static member of the (public-in-itself) base is callable via
-            // the underlying entity directly.
-            with_arg_call_extras<u>([&](auto&&... e) {
-                reflect_static_method_binder<u, FnType>::bind(
-                    cls, entity_name<u>(), std::forward<decltype(e)>(e)...);
-            });
-        } else {
-            with_arg_call_extras<u>([&](auto&&... e) {
-                reflect_method_binder<T, proxy, FnType>::bind(
-                    cls, entity_name<u>(), std::forward<decltype(e)>(e)...);
-            });
-        }
-    }
-}
-
 /// Kind-routing for one members_of entry of a class walk (a shared classifier,
 /// see data_member_route's section note); used identically by the direct-member
 /// pass (bind_class_contents) and the base-flattening pass. fn: a public,
 /// non-deleted, non-template, non-special member function (operators and
 /// conversions included; reflect_bind_member_function / classify_member_fn
 /// route further). tmpl: a public member function template (binds via its
-/// default instantiation when one exists). proxy: a public using-redeclaration.
+/// default instantiation when one exists).
 /// Each kind is gated against the pack's nb::exclude_ set.
-enum class class_member_kind { skip, fn, tmpl, proxy };
+enum class class_member_kind { skip, fn, tmpl };
 // The class-member list every `template for` walk lifts via
 // define_static_array. On GCC 16, lifting the reflection of an
 // IMPLICITLY-declared special member into static storage instantiates that
@@ -1878,10 +1762,6 @@ consteval class_member_kind classify_class_member(
         && !std::meta::is_conversion_function_template(fn))
         return member_template_mentions_excluded(fn, ex) ? class_member_kind::skip
                                                          : class_member_kind::tmpl;
-    if (is_using_proxy(fn)
-        && std::meta::is_public(fn)
-        && !proxy_mentions_excluded(fn, ex))
-        return class_member_kind::proxy;
     return class_member_kind::skip;
 }
 
@@ -1942,8 +1822,6 @@ void bind_class_contents(auto& cls) {
             reflect_bind_member_function<T, fn>(cls);
         else if constexpr (kind == class_member_kind::tmpl)
             reflect_bind_member_template<T, fn>(cls);
-        else if constexpr (kind == class_member_kind::proxy)
-            reflect_bind_proxy<T, fn>(cls);
     };
 
     // Bind properties from [[=r::property{"name"}]] getter/setter pairs. The kind
@@ -1989,9 +1867,7 @@ void flatten_base_members(auto& cls) {
     // Same kind-routing as bind_class_contents. Member function templates with
     // all-defaulted parameters bind via their default instantiation -- this is
     // where flat_hash_map's heterogeneous contains/find/erase/operator[] live
-    // (declared on the flattened raw_hash_map/raw_hash_set ancestry). A proxy
-    // here is a using-redeclaration inside the flattened base re-exporting from
-    // ITS OWN inaccessible base.
+    // (declared on the flattened raw_hash_map/raw_hash_set ancestry).
     template for (constexpr auto fn :
         std::define_static_array(liftable_class_members(Base))) {
         constexpr class_member_kind kind =
@@ -2000,8 +1876,6 @@ void flatten_base_members(auto& cls) {
             reflect_bind_member_function<T, fn>(cls);
         else if constexpr (kind == class_member_kind::tmpl)
             reflect_bind_member_template<T, fn>(cls);
-        else if constexpr (kind == class_member_kind::proxy)
-            reflect_bind_proxy<T, fn>(cls);
     };
 }
 
@@ -2172,22 +2046,6 @@ consteval void collect_own_stl_member_types(std::meta::info owner,
         // casters for its signature either -- e.g. spdlog's
         // set_formatter(std::unique_ptr<formatter>) is skipped at bind time but
         // used to static_assert here for the missing unique_ptr caster.
-        if (is_using_proxy(mem)) {
-            // A bound using-redeclaration (reflect_bind_proxy) contributes its
-            // underlying function's signature types.
-            auto u = proxy_underlying(mem);
-            if (std::meta::is_function(u) && !std::meta::is_template(u)
-                && !std::meta::is_destructor(u) && !std::meta::is_constructor(u)
-                && !std::meta::is_deleted(u)
-                && !fn_skip_annotated(u) && !has_move_only_by_value_param(u)
-                && !has_unbindable_signature(u)
-                && !fn_mentions_excluded(u, ex)) {
-                collect_stl_types(std::meta::return_type_of(u), out, visited, ex);
-                for (auto p : std::meta::parameters_of(u))
-                    collect_stl_types(std::meta::type_of(p), out, visited, ex);
-            }
-            continue;
-        }
         if (std::meta::is_template(mem)) {
             // A member function template that binds via its default instantiation
             // (reflect_bind_member_template) contributes that instantiation's
@@ -2257,8 +2115,6 @@ consteval void collect_scope_stl_types(std::meta::info r,
                                        std::span<const std::meta::info> ex = {}) {
     if (std::meta::is_namespace(r)) {
         for (auto mem : std::meta::members_of(r, std::meta::access_context::unchecked())) {
-            if (is_using_proxy(mem))
-                continue;  // namespace-scope using-declaration: not a seed
             if (is_excluded_entity(mem, ex))
                 continue;  // nb::exclude_-listed class/namespace: opaque
             if (std::meta::is_type(mem) && std::meta::is_class_type(mem)) {
@@ -2395,20 +2251,6 @@ consteval void collect_own_member_specs(std::meta::info owner,
     for (auto mem : std::meta::members_of(owner, std::meta::access_context::unchecked())) {
         if (!std::meta::is_public(mem))
             continue;
-        if (is_using_proxy(mem)) {
-            // A bound using-redeclaration (reflect_bind_proxy) contributes its
-            // underlying function's signature types.
-            auto u = proxy_underlying(mem);
-            if (std::meta::is_function(u) && !std::meta::is_template(u)
-                && !std::meta::is_destructor(u) && !std::meta::is_constructor(u)
-                && !std::meta::is_deleted(u)
-                && !fn_mentions_excluded(u, ex)) {
-                collect_user_specs_from_type(std::meta::return_type_of(u), out, visited, ex);
-                for (auto p : std::meta::parameters_of(u))
-                    collect_user_specs_from_type(std::meta::type_of(p), out, visited, ex);
-            }
-            continue;
-        }
         if (std::meta::is_template(mem)) {
             // Default-instantiable member templates bind (see
             // reflect_bind_member_template), so their instantiation's signature
@@ -2486,8 +2328,6 @@ consteval void collect_scope_user_specs(std::meta::info r,
         return;  // a marker is not a seed; an excluded seed is opaque
     if (std::meta::is_namespace(r)) {
         for (auto mem : std::meta::members_of(r, std::meta::access_context::unchecked())) {
-            if (is_using_proxy(mem))
-                continue;  // namespace-scope using-declaration: not a seed
             if (is_excluded_entity(mem, ex))
                 continue;  // nb::exclude_-listed class/namespace: opaque
             if (std::meta::is_type(mem) && std::meta::is_class_type(mem)) {
@@ -2574,7 +2414,7 @@ consteval void collect_seed_classes(std::meta::info r,
         return;
     if (std::meta::is_namespace(r)) {
         for (auto mem : std::meta::members_of(r, std::meta::access_context::unchecked())) {
-            if (std::meta::is_template(mem) || is_using_proxy(mem))
+            if (std::meta::is_template(mem))
                 continue;
             if (std::meta::is_type(mem) && std::meta::is_class_type(mem)) {
                 if (std::meta::is_complete_type(mem)   // skip fwd decls (BINDER-0019)
@@ -2870,11 +2710,10 @@ void reflect_enum(module_& m) {
 // (bind_set_v<Rs...>) when deciding Python-base wiring.
 /// Kind-routing for one member of a namespace walk (a shared classifier, see
 /// data_member_route's section note). Guard ORDER is load-bearing: templates
-/// and proxies are rejected before any annotation query (annotations_of is
-/// ill-formed on both). Templates are skipped because only their
-/// specializations bind (discovered by reflect_user_specs or passed
-/// explicitly); a namespace-scope using-declaration (`using std::string;`) is
-/// not a binding seed. cls requires a COMPLETE type: a forward-declared
+/// are rejected before any annotation query (annotations_of is ill-formed on
+/// a template). Templates are skipped because only their specializations bind
+/// (discovered by reflect_user_specs or passed
+/// explicitly). cls requires a COMPLETE type: a forward-declared
 /// namespace member (`struct Opaque;` -- the pImpl idiom, BINDER-0019) cannot
 /// be bound, exactly like the discovery walks treat it. A namespace ALIAS
 /// member is a shorthand, not a declaration of contents -- following it binds
@@ -2883,7 +2722,7 @@ void reflect_enum(module_& m) {
 enum class ns_member_kind { skip, cls, enum_, free_fn, ns };
 consteval ns_member_kind classify_namespace_member(
         std::meta::info mem, std::span<const std::meta::info> ex) {
-    if (std::meta::is_template(mem) || is_using_proxy(mem))
+    if (std::meta::is_template(mem))
         return ns_member_kind::skip;
     if (fn_skip_annotated(mem) || is_excluded_entity(mem, ex))
         return ns_member_kind::skip;

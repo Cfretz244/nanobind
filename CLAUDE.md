@@ -108,7 +108,7 @@ thing that cannot be expressed in-language (a virtual-override **trampoline**) h
 - **Deleted functions are filtered on every path** (BINDER-0012, found via tl::expected's
   `unexpected() = delete;`): ctors, methods/operators/conversions, member-template default
   instantiations (checked on the substituted SPEC — `is_deleted` is silently false on a
-  Template reflection), entity proxies (checked on the UNDERLYING function), flattening,
+  Template reflection), flattening,
   free functions/operators, properties, the `__int__` widest-conversion contest, and the
   caster/spec discovery walks. A class with only deleted ctors binds with no `__init__`
   (Python TypeError, the abstract-class contract).
@@ -136,9 +136,10 @@ thing that cannot be expressed in-language (a virtual-override **trampoline**) h
   `define_static_array` lift (`namespace_members_for_binding`): a guide is never bindable,
   and pre-TC-0008 toolchains ICE mangling a guide reflection ("Can't mangle a deduction
   guide name!" — tl's `unexpected(E) -> unexpected<E>` was the field shape).
-- **Using-redeclarations** (`using Base::f;`, incl. from PRIVATE bases — StatusOr's
-  `value()`) bind as entity proxies. Requires `-fentity-proxy-reflection` (NOT implied by
-  `-freflection-latest`); template/data-member re-exports from inaccessible bases skipped.
+- **Using-redeclarations**: public-base re-exports are covered by inheritance/flattening.
+  Private-base re-exports (StatusOr's `value()`) do NOT bind — the entity-proxy feature
+  (clang fork's `-fentity-proxy-reflection`) was REMOVED after P3687R1 deferred
+  shadow-declaration reflection past C++26 (the binder targets standard C++26 / GCC 16).
 
 - **Wave-1 parallel-corpus hardening (BINDER-0015..0020, one commit each):**
   unrepresentable parameter/return shapes (ptr-to-ptr, ptr-to-function, `T*&`
@@ -238,12 +239,9 @@ needing explicit arguments; trampoline hardening for final/ref-qualified virtual
   was `[[clang::lifetimebound]]` wrapping the method type in AttributedType sugar that
   blinded the qualifier predicates — proxies were incidental; fixed in the toolchain as
   TC-0005.)
-- **Entity proxies need `-fentity-proxy-reflection`** (not implied by
-  `-freflection-latest`), and proxy guards still precede kind predicates in `members_of`
-  loops (`is_constructor` on a proxy was an ICE before the TC-0003 toolchain fix,
-  upstreamed as bloomberg/clang-p2996#290 / PR #291; the ordering keeps the binder
-  working on an unpatched compiler. Most type queries are still ill-formed on the proxy
-  itself — use `proxy_underlying`/`underlying_entity_of`).
+- **Entity proxies were removed** (P3687R1 deferred shadow-declaration reflection past
+  C++26): the binder no longer passes `-fentity-proxy-reflection` and has no proxy
+  paths. `using` re-exports from private bases simply do not bind.
 
 ## Building & testing (exact, this laptop)
 
@@ -260,7 +258,7 @@ Fast front-end check (no build/link; run from this directory):
 ```bash
 TC=../toolchain
 PYINC=$(/opt/homebrew/bin/python3.12 -c 'import sysconfig;print(sysconfig.get_path("include"))')
-$TC/bin/clang++ -std=c++26 -freflection-latest -fentity-proxy-reflection -stdlib=libc++ \
+$TC/bin/clang++ -std=c++26 -freflection-latest -stdlib=libc++ \
   -isysroot "$(xcrun --show-sdk-path)" -nostdinc++ -isystem $TC/include/c++/v1 \
   -I "$PYINC" -I include -fsyntax-only tests/test_reflect.cpp
 ```

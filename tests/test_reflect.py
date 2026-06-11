@@ -507,18 +507,6 @@ def test37_member_function_templates(t):
         assert not hasattr(t.HetMap, absent), absent
 
 
-def test38_private_base_using_reexports(t):
-    # Members declared in a PRIVATE base and re-exported with using-declarations
-    # bind as entity proxies through the derived class (BINDER-0009); the base
-    # itself is neither bound nor flattened.
-    u = t.UsesPrivateBase()
-    assert u.own() == 1
-    assert u.pmeth() == 7              # using ProxyImpl::pmeth (private base)
-    assert u.padd(5) == 12             # with an argument
-    assert t.UsesPrivateBase.psq(3) == 9   # static re-export
-    assert not hasattr(t, 'ProxyImpl')
-
-
 def test36b_policy_args_not_bound(t):
     # Cont<int, Pol<int>> is signature-reachable and bound; Pol<int> appears only
     # as its template argument (a "policy") and is not -- mirroring hash-map

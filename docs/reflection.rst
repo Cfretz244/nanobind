@@ -780,12 +780,14 @@ Limitations
   Explicit instantiation definitions are not auto-detected, and the
   header-only path does not diagnose a missing std caster used *only* by a discovered
   specialization's members (it surfaces at bind time); the codegen path emits it.
-- **Using-redeclarations**: ``using Base::f;`` re-exports — including from
-  **private** bases (``absl::StatusOr``'s ``value()``) — bind through their
-  entity proxies. Requires the ``-fentity-proxy-reflection`` flag (NOT implied
-  by ``-freflection-latest``); without it they are invisible and skipped.
-  Re-exports of member function *templates* from inaccessible bases and of
-  *data members* are not supported (skipped).
+- **Using-redeclarations**: ``using Base::f;`` re-exports from **public** bases
+  are already covered by inheritance/flattening (the member is reachable through
+  the base subtree). Re-exports from **private/protected** bases
+  (``absl::StatusOr``'s ``value()``) do *not* bind: reflecting a shadow
+  declaration was deferred past C++26 (P3687R1), so no conforming compiler can
+  enumerate them. (An earlier version bound these through the clang-p2996
+  fork's ``-fentity-proxy-reflection`` extension; the feature was removed when
+  the binder moved to standard C++26 reflection.)
 - **Default-argument values** are not bound — a standard limitation, not a binder
   one (P3096 exposes only ``has_default_argument``). See `Keyword arguments`_.
 - **STL casters**: the header-only path cannot inject ``#include``s (it diagnoses

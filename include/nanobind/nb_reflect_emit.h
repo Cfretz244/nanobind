@@ -757,47 +757,6 @@ consteval void append_member_template(std::string& out,
     }
 }
 
-// --- Entity proxies (using-redeclarations) ---
-
-template <std::meta::info Cls, std::meta::info Proxy>
-consteval void append_proxy(std::string& out, std::string_view cls_spell) {
-    constexpr proxy_route route = classify_proxy(Cls, Proxy);
-    if constexpr (route == proxy_route::skip) {
-        return;
-    } else {
-        constexpr auto u = proxy_underlying(Proxy);
-        if constexpr (route == proxy_route::oper) {
-            constexpr const char* d = operator_dunder(
-                std::meta::operator_of(u),
-                std::meta::parameters_of(u).size());
-            if constexpr (d != nullptr) {
-                // Unqualified call through the using-declared name: the ONLY
-                // valid spelling for a private-base re-export.
-                std::string callee = "operator";
-                callee += std::meta::symbol_of(std::meta::operator_of(u));
-                append_method<u>(out, cls_spell, d, callee, "",
-                                 ", nb::is_operator()");
-            }
-        } else if constexpr (route == proxy_route::static_method) {
-            // The underlying entity is callable directly (its class is
-            // public-in-itself even when a private base of Cls).
-            std::string callee = type_spelling(std::meta::parent_of(u));
-            if (callee.empty()) {
-                append_skip_note(out, entity_name<u>());
-                return;
-            }
-            callee += "::";
-            callee += std::meta::identifier_of(u);
-            append_static_method<u>(out, entity_name<u>(), callee);
-        } else {
-            std::string extras;
-            append_call_extras<u>(extras);
-            append_method<u>(out, cls_spell, entity_name<u>(),
-                             std::meta::identifier_of(u), "", extras);
-        }
-    }
-}
-
 // --- Class contents (mirrors bind_class_contents) ---
 
 template <std::meta::info Cls, bool HasTramp, std::meta::info... Rs>
@@ -840,7 +799,7 @@ consteval void append_class_contents(std::string& out,
             append_static_member<mem>(out, cls_spell);
     };
 
-    // Methods / member templates / proxies (one shared kind-router).
+    // Methods / member templates (one shared kind-router).
     template for (constexpr auto fn : std::define_static_array(
                       liftable_class_members(Cls))) {
         constexpr class_member_kind kind =
@@ -849,8 +808,6 @@ consteval void append_class_contents(std::string& out,
             append_member_function<Cls, fn>(out, cls_spell, "");
         else if constexpr (kind == class_member_kind::tmpl)
             append_member_template<Cls, fn>(out, cls_spell, "");
-        else if constexpr (kind == class_member_kind::proxy)
-            append_proxy<Cls, fn>(out, cls_spell);
     };
 
     // Properties.
@@ -907,8 +864,6 @@ consteval void append_flatten_base(std::string& out,
             append_member_function<Cls, fn>(out, cls_spell, call_prefix);
         else if constexpr (kind == class_member_kind::tmpl)
             append_member_template<Cls, fn>(out, cls_spell, call_prefix);
-        else if constexpr (kind == class_member_kind::proxy)
-            append_proxy<Cls, fn>(out, cls_spell);
     };
 }
 

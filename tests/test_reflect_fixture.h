@@ -551,35 +551,6 @@ struct HetMap : member_template_detail::HetBase {
 
 } // namespace member_template_test
 
-// --- Entity proxies (BINDER-0009): members declared in a PRIVATE base and
-//     re-exported with using-declarations. Under -fentity-proxy-reflection the
-//     shadow declarations enumerate as proxies and bind THROUGH the derived
-//     class (correct access). Mirrors absl::StatusOr's value()/operator*.
-namespace proxy_detail {
-
-// NOT reflected (mirrors absl::internal_statusor).
-struct ProxyImpl {
-    int pv;
-    ProxyImpl() : pv(7) {}
-    int pmeth() const { return pv; }
-    int padd(int x) const { return pv + x; }
-    static int psq(int x) { return x * x; }
-};
-
-} // namespace proxy_detail
-
-namespace proxy_test {
-
-struct UsesPrivateBase : private proxy_detail::ProxyImpl {
-    UsesPrivateBase() {}
-    using proxy_detail::ProxyImpl::pmeth;
-    using proxy_detail::ProxyImpl::padd;
-    using proxy_detail::ProxyImpl::psq;
-    int own() const { return 1; }
-};
-
-} // namespace proxy_test
-
 // --- Streamable: free operator<<(ostream&, T) -> __str__ (BINDER-0007), while a genuine
 //     operator<<(T, int) shift still maps to __lshift__. Reflected as a TYPE (^^stream_test::
 //     Streamable), mirroring how a real streamable library value (e.g. absl::int128) is bound.

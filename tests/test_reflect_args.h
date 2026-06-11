@@ -42,7 +42,7 @@ consteval std::meta::info xvec_member(std::string_view name) {
     ^^template_test::Box<float>,                                               \
     ^^template_test::identity<int>,                                            \
     ^^stream_test::Streamable,                                                 \
-    ^^member_template_test, ^^proxy_test,                                      \
+    ^^member_template_test,                                                    \
     ^^exclude_test, ^^EX_MARKER,                                               \
     ^^unbindable_shapes, ^^ownership_test,                                     \
     ^^anon_typedef_test, ^^static_const_test,                                  \

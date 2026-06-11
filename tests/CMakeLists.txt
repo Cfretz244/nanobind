@@ -180,9 +180,7 @@ elseif(NB_HAS_REFLECTION_BLOOMBERG)
   # (required_stl_types / required_user_specs) over the growing test fixture
   # namespace; the default budget is no longer enough. Safe since the TC-0002
   # Sema use-after-free fix (the budget itself was never the bug).
-  # -fentity-proxy-reflection (NOT implied by -freflection-latest) makes
-  # using-redeclarations enumerable so they can bind (BINDER-0009).
-  set(NB_REFLECT_FLAGS -std=c++26 -freflection-latest -fentity-proxy-reflection
+  set(NB_REFLECT_FLAGS -std=c++26 -freflection-latest
       -stdlib=libc++ -fconstexpr-steps=100000000)
   set(NB_REFLECT_BIG_STEPS -fconstexpr-steps=2000000000)
 endif()
