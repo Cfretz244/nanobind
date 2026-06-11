@@ -324,6 +324,17 @@ consteval std::string type_spelling(std::meta::info t) {
     }
 
     // Fundamentals (int, unsigned long, void, decltype(nullptr), ...).
+    // `display_string_of` spells most of these canonically, but on this
+    // toolchain a distinct char-family fundamental can render as its UNDERLYING
+    // type rather than its own keyword -- `wchar_t` displays as "int", so
+    // `std::wstring` (= basic_string<wchar_t>) would emit
+    // basic_string<int, char_traits<int>, ...> and fail to compile against the
+    // real overload (CLI11's parse(std::wstring)). Spell the char family by
+    // type identity so the keyword is always exact; the rest fall through.
+    if (std::meta::dealias(t) == ^^wchar_t)  return "wchar_t";
+    if (std::meta::dealias(t) == ^^char8_t)  return "char8_t";
+    if (std::meta::dealias(t) == ^^char16_t) return "char16_t";
+    if (std::meta::dealias(t) == ^^char32_t) return "char32_t";
     return std::string(std::meta::display_string_of(t));
 }
 

@@ -17,6 +17,20 @@
 
 namespace nb = nanobind;
 
+// --- Emitter type-spelling: char-family fundamentals must spell by keyword ---
+// On this toolchain display_string_of(^^wchar_t) is "int" (its underlying type),
+// which would render std::wstring as basic_string<int, ...> and miscompile
+// against the real overload. type_spelling must special-case the char family.
+static_assert(nb::detail::type_spelling(^^wchar_t)  == "wchar_t");
+static_assert(nb::detail::type_spelling(^^char8_t)  == "char8_t");
+static_assert(nb::detail::type_spelling(^^char16_t) == "char16_t");
+static_assert(nb::detail::type_spelling(^^char32_t) == "char32_t");
+static_assert(nb::detail::type_spelling(^^char)     == "char");
+static_assert(
+    nb::detail::type_spelling(^^std::wstring)
+        == "::std::basic_string<wchar_t, ::std::char_traits<wchar_t>, "
+           "::std::allocator<wchar_t>>");
+
 // The trampoline lives OUTSIDE the reflected namespace so reflect_ does not try
 // to bind it as a class; it is wired in only via NB_REFLECT_TRAMPOLINE.
 namespace reflect_test_tramp {
