@@ -213,6 +213,35 @@ if (NB_REFLECT_FLAGS)
   target_link_options(test_reflect_codegen_ext PRIVATE ${NB_REFLECT_FLAGS})
   target_include_directories(test_reflect_codegen_ext PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
   add_dependencies(test_reflect_codegen_ext test_reflect_codegen_generate)
+
+  # Emit (full source codegen) test: a generator program renders the COMPLETE
+  # binding TU for the shared fixture via reflection; the build runs it and
+  # compiles the GENERATED source as the module -- at c++20 with NO reflection
+  # flags, which is the in-tree proof that the output needs no reflection
+  # toolchain (the corpus's emit lane repeats this with Apple Clang).
+  set(NB_REFLECT_EMIT_SRC ${CMAKE_CURRENT_BINARY_DIR}/test_reflect_emit.gen.cpp)
+
+  add_executable(test_reflect_emit_gen test_reflect_emit_gen.cpp)
+  # Rendering the whole module as a consteval string outspends the default
+  # walk budget; the bump is harmless (TC-0002 made budgets safe to raise).
+  target_compile_options(test_reflect_emit_gen PRIVATE ${NB_REFLECT_FLAGS}
+      -fconstexpr-steps=2000000000)
+  target_link_options(test_reflect_emit_gen PRIVATE ${NB_REFLECT_FLAGS})
+  target_include_directories(test_reflect_emit_gen
+      PRIVATE ${NB_DIR}/include ${Python_INCLUDE_DIRS})
+
+  add_custom_command(
+      OUTPUT ${NB_REFLECT_EMIT_SRC}
+      COMMAND test_reflect_emit_gen ${NB_REFLECT_EMIT_SRC}
+      DEPENDS test_reflect_emit_gen
+      COMMENT "Generating nanobind binding source via reflection (emit backend)")
+  add_custom_target(test_reflect_emit_generate DEPENDS ${NB_REFLECT_EMIT_SRC})
+
+  nanobind_add_module(test_reflect_emit_ext ${NB_REFLECT_EMIT_SRC} ${NB_EXTRA_ARGS})
+  # Deliberately NO ${NB_REFLECT_FLAGS}: the generated TU is plain C++20.
+  target_compile_features(test_reflect_emit_ext PRIVATE cxx_std_20)
+  target_include_directories(test_reflect_emit_ext PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  add_dependencies(test_reflect_emit_ext test_reflect_emit_generate)
 endif()
 
 add_library(
@@ -259,6 +288,7 @@ set(TEST_FILES
   test_specialization.py
   test_reflect.py
   test_reflect_codegen.py
+  test_reflect_emit.py
 
   # Stub reference files
   test_classes_ext.pyi.ref

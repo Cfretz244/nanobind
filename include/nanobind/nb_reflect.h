@@ -43,6 +43,16 @@ NAMESPACE_BEGIN(NB_NAMESPACE)
 ///                ^^nb::exclude_<^^Eigen::Transpose, ^^Eigen::Block>>(m);
 template <std::meta::info... Excluded> struct exclude_ {};
 
+/// Emit-mode trampoline selection markers (consumed by nb_reflect_emit.h;
+/// inert configuration in the constexpr backend, where trampolines are
+/// registered via NB_REFLECT_TRAMPOLINE / the two-stage codegen instead):
+/// pass ^^trampoline_<^^Class...> in the pack to give exactly the listed
+/// classes generated trampolines in the emitted source, or
+/// ^^trampoline_all_ for every class with overridable virtuals (the
+/// two-stage codegen tier's rule -- what a json-style run uses).
+template <std::meta::info... Classes> struct trampoline_ {};
+struct trampoline_all_ {};
+
 NAMESPACE_BEGIN(detail)
 
 // --- Trampoline hook ---
@@ -1146,6 +1156,20 @@ consteval bool is_exclude_marker(std::meta::info r) {
     return std::meta::is_class_type(r)
         && std::meta::has_template_arguments(r)
         && std::meta::template_of(r) == ^^exclude_;
+}
+
+/// True for the emit-mode trampoline markers (trampoline_<...> /
+/// trampoline_all_): configuration, not binding seeds -- every walk skips
+/// them exactly like exclude_ markers.
+consteval bool is_trampoline_marker(std::meta::info r) {
+    if (!std::meta::is_type(r))
+        return false;
+    r = std::meta::dealias(r);
+    if (r == ^^trampoline_all_)
+        return true;
+    return std::meta::is_class_type(r)
+        && std::meta::has_template_arguments(r)
+        && std::meta::template_of(r) == ^^trampoline_;
 }
 
 template <std::meta::info... Rs>
@@ -2477,7 +2501,8 @@ consteval std::vector<std::meta::info> required_user_specs(
 consteval void collect_seed_classes(std::meta::info r,
                                     std::vector<std::meta::info>& out,
                                     std::span<const std::meta::info> ex = {}) {
-    if (is_exclude_marker(r) || is_excluded_entity(r, ex))
+    if (is_exclude_marker(r) || is_trampoline_marker(r)
+        || is_excluded_entity(r, ex))
         return;
     if (std::meta::is_namespace(r)) {
         for (auto mem : std::meta::members_of(r, std::meta::access_context::unchecked())) {
@@ -2812,9 +2837,11 @@ consteval ns_member_kind classify_namespace_member(
 
 template <std::meta::info r, std::meta::info... Rs>
 void reflect_dispatch(module_& m) {
-    if constexpr (is_exclude_marker(r) || is_excluded_entity(r, excluded_v<Rs...>)) {
-        // An ^^nb::exclude_<...> marker (configuration, not a binding seed), or
-        // a seed that is itself excluded -- bind nothing.
+    if constexpr (is_exclude_marker(r) || is_trampoline_marker(r)
+                  || is_excluded_entity(r, excluded_v<Rs...>)) {
+        // An ^^nb::exclude_<...> / ^^nb::trampoline_<...> marker
+        // (configuration, not a binding seed), or a seed that is itself
+        // excluded -- bind nothing.
     } else if constexpr (std::meta::is_namespace(r)) {
         template for (constexpr auto mem :
             std::define_static_array(namespace_members_for_binding(r))) {

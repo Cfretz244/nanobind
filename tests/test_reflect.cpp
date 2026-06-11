@@ -10,11 +10,10 @@
 #include <string>
 #include <vector>
 
-// The bound C++ surface. Shared with the emit-mode generator and the generated
-// TU (which compiles WITHOUT reflection), so the fixture is plain header-safe
-// C++; everything P2996-only -- the trampoline registration, the reflection
-// markers, and the binder static_asserts -- stays in this TU.
-#include "test_reflect_fixture.h"
+// The bound C++ surface (plain header-safe C++, shared with the emit-mode
+// generator and the generated TU, which compiles WITHOUT reflection) plus the
+// shared reflect_ argument pack (TEST_REFLECT_ARGS / EX_MARKER / xvec_member).
+#include "test_reflect_args.h"
 
 namespace nb = nanobind;
 
@@ -70,23 +69,6 @@ static_assert(!tt_has_spec(^^std::vector<int>));     // std -> caster path, not 
 static_assert(tt_has_spec(^^template_test::Cont<int, template_test::Pol<int>>));
 static_assert(!tt_has_spec(^^template_test::Pol<int>));
 
-// A member listed by its REFLECTION (not spellable as ^^name for an overload/
-// ctor in general) -- exercises the per-member exclusion path.
-consteval std::meta::info xvec_member(std::string_view name) {
-    for (auto m : std::meta::members_of(^^exclude_test::XVec,
-                                        std::meta::access_context::unchecked()))
-        if (std::meta::is_function(m) && !std::meta::is_template(m)
-            && std::meta::has_identifier(m) && std::meta::identifier_of(m) == name)
-            return m;
-    return ^^void;
-}
-
-// The marker is spelled in full at each use: a `using` alias would put an
-// ALIAS reflection in the pack, and the marker test keys on template_of.
-#define EX_MARKER                                                              \
-    nb::exclude_<^^exclude_test::Expr, ^^exclude_test::detail,                 \
-                 ^^exclude_test::Opaque, ^^exclude_test::ExBase,               \
-                 xvec_member("doomed")>
 namespace {
 consteval bool ex_has_spec(std::meta::info t) {
     std::vector<std::meta::info> ex = nb::detail::compute_excluded<^^EX_MARKER>();
@@ -154,18 +136,5 @@ static_assert(spelled(^^spell_fixture::OuterT<int>::Nested,
 static_assert(nb::detail::fn_signature_spellable(^^reflect_test::kw_sub));
 
 NB_MODULE(test_reflect_ext, m) {
-    // Box<float> is referenced by no signature; it is bound only because it is listed
-    // explicitly here (the explicit opt-in for specializations the walk can't reach).
-    // identity<int> is a free-function-template specialization, also explicit-only.
-    nb::reflect_<^^reflect_test, ^^template_test,
-                 ^^template_test::Box<float>,
-                 ^^template_test::identity<int>,
-                 ^^stream_test::Streamable,
-                 ^^member_template_test, ^^proxy_test,
-                 ^^exclude_test, ^^EX_MARKER,
-                 ^^unbindable_shapes, ^^ownership_test,
-                 ^^anon_typedef_test, ^^static_const_test,
-                 ^^collide_a, ^^collide_b, ^^shadow_test,
-                 ^^alias_fixture, ^^ref_return_test,
-                 ^^parens_init_test>(m);
+    nb::reflect_<TEST_REFLECT_ARGS>(m);
 }

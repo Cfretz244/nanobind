@@ -1,15 +1,12 @@
 import pytest
 
-try:
-    import test_reflect_ext as t
-    def needs_reflect(x):
-        return x
-except ImportError:
-    needs_reflect = pytest.mark.skip(reason="C++26 reflection support required")
+# Every test takes the bound module via the `t` fixture (tests/conftest.py),
+# parameterized over BOTH backends: test_reflect_ext (constexpr reflect_) and
+# test_reflect_emit_ext (the emit backend's generated source, compiled without
+# reflection). One behavioral suite, two binders.
 
 
-@needs_reflect
-def test01_enum():
+def test01_enum(t):
     assert t.Enum.A.name == 'A'
     assert t.Enum.B.name == 'B'
     assert t.Enum.C.name == 'C'
@@ -18,23 +15,20 @@ def test01_enum():
     assert t.Enum.C.value == 2
 
 
-@needs_reflect
-def test02_default_ctor():
+def test02_default_ctor(t):
     s = t.Struct()
     assert s.i == 0
     assert s.d == 0.0
     assert s.s == ''
 
 
-@needs_reflect
-def test03_param_ctor():
+def test03_param_ctor(t):
     s = t.Struct(3, 1.5)
     assert s.i == 3
     assert s.d == 1.5
 
 
-@needs_reflect
-def test04_data_member_rw():
+def test04_data_member_rw(t):
     s = t.Struct()
     s.i = 7
     s.d = 2.5
@@ -44,46 +38,39 @@ def test04_data_member_rw():
     assert s.s == 'hello'
 
 
-@needs_reflect
-def test05_const_method():
+def test05_const_method(t):
     s = t.Struct(3, 1.5)
     assert s.get_i() == 3
     assert abs(s.sum() - 4.5) < 1e-10
 
 
-@needs_reflect
-def test06_nonconst_method():
+def test06_nonconst_method(t):
     s = t.Struct()
     s.set_i(10)
     assert s.get_i() == 10
 
 
-@needs_reflect
-def test07_method_overload():
+def test07_method_overload(t):
     s = t.Struct(0, 1.0)
     assert abs(s.overloaded(2.0) - 3.0) < 1e-10
     assert abs(s.overloaded(2, 3) - 6.0) < 1e-10
 
 
-@needs_reflect
-def test08_static_const():
+def test08_static_const(t):
     assert t.Struct.static_const == 42
 
 
-@needs_reflect
-def test09_static_mutable():
+def test09_static_mutable(t):
     before = t.Struct.static_mut
     t.Struct()
     assert t.Struct.static_mut == before + 1
 
 
-@needs_reflect
-def test10_static_method():
+def test10_static_method(t):
     assert t.Struct.create_count() >= 0
 
 
-@needs_reflect
-def test11_ns_class():
+def test11_ns_class(t):
     a = t.A()
     a.x = 1
     a.y = 2.0
@@ -95,40 +82,34 @@ def test11_ns_class():
     assert b.s == 'test'
 
 
-@needs_reflect
-def test12_ns_enum():
+def test12_ns_enum(t):
     assert t.E.X.name == 'X'
     assert t.E.Z.name == 'Z'
     assert t.E.X.value == 0
     assert t.E.Z.value == 2
 
 
-@needs_reflect
-def test13_free_fn():
+def test13_free_fn(t):
     assert abs(t.free_fn(1.0, 2.0) - 3.0) < 1e-10
 
 
-@needs_reflect
-def test14_free_fn_overload():
+def test14_free_fn_overload(t):
     assert abs(t.free_fn(1.0, 2.0, 3.0) - 6.0) < 1e-10
 
 
-@needs_reflect
-def test15_string_member():
+def test15_string_member(t):
     n = t.Nested()
     n.name = 'abc'
     assert n.name == 'abc'
 
 
-@needs_reflect
-def test16_vector_member():
+def test16_vector_member(t):
     n = t.Nested()
     n.items = [1, 2, 3]
     assert n.items == [1, 2, 3]
 
 
-@needs_reflect
-def test17_nested_type():
+def test17_nested_type(t):
     n = t.Nested()
     s = t.Struct(5, 1.0)
     n.inner = s
@@ -136,8 +117,7 @@ def test17_nested_type():
     assert n.inner.d == 1.0
 
 
-@needs_reflect
-def test18_private_members_hidden():
+def test18_private_members_hidden(t):
     m = t.Mixed()
     m.pub_i = 7
     m.pub_s = 'hi'
@@ -151,8 +131,7 @@ def test18_private_members_hidden():
     assert not hasattr(m, 'prot_i')
 
 
-@needs_reflect
-def test19_single_inheritance():
+def test19_single_inheritance(t):
     d = t.Derived()
     d.b = 3   # inherited data member
     d.d = 4   # own data member
@@ -164,8 +143,7 @@ def test19_single_inheritance():
     assert isinstance(d, t.Base)
 
 
-@needs_reflect
-def test20_multilevel_chain():
+def test20_multilevel_chain(t):
     x = t.L2()
     x.v0 = 1
     x.v1 = 2
@@ -177,8 +155,7 @@ def test20_multilevel_chain():
     assert isinstance(x, t.L0)
 
 
-@needs_reflect
-def test21_external_base_flattened():
+def test21_external_base_flattened(t):
     # ExtBase lives outside reflect_test and was never passed to reflect_<...>,
     # so it is NOT in the bind set: being a base does not surface a type
     # (reachability rule). Its public members are flattened onto UsesExtBase
@@ -193,8 +170,7 @@ def test21_external_base_flattened():
     assert t.UsesExtBase.__bases__ == (object,)
 
 
-@needs_reflect
-def test21b_two_level_unbound_chain_flattened():
+def test21b_two_level_unbound_chain_flattened(t):
     # MidUnbound and DeepUnbound (both outside the bind set) flatten transitively.
     x = t.UsesDeepChain()
     x.own = 1
@@ -206,8 +182,7 @@ def test21b_two_level_unbound_chain_flattened():
     assert t.UsesDeepChain.__bases__ == (object,)
 
 
-@needs_reflect
-def test21c_python_base_through_unbound_link():
+def test21c_python_base_through_unbound_link(t):
     # ChainThroughUnbound : MidToBase(unbound) : Base(bound). The in-set ancestor
     # is wired as the real Python base across the unbound link, whose own members
     # flatten onto the derived class.
@@ -221,8 +196,7 @@ def test21c_python_base_through_unbound_link():
     assert not hasattr(t, 'MidToBase')
 
 
-@needs_reflect
-def test22_multiple_bases_flattened():
+def test22_multiple_bases_flattened(t):
     # MultiDerived : MixinA, MixinB -> MixinA is the real nanobind base, and
     # MixinB's members are flattened directly onto MultiDerived.
     md = t.MultiDerived()
@@ -244,8 +218,7 @@ def test22_multiple_bases_flattened():
     assert t.MixinB().from_b() == 0
 
 
-@needs_reflect
-def test23_secondary_subtree_flattened():
+def test23_secondary_subtree_flattened(t):
     # Combo : PrimaryX, Mid; Mid : SecBase. PrimaryX is the real base; Mid AND
     # its base SecBase are flattened onto Combo.
     c = t.Combo()
@@ -260,8 +233,7 @@ def test23_secondary_subtree_flattened():
     assert not issubclass(t.Combo, t.SecBase)
 
 
-@needs_reflect
-def test24_diamond_no_double_bind():
+def test24_diamond_no_double_bind(t):
     # Dia : DiaL, DiaR; both DiaL and DiaR : DiaTop. DiaTop is reached through the
     # primary chain (DiaL), so it is a real ancestor and is not flattened twice.
     d = t.Dia()
@@ -276,8 +248,7 @@ def test24_diamond_no_double_bind():
     assert not issubclass(t.Dia, t.DiaR)
 
 
-@needs_reflect
-def test28_annotation_skip_rename_doc():
+def test28_annotation_skip_rename_doc(t):
     # skip: class, method, data member, and free function are absent.
     assert not hasattr(t, 'HiddenClass')
     assert not hasattr(t, 'hidden_free')
@@ -296,8 +267,7 @@ def test28_annotation_skip_rename_doc():
     assert 'documented method' in t.Annotated.documented.__doc__
 
 
-@needs_reflect
-def test29_annotation_lifetime():
+def test29_annotation_lifetime(t):
     # reference_internal: repeated access returns the SAME Python object (proof the
     # return-value policy was applied; a default ref return would copy).
     h = t.Holder()
@@ -312,8 +282,7 @@ def test29_annotation_lifetime():
     assert x.total == 1
 
 
-@needs_reflect
-def test27_operators():
+def test27_operators(t):
     a = t.Ops(2)
     b = t.Ops(3)
     assert (a + b).x == 5          # __add__
@@ -333,8 +302,7 @@ def test27_operators():
     assert a.__add__("nope") is NotImplemented
 
 
-@needs_reflect
-def test27b_widest_int_conversion():
+def test27b_widest_int_conversion(t):
     # Multiple integral conversion operators: only the widest (long long) binds
     # __int__. 5e9 exceeds int32, so the previously-last-bound `operator int`
     # would have truncated it.
@@ -344,8 +312,7 @@ def test27b_widest_int_conversion():
     assert bool(m) and not bool(t.ManyConv(0))  # __bool__ unaffected
 
 
-@needs_reflect
-def test27c_move_only_by_value_param_skipped():
+def test27c_move_only_by_value_param_skipped(t):
     # An overload taking a move-only class type BY VALUE is skipped (the class
     # caster cannot produce it); sibling overloads and the class still bind.
     s = t.Sink()
@@ -355,8 +322,7 @@ def test27c_move_only_by_value_param_skipped():
         s.put(t.MoveOnlyBuf())   # only the int overload exists
 
 
-@needs_reflect
-def test27d_abstract_class_no_ctor():
+def test27d_abstract_class_no_ctor(t):
     # An abstract class binds (so derived classes get a real Python base) but gets
     # NO constructor (BINDER-0011): instantiating it from Python raises TypeError.
     # Its skipped unique_ptr methods must not have demanded the unique_ptr caster
@@ -370,8 +336,7 @@ def test27d_abstract_class_no_ctor():
     assert not hasattr(t.AbstractIface, "hidden")
 
 
-@needs_reflect
-def test26_function_qualifiers():
+def test26_function_qualifiers(t):
     q = t.Quals()
     # noexcept / const noexcept / lvalue-ref-qualified methods are bound.
     assert q.plain(1) == 2
@@ -388,8 +353,7 @@ def test26_function_qualifiers():
     assert not hasattr(q, 'va')
 
 
-@needs_reflect
-def test25_virtual_override_from_python():
+def test25_virtual_override_from_python(t):
     # A Python subclass overrides a C++ virtual; C++ code calling through a base
     # reference must dispatch into the Python override (this is what the
     # trampoline provides).
@@ -405,8 +369,7 @@ def test25_virtual_override_from_python():
     assert t.call_kind(s) == 'shape'         # C++ -> C++ base fallback
 
 
-@needs_reflect
-def test30_keyword_arguments():
+def test30_keyword_arguments(t):
     # Parameter names from C++ (P3096 reflection) become Python keyword args.
     k = t.Kw()
 
@@ -434,15 +397,13 @@ def test30_keyword_arguments():
         k.add(a=2, c=3)
 
 
-@needs_reflect
-def test31_class_enum_docstrings():
+def test31_class_enum_docstrings(t):
     # A [[=r::doc{...}]] annotation on a class or enum sets its Python __doc__.
     assert t.DocClass.__doc__ == "A documented class."
     assert t.DocEnum.__doc__ == "A documented enum."
 
 
-@needs_reflect
-def test32_free_operators():
+def test32_free_operators(t):
     a = t.Vec(1.0, 2.0)
     b = t.Vec(3.0, 4.0)
 
@@ -470,8 +431,7 @@ def test32_free_operators():
     assert w.x == 2.0 and w.y == 1.0
 
 
-@needs_reflect
-def test32b_array_member_skipped():
+def test32b_array_member_skipped(t):
     # BINDER-0006: a C-array data member has no def_rw-able form, so it is skipped while
     # ordinary scalar members still bind.
     w = t.WithArray()
@@ -480,8 +440,7 @@ def test32b_array_member_skipped():
     assert not hasattr(w, 'arr')
 
 
-@needs_reflect
-def test32c_stream_operator_to_str():
+def test32c_stream_operator_to_str(t):
     # BINDER-0007: a free operator<<(ostream&, T) is surfaced as Python __str__ (formatted via
     # std::ostringstream), NOT bound as a dunder; a genuine operator<<(T, int) shift still maps
     # to __lshift__.
@@ -492,8 +451,7 @@ def test32c_stream_operator_to_str():
     assert not hasattr(s, '__rlshift__')
 
 
-@needs_reflect
-def test34_properties():
+def test34_properties(t):
     th = t.Thermo()
 
     # Read-write property: get + set go through the C++ accessor pair.
@@ -515,8 +473,7 @@ def test34_properties():
     assert isinstance(type(th).fahrenheit, property)
 
 
-@needs_reflect
-def test35_template_specializations():
+def test35_template_specializations(t):
     # Each instantiation is a distinct Python class, CamelCase-named.
     for name in ("BoxInt", "BoxDouble", "BoxFloat", "BoxBoxInt", "WrapInt",
                  "PairIntDouble", "ArrayInt3", "UsesBoxes"):
@@ -534,8 +491,7 @@ def test35_template_specializations():
     assert t.BoxFloat().get() == 0.0
 
 
-@needs_reflect
-def test37_member_function_templates():
+def test37_member_function_templates(t):
     # All-defaulted member function templates bind via their default
     # instantiation, under the TEMPLATE's name (the heterogeneous-lookup shape).
     h = t.HetMap()
@@ -551,8 +507,7 @@ def test37_member_function_templates():
         assert not hasattr(t.HetMap, absent), absent
 
 
-@needs_reflect
-def test38_private_base_using_reexports():
+def test38_private_base_using_reexports(t):
     # Members declared in a PRIVATE base and re-exported with using-declarations
     # bind as entity proxies through the derived class (BINDER-0009); the base
     # itself is neither bound nor flattened.
@@ -564,8 +519,7 @@ def test38_private_base_using_reexports():
     assert not hasattr(t, 'ProxyImpl')
 
 
-@needs_reflect
-def test36b_policy_args_not_bound():
+def test36b_policy_args_not_bound(t):
     # Cont<int, Pol<int>> is signature-reachable and bound; Pol<int> appears only
     # as its template argument (a "policy") and is not -- mirroring hash-map
     # Hash/Eq/Alloc/Policy args.
@@ -574,8 +528,7 @@ def test36b_policy_args_not_bound():
     assert not hasattr(t, 'PolInt')
 
 
-@needs_reflect
-def test36_template_nested_and_multi_arg():
+def test36_template_nested_and_multi_arg(t):
     # Nested type arg: Box<Box<int>> -> BoxBoxInt, holding a BoxInt value.
     bb = t.BoxBoxInt()
     inner = t.BoxInt(9)
@@ -589,8 +542,7 @@ def test36_template_nested_and_multi_arg():
     assert a.size() == 3
 
 
-@needs_reflect
-def test37_template_auto_discovery():
+def test37_template_auto_discovery(t):
     # UsesBoxes references the specializations only via its signatures; they are
     # bound automatically (none were listed in reflect_<...>).
     u = t.UsesBoxes()
@@ -605,8 +557,7 @@ def test37_template_auto_discovery():
     assert u.wrapped.inner.get() == 1
 
 
-@needs_reflect
-def test38_function_template_specialization():
+def test38_function_template_specialization(t):
     # A free-function-template specialization bound by explicit listing. Python name
     # is CamelCase (identity<int> -> identityInt); function templates cannot be bound,
     # only their instantiations, and only when listed explicitly.
@@ -614,8 +565,7 @@ def test38_function_template_specialization():
     assert t.identityInt(42) == 42
 
 
-@needs_reflect
-def test39_deleted_functions_not_bound():
+def test39_deleted_functions_not_bound(t):
     # Deleted functions are public, enumerable declarations; none may bind
     # (BINDER-0012). The module compiling at all is the primary regression --
     # pre-fix, each deleted fixture member was a TU-wide hard error.
@@ -641,8 +591,7 @@ def test39_deleted_functions_not_bound():
     assert t.OnlyDeletedCtors.probe() == 7
 
 
-@needs_reflect
-def test40_copy_construction():
+def test40_copy_construction(t):
     # A publicly copy-constructible class binds init<const T&>: Python can copy
     # a bound instance (BINDER-0013, found via tl::expected's copy-ctor
     # differential). The copy is a distinct object with the same state.
@@ -652,8 +601,7 @@ def test40_copy_construction():
     assert c.dbl() == 42
 
 
-@needs_reflect
-def test41_exclude_marker():
+def test41_exclude_marker(t):
     # nb::exclude_<...> call-site exclusions (the out-of-line [[=r::skip]] for
     # code you do not own; what makes expression-template libraries bindable).
     # The clean surface binds normally.
@@ -674,8 +622,7 @@ def test41_exclude_marker():
     assert not hasattr(t.XVec, "from_base")
 
 
-@needs_reflect
-def test42_unbindable_shapes_skip():
+def test42_unbindable_shapes_skip(t):
     # BINDER-0015 + BINDER-0019: ptr-to-ptr, T*& out-params, function-pointer
     # params, and pointers to incomplete plain classes skip gracefully (each
     # used to be a TU-wide hard compile error). The clean surface still binds.
@@ -685,8 +632,7 @@ def test42_unbindable_shapes_skip():
         assert not hasattr(t.Gadget, absent), absent
 
 
-@needs_reflect
-def test43_raw_pointer_return_borrows():
+def test43_raw_pointer_return_borrows(t):
     # BINDER-0017: a bare class-pointer return is BORROWED by default. Under the
     # old automatic/take_ownership default, collecting `it` (or the discarded
     # add() return) double-freed and aborted the process (CLI11's field shape).
@@ -710,8 +656,7 @@ def test43_raw_pointer_return_borrows():
     assert t.Registry.shared_item().get() == 99
 
 
-@needs_reflect
-def test44_anonymous_typedef_names():
+def test44_anonymous_typedef_names(t):
     # BINDER-0018: `typedef struct {...} point_t;` binds under the typedef name
     # for linkage (the identifier_of route is ill-formed on the anonymous record).
     p = t.point_t()
@@ -722,8 +667,7 @@ def test44_anonymous_typedef_names():
     assert t.color_t.ANON_GREEN.value == 2
 
 
-@needs_reflect
-def test46_unbindable_cv_void_ptr():
+def test46_unbindable_cv_void_ptr(t):
     # BINDER-0023: a cv-qualified void* return (SQLiteCpp's getBlob) skips
     # gracefully instead of hard-erroring in the void* caster.
     g = t.Gadget()
@@ -731,8 +675,7 @@ def test46_unbindable_cv_void_ptr():
     assert not hasattr(t.Gadget, "blob")
 
 
-@needs_reflect
-def test47_enum_name_collision_qualifies():
+def test47_enum_name_collision_qualifies(t):
     # BINDER-0022: same-named enums in sibling namespaces no longer clobber one
     # module attribute; the second binds parent-qualified. Bind order follows
     # the reflect_ pack (collide_a first).
@@ -741,8 +684,7 @@ def test47_enum_name_collision_qualifies():
     assert t.shade is not t.collide_b_shade
 
 
-@needs_reflect
-def test48_static_shadowed_by_instance_method():
+def test48_static_shadowed_by_instance_method(t):
     # BINDER-0024: a static method shadowed by a same-named instance method is
     # skipped (binding both under one name aborted nanobind at import -- this
     # module importing at all is most of the test).
@@ -753,8 +695,7 @@ def test48_static_shadowed_by_instance_method():
         t.Conn.info(5)                # the static overload is gone
 
 
-@needs_reflect
-def test49_namespace_alias_not_followed():
+def test49_namespace_alias_not_followed(t):
     # BINDER-0028: a namespace-alias member of a reflected namespace is a
     # shorthand, not contents -- the walk must not pull the aliased namespace
     # into the bind set (a fixture's `namespace sd = simdjson;` bound the world).
@@ -762,8 +703,7 @@ def test49_namespace_alias_not_followed():
     assert not hasattr(t, "LeakedInner")
 
 
-@needs_reflect
-def test50_lvalue_ref_return_borrows():
+def test50_lvalue_ref_return_borrows(t):
     # BINDER-0025: a T& class return binds reference_internal (a live view),
     # not automatic (= COPY, which aborts for non-copyable T and silently
     # detaches for copyable T).
@@ -774,8 +714,7 @@ def test50_lvalue_ref_return_borrows():
     assert h.edit().get() == 41       # mutation visible through the holder
 
 
-@needs_reflect
-def test51_ctor_parens_no_initializer_list_hijack():
+def test51_ctor_parens_no_initializer_list_hijack(t):
     # BINDER-0026: reflected ctors construct with parens; the (size_t, int)
     # fill ctor must run as a fill, not brace-hijack to initializer_list.
     f = t.FillVec(3, 9)
@@ -783,8 +722,7 @@ def test51_ctor_parens_no_initializer_list_hijack():
     assert f.sum() == 27
 
 
-@needs_reflect
-def test45_static_const_by_value():
+def test45_static_const_by_value(t):
     # BINDER-0020: constant-readable static const members bind by VALUE (no
     # ODR-use). In-class-initialized statics with no out-of-line definition
     # used to fail at link.
