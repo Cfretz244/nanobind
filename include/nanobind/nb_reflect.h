@@ -240,6 +240,17 @@ template <std::meta::info R>
 consteval bool is_property_accessor() {
     return prop_name<R>() != nullptr;
 }
+// Value-form presence check (reading the NAME needs the NTTP form above, which
+// splices the annotation constant; presence only needs template matching).
+consteval bool is_property_accessor(std::meta::info fn) {
+    for (auto ann : std::meta::annotations_of(fn)) {
+        auto t = std::meta::type_of(ann);
+        if (std::meta::has_template_arguments(t)
+            && std::meta::template_of(t) == ^^reflect::property)
+            return true;
+    }
+    return false;
+}
 // A property accessor taking no parameters is the getter (the 1-parameter one is the
 // setter); a read-only property annotates only the getter. (Kept in consteval helpers
 // so parameters_of()'s vector is consumed within one constant evaluation -- an inline
@@ -985,6 +996,42 @@ consteval bool is_inplace_operator(std::meta::operators op) {
     }
 }
 
+/// How a free unary/binary operator attaches to class `cls` (a shared
+/// classifier, see data_member_route's section note). The forward dunder binds
+/// when cls is the LEFT operand (or the sole operand of a unary); the reversed
+/// dunder when cls is the RIGHT operand of a binary whose operand types differ
+/// (the symmetric same-type case is already covered by the forward binding) --
+/// that is what makes `2.0 * vec` work when only the right operand is a bound
+/// type. nullptr fields mean "no binding on that side".
+struct free_op_plan {
+    const char* fwd_dunder;
+    const char* rev_dunder;
+    bool inplace;
+};
+consteval free_op_plan plan_free_operator(std::meta::info cls,
+                                          std::meta::info fn) {
+    free_op_plan plan{nullptr, nullptr, false};
+    auto op = std::meta::operator_of(fn);
+    plan.inplace = is_inplace_operator(op);
+    auto params = std::meta::parameters_of(fn);
+    auto operand = [](std::meta::info p) {
+        return std::meta::dealias(
+            std::meta::remove_cvref(std::meta::type_of(p)));
+    };
+    auto self = std::meta::dealias(cls);
+    if (params.size() == 1) {
+        if (std::meta::is_same_type(operand(params[0]), self))
+            plan.fwd_dunder = operator_dunder(op, 0);
+    } else if (params.size() == 2) {
+        auto a = operand(params[0]), b = operand(params[1]);
+        if (std::meta::is_same_type(a, self))
+            plan.fwd_dunder = operator_dunder(op, 1);
+        if (std::meta::is_same_type(b, self) && !std::meta::is_same_type(a, b))
+            plan.rev_dunder = operator_reversed_dunder(op);
+    }
+    return plan;
+}
+
 template <typename T, std::meta::info fn>
 void reflect_bind_operator(auto& cls) {
     constexpr auto op = std::meta::operator_of(fn);
@@ -1048,23 +1095,35 @@ consteval std::meta::info widest_integral_conversion() {
     return widest_integral_conversion(^^T);
 }
 
+/// The dunder a conversion operator binds as, or nullptr (skip). bool ->
+/// __bool__; the WIDEST integral conversion -> __int__ (the others have no
+/// Python equivalent, see widest_integral_conversion); floating -> __float__.
+consteval const char* conversion_dunder(std::meta::info cls, std::meta::info fn) {
+    auto R = std::meta::return_type_of(fn);
+    if (std::meta::is_same_type(R, ^^bool))
+        return "__bool__";
+    if (std::meta::is_integral_type(R))
+        return fn == widest_integral_conversion(cls) ? "__int__" : nullptr;
+    if (std::meta::is_floating_point_type(R))
+        return "__float__";
+    return nullptr;  // no standard numeric dunder
+}
+
 template <typename T, std::meta::info fn>
 void reflect_bind_conversion(auto& cls) {
     // Use fixed concrete lambda return types (bool/long long/double) and cast the
     // conversion result: a spliced type in a lambda signature crashes the
     // clang-p2996 mangler.
-    constexpr auto R = std::meta::return_type_of(fn);
-    if constexpr (std::meta::is_same_type(R, ^^bool))
-        cls.def("__bool__", [](T& self) -> bool { return (bool) self.[:fn:](); });
-    else if constexpr (std::meta::is_integral_type(R)) {
-        // Only the widest integral conversion binds __int__ (see
-        // widest_integral_conversion); the others have no Python equivalent.
-        if constexpr (fn == widest_integral_conversion<T>())
-            cls.def("__int__", [](T& self) -> long long { return (long long) self.[:fn:](); });
+    constexpr const char* d = conversion_dunder(^^T, fn);
+    if constexpr (d != nullptr) {
+        constexpr auto R = std::meta::return_type_of(fn);
+        if constexpr (std::meta::is_same_type(R, ^^bool))
+            cls.def(d, [](T& self) -> bool { return (bool) self.[:fn:](); });
+        else if constexpr (std::meta::is_integral_type(R))
+            cls.def(d, [](T& self) -> long long { return (long long) self.[:fn:](); });
+        else
+            cls.def(d, [](T& self) -> double { return (double) self.[:fn:](); });
     }
-    else if constexpr (std::meta::is_floating_point_type(R))
-        cls.def("__float__", [](T& self) -> double { return (double) self.[:fn:](); });
-    // else: no standard numeric dunder -- skip.
 }
 
 // --- Call-site exclusions (nb::exclude_) ---
@@ -1317,31 +1376,20 @@ struct reflect_free_operator_binder;
     template <typename T, std::meta::info fn, typename Ret,                        \
               typename P0, typename P1>                                            \
     struct reflect_free_operator_binder<T, fn, Ret(P0, P1) QUALS> {                \
-        using A = std::remove_cvref_t<P0>;                                         \
-        using B = std::remove_cvref_t<P1>;                                         \
         static void bind(auto& cls) {                                              \
-            constexpr auto op = std::meta::operator_of(fn);                        \
-            /* Forward: this class is the LEFT operand. */                         \
-            if constexpr (std::is_same_v<T, A>) {                                  \
-                constexpr const char* d = operator_dunder(op, 1);                  \
-                if constexpr (d != nullptr) {                                      \
-                    if constexpr (is_inplace_operator(op))                         \
-                        cls.def(d, [](P0 a, P1 b) -> Ret {                         \
-                            return [:fn:](a, b); },                                \
-                            is_operator(), rv_policy::reference);                  \
-                    else                                                           \
-                        cls.def(d, [](P0 a, P1 b) -> Ret {                         \
-                            return [:fn:](a, b); }, is_operator());                \
-                }                                                                  \
-            }                                                                      \
-            /* Reversed: this class is the RIGHT operand (and not also the left, */\
-            /* which would be the symmetric same-type case already covered).     */\
-            if constexpr (std::is_same_v<T, B> && !std::is_same_v<A, B>) {         \
-                constexpr const char* rd = operator_reversed_dunder(op);           \
-                if constexpr (rd != nullptr)                                       \
-                    cls.def(rd, [](P1 b, P0 a) -> Ret {                            \
+            constexpr free_op_plan plan = plan_free_operator(^^T, fn);             \
+            if constexpr (plan.fwd_dunder != nullptr) {                            \
+                if constexpr (plan.inplace)                                        \
+                    cls.def(plan.fwd_dunder, [](P0 a, P1 b) -> Ret {               \
+                        return [:fn:](a, b); },                                    \
+                        is_operator(), rv_policy::reference);                      \
+                else                                                               \
+                    cls.def(plan.fwd_dunder, [](P0 a, P1 b) -> Ret {               \
                         return [:fn:](a, b); }, is_operator());                    \
             }                                                                      \
+            if constexpr (plan.rev_dunder != nullptr)                              \
+                cls.def(plan.rev_dunder, [](P1 b, P0 a) -> Ret {                   \
+                    return [:fn:](a, b); }, is_operator());                        \
         }                                                                          \
     };
 
@@ -1359,15 +1407,11 @@ NB_REFLECT_DEFINE_FREE_OP_BINDER(noexcept)
 #define NB_REFLECT_DEFINE_FREE_UNARY_OP_BINDER(QUALS)                               \
     template <typename T, std::meta::info fn, typename Ret, typename P0>           \
     struct reflect_free_operator_binder<T, fn, Ret(P0) QUALS> {                    \
-        using A = std::remove_cvref_t<P0>;                                         \
         static void bind(auto& cls) {                                              \
-            constexpr auto op = std::meta::operator_of(fn);                        \
-            if constexpr (std::is_same_v<T, A>) {                                  \
-                constexpr const char* d = operator_dunder(op, 0);                  \
-                if constexpr (d != nullptr)                                        \
-                    cls.def(d, [](P0 a) -> Ret { return [:fn:](a); },              \
-                            is_operator());                                        \
-            }                                                                      \
+            constexpr free_op_plan plan = plan_free_operator(^^T, fn);             \
+            if constexpr (plan.fwd_dunder != nullptr)                              \
+                cls.def(plan.fwd_dunder, [](P0 a) -> Ret { return [:fn:](a); },    \
+                        is_operator());                                            \
         }                                                                          \
     };
 
@@ -1534,178 +1578,230 @@ consteval bool instance_method_shadows(std::string_view name) {
     return instance_method_shadows(^^T, name);
 }
 
-// Route a public member function to the right binder. Operators and conversion
-// functions have no identifier, so they must be detected before reflect_bind_method
-// (which names the binding via identifier_of).
-template <typename T, std::meta::info fn>
-void reflect_bind_member_function(auto& cls) {
-    if constexpr (has_ann<fn, reflect::skip>())
-        return;  // explicitly excluded
-    else if constexpr (has_move_only_by_value_param(fn))
-        return;  // by-value move-only param: the class caster cannot produce it
-    else if constexpr (has_unbindable_signature(fn))
-        return;  // ptr-to-ptr / T*& out-param / function-pointer shape: no caster
-    else if constexpr (is_property_accessor<fn>())
-        return;  // getter/setter handled by the property pass, not as a method
-    else if constexpr (std::meta::is_operator_function(fn))
-        reflect_bind_operator<T, fn>(cls);
-    else if constexpr (std::meta::is_conversion_function(fn))
-        reflect_bind_conversion<T, fn>(cls);
-    else if constexpr (std::meta::is_static_member(fn)) {
+// Routing for a public, non-deleted, non-template member function of `cls`
+// (a shared classifier, see data_member_route's section note). Operators and
+// conversion functions have no identifier, so they are detected before the
+// method route (which names the binding via identifier_of).
+enum class member_fn_route { skip, oper, conversion, static_method, method };
+consteval member_fn_route classify_member_fn(std::meta::info cls,
+                                             std::meta::info fn) {
+    if (fn_skip_annotated(fn)                // explicitly excluded
+        || has_move_only_by_value_param(fn)  // class caster cannot produce it
+        || has_unbindable_signature(fn)      // ptr-to-ptr / T*& / fn-ptr shape
+        || is_property_accessor(fn))         // handled by the property pass
+        return member_fn_route::skip;
+    if (std::meta::is_operator_function(fn))
+        return member_fn_route::oper;
+    if (std::meta::is_conversion_function(fn))
+        return member_fn_route::conversion;
+    if (std::meta::is_static_member(fn)) {
         // A static shadowed by a same-named instance method is skipped
-        // (nanobind aborts at import binding both under one name).
-        if constexpr (!std::meta::has_identifier(fn)
-                      || !instance_method_shadows<T>(std::meta::identifier_of(fn)))
-            reflect_bind_static_method<fn>(cls);
+        // (nanobind aborts at import binding both under one name, BINDER-0024).
+        if (!std::meta::has_identifier(fn)
+            || instance_method_shadows(cls, std::meta::identifier_of(fn)))
+            return member_fn_route::skip;
+        return member_fn_route::static_method;
     }
-    else if constexpr (std::meta::has_identifier(fn))
-        reflect_bind_method<T, fn>(cls);
-    // else: nameless and non-operator (e.g. a literal operator) -- skip.
+    if (std::meta::has_identifier(fn))
+        return member_fn_route::method;
+    return member_fn_route::skip;  // nameless non-operator (e.g. literal operator)
 }
 
-// Bind a member function TEMPLATE whose default instantiation exists (see
-// fn_template_default_instantiable): substitute with zero explicit arguments and
-// route the resulting specialization through the ordinary binders. The Python
+template <typename T, std::meta::info fn>
+void reflect_bind_member_function(auto& cls) {
+    constexpr member_fn_route route = classify_member_fn(^^T, fn);
+    if constexpr (route == member_fn_route::oper)
+        reflect_bind_operator<T, fn>(cls);
+    else if constexpr (route == member_fn_route::conversion)
+        reflect_bind_conversion<T, fn>(cls);
+    else if constexpr (route == member_fn_route::static_method)
+        reflect_bind_static_method<fn>(cls);
+    else if constexpr (route == member_fn_route::method)
+        reflect_bind_method<T, fn>(cls);
+}
+
+/// The template's default instantiation -- the only thing the binder binds for
+/// a member function template. It is substituted right here, two-plus
+/// dependent levels deep: that shape used to require hoisting the substitute()
+/// to the dispatch loop and passing the spec down as an NTTP, because
+/// reflections of same-named function templates (raw_hash_map's operator[] /
+/// its SFINAE-false pack sibling) mangled identically as template arguments
+/// and the two dispatch instantiations were silently FOLDED into one body at
+/// codegen (TC-0004 -- fixed in the toolchain mangler; regression-covered by
+/// HetMap's pack-sibling operator[] and by
+/// libcxx/test/.../substitute-nested-dependent.pass.cpp).
+consteval std::meta::info default_spec(std::meta::info tmpl) {
+    return std::meta::substitute(tmpl, std::vector<std::meta::info>{});
+}
+
+/// Routing for a public member function TEMPLATE (a shared classifier, see
+/// data_member_route's section note). Every spec-level gate folds in here:
+/// is_deleted / the skip annotation must be asked of the substituted SPEC --
+/// on a Template reflection they silently answer false (BINDER-0012) -- and
+/// the qualifier-matrix filter (method_shape_bindable, the value twin of the
+/// binder-spec completeness gate) decides the instance-method route.
+enum class member_tmpl_route { skip, oper, static_method, method };
+consteval member_tmpl_route classify_member_template(std::meta::info cls,
+                                                     std::meta::info tmpl) {
+    if (!fn_template_default_instantiable(tmpl))
+        return member_tmpl_route::skip;
+    auto spec = default_spec(tmpl);
+    if (fn_skip_annotated(spec) || std::meta::is_deleted(spec)
+        || has_move_only_by_value_param(spec)
+        || has_unbindable_signature(spec))
+        return member_tmpl_route::skip;
+    if (std::meta::is_operator_function(spec))
+        return member_tmpl_route::oper;
+    if (!std::meta::has_identifier(tmpl)
+        || std::meta::has_ellipsis_parameter(spec))
+        return member_tmpl_route::skip;
+    if (std::meta::is_static_member(spec)) {
+        if (instance_method_shadows(cls, std::meta::identifier_of(tmpl)))
+            return member_tmpl_route::skip;
+        return member_tmpl_route::static_method;
+    }
+    return method_shape_bindable(spec) ? member_tmpl_route::method
+                                       : member_tmpl_route::skip;
+}
+
+// Bind a member function template via its default instantiation. The Python
 // name is the TEMPLATE's identifier (`contains`, not `containsInt` -- the
 // defaulted argument is an implementation detail), so multiple such templates
-// and their non-template overloads stack as normal Python overloads. Operator
-// templates route to the dunder path; constructor and conversion templates are
-// handled by their own passes' guards (still unsupported).
-// The default instantiation is substituted right here, two-plus dependent
-// levels deep. That shape used to require hoisting the substitute() to the
-// dispatch loop and passing the spec down as an NTTP: reflections of
-// same-named function templates (raw_hash_map's operator[] / its SFINAE-false
-// pack sibling) mangled identically as template arguments, so the two dispatch
-// instantiations were silently FOLDED into one body at codegen and the
-// operator never bound (TC-0004 -- fixed in the toolchain mangler;
-// regression-covered by HetMap's pack-sibling operator[] here and by
-// libcxx/test/.../substitute-nested-dependent.pass.cpp). The supported-
-// qualifier gate stays expressed as "does a binder partial specialization
-// exist for this exact function type" (sizeof on the undefined primary is a
-// substitution failure), exactly as in reflect_bind_proxy: one gate for every
-// shape the binder matrix does not model, no duplicated qualifier logic.
+// and their non-template overloads stack as normal Python overloads.
 template <typename T, std::meta::info tmpl>
 void reflect_bind_member_template(auto& cls) {
-    if constexpr (fn_template_default_instantiable(tmpl)) {
-        constexpr auto spec =
-            std::meta::substitute(tmpl, std::vector<std::meta::info>{});
-        // is_deleted must be asked of the substituted SPEC: on a Template
-        // reflection it silently answers false (BINDER-0012).
-        if constexpr (std::meta::is_operator_function(spec)) {
-            if constexpr (!has_ann<spec, reflect::skip>()
-                          && !std::meta::is_deleted(spec)
-                          && !has_move_only_by_value_param(spec)
-                          && !has_unbindable_signature(spec))
-                reflect_bind_operator<T, spec>(cls);
-        } else if constexpr (std::meta::has_identifier(tmpl)) {
-            if constexpr (!has_ann<spec, reflect::skip>()
-                          && !std::meta::is_deleted(spec)
-                          && !has_move_only_by_value_param(spec)
-                          && !has_unbindable_signature(spec)
-                          && !std::meta::has_ellipsis_parameter(spec)) {
-                using FnType = [:std::meta::type_of(spec):];
-                constexpr const char* nm = std::define_static_string(
-                    std::meta::identifier_of(tmpl));
-                if constexpr (std::meta::is_static_member(spec)) {
-                    if constexpr (requires {
-                            sizeof(reflect_static_method_binder<spec, FnType>); }
-                        && !instance_method_shadows<T>(
-                               std::meta::identifier_of(tmpl))) {
-                        with_arg_call_extras<spec>([&](auto&&... e) {
-                            reflect_static_method_binder<spec, FnType>::bind(
-                                cls, nm, std::forward<decltype(e)>(e)...);
-                        });
-                    }
-                } else if constexpr (requires {
-                        sizeof(reflect_method_binder<T, spec, FnType>); }) {
-                    with_arg_call_extras<spec>([&](auto&&... e) {
-                        reflect_method_binder<T, spec, FnType>::bind(
-                            cls, nm, std::forward<decltype(e)>(e)...);
-                    });
-                }
-            }
+    constexpr member_tmpl_route route = classify_member_template(^^T, tmpl);
+    if constexpr (route == member_tmpl_route::oper) {
+        reflect_bind_operator<T, default_spec(tmpl)>(cls);
+    } else if constexpr (route != member_tmpl_route::skip) {
+        constexpr auto spec = default_spec(tmpl);
+        using FnType = [:std::meta::type_of(spec):];
+        constexpr const char* nm = std::define_static_string(
+            std::meta::identifier_of(tmpl));
+        if constexpr (route == member_tmpl_route::static_method) {
+            with_arg_call_extras<spec>([&](auto&&... e) {
+                reflect_static_method_binder<spec, FnType>::bind(
+                    cls, nm, std::forward<decltype(e)>(e)...);
+            });
+        } else {
+            with_arg_call_extras<spec>([&](auto&&... e) {
+                reflect_method_binder<T, spec, FnType>::bind(
+                    cls, nm, std::forward<decltype(e)>(e)...);
+            });
         }
     }
 }
 
-// True if the entity a proxy re-exports is declared in T's PUBLIC base subtree.
+// True if the entity a proxy re-exports is declared in cls's PUBLIC base subtree.
 // Such re-exports are already exposed by the flattening pass (or the real Python
 // base); binding the proxy too would create duplicate overloads.
-template <typename T>
-consteval bool proxy_flatten_covered(std::meta::info proxy) {
+consteval bool proxy_flatten_covered(std::meta::info cls, std::meta::info proxy) {
     auto owner = std::meta::parent_of(proxy_underlying(proxy));
     std::vector<std::meta::info> bases;
-    collect_public_base_subtree(^^T, bases);
+    collect_public_base_subtree(cls, bases);
     return info_vec_contains(bases, owner);
 }
 
-// Bind a using-redeclaration (entity proxy; see is_using_proxy). Only proxies
-// the flattening pass does NOT cover bind here -- i.e. re-exports from private/
-// protected bases, which are exactly the ones nothing else can reach. The
-// method lambda calls THROUGH the proxy (a public member of T, so the
-// inaccessible-base path is never formed); the function type and parameter
-// names come from the underlying function. Unsupported and skipped: proxies of
-// member function TEMPLATES in inaccessible bases (the substituted spec is the
-// base's member -- calling it through T would form the inaccessible path) and
-// of DATA members (a pointer-to-member of an inaccessible base is unusable).
+/// Routing for a public using-redeclaration (entity proxy; see is_using_proxy)
+/// -- a shared classifier, see data_member_route's section note. Only proxies
+/// the flattening pass does NOT cover bind -- i.e. re-exports from private/
+/// protected bases, exactly the ones nothing else can reach. is_deleted must
+/// be asked of the UNDERLYING function: on the proxy itself it silently
+/// answers false (BINDER-0012). Unsupported and skipped: proxies of member
+/// function TEMPLATES in inaccessible bases (the substituted spec is the
+/// base's member -- calling it through the derived class would form the
+/// inaccessible path) and of DATA members (a pointer-to-member of an
+/// inaccessible base is unusable). method_shape_bindable on the underlying is
+/// the value twin of the binder-spec completeness gate.
+enum class proxy_route { skip, oper, static_method, method };
+consteval proxy_route classify_proxy(std::meta::info cls, std::meta::info proxy) {
+    if (proxy_flatten_covered(cls, proxy))
+        return proxy_route::skip;
+    auto u = proxy_underlying(proxy);
+    if (!std::meta::is_function(u)
+        || std::meta::is_deleted(u)
+        || std::meta::is_constructor(u)
+        || std::meta::is_destructor(u)
+        || std::meta::is_special_member_function(u)
+        || std::meta::has_ellipsis_parameter(u)
+        || has_move_only_by_value_param(u)
+        || has_unbindable_signature(u))
+        return proxy_route::skip;
+    if (std::meta::is_operator_function(u))
+        return method_shape_bindable(u) ? proxy_route::oper : proxy_route::skip;
+    if (std::meta::is_static_member(u))
+        return proxy_route::static_method;
+    if (std::meta::has_identifier(u))
+        return method_shape_bindable(u) ? proxy_route::method : proxy_route::skip;
+    return proxy_route::skip;
+}
+
+// Bind a using-redeclaration (entity proxy); classify_proxy holds the routing
+// rationale. The method lambda calls THROUGH the proxy (a public member of T,
+// so the inaccessible-base path is never formed); the function type and
+// parameter names come from the underlying function. (Historical note: the
+// decl predicates also used to misreport qualifiers on [[clang::lifetimebound]]
+// accessors like StatusOr<T>'s value() -- AttributedType sugar blinded them;
+// fixed in the toolchain, TC-0005.)
 template <typename T, std::meta::info proxy>
 void reflect_bind_proxy(auto& cls) {
-    if constexpr (proxy_flatten_covered<T>(proxy))
-        return;
-    else {
+    constexpr proxy_route route = classify_proxy(^^T, proxy);
+    if constexpr (route != proxy_route::skip) {
         constexpr auto u = proxy_underlying(proxy);
-        // is_deleted must be asked of the UNDERLYING function: on the proxy
-        // itself it silently answers false (BINDER-0012).
-        if constexpr (std::meta::is_function(u)
-                      && !std::meta::is_deleted(u)
-                      && !std::meta::is_constructor(u)
-                      && !std::meta::is_destructor(u)
-                      && !std::meta::is_special_member_function(u)
-                      && !std::meta::has_ellipsis_parameter(u)
-                      && !has_move_only_by_value_param(u)
-                      && !has_unbindable_signature(u)) {
-            // The supported-qualifier gate is "does a binder partial
-            // specialization exist for this exact function type" (sizeof on
-            // the undefined primary is a substitution failure for
-            // volatile/&&/unmatched), same as every other binding path.
-            // (Historical note: the decl predicates also used to misreport
-            // qualifiers on [[clang::lifetimebound]] accessors like
-            // StatusOr<T>'s value() -- AttributedType sugar blinded them;
-            // fixed in the toolchain, TC-0005.)
-            using FnType = [:std::meta::type_of(u):];
-            if constexpr (std::meta::is_operator_function(u)) {
-                if constexpr (requires {
-                        sizeof(reflect_method_binder<T, proxy, FnType>); }) {
-                    constexpr auto op = std::meta::operator_of(u);
-                    constexpr const char* d =
-                        operator_dunder(op, std::meta::parameters_of(u).size());
-                    if constexpr (d != nullptr)
-                        reflect_method_binder<T, proxy, FnType>::bind(
-                            cls, d, is_operator());
-                }
-            } else if constexpr (std::meta::is_static_member(u)) {
-                // A static member of the (public-in-itself) base is callable
-                // via the underlying entity directly.
-                if constexpr (requires {
-                        sizeof(reflect_static_method_binder<u, FnType>); }) {
-                    with_arg_call_extras<u>([&](auto&&... e) {
-                        reflect_static_method_binder<u, FnType>::bind(
-                            cls, entity_name<u>(),
-                            std::forward<decltype(e)>(e)...);
-                    });
-                }
-            } else if constexpr (std::meta::has_identifier(u)) {
-                if constexpr (requires {
-                        sizeof(reflect_method_binder<T, proxy, FnType>); }) {
-                    with_arg_call_extras<u>([&](auto&&... e) {
-                        reflect_method_binder<T, proxy, FnType>::bind(
-                            cls, entity_name<u>(),
-                            std::forward<decltype(e)>(e)...);
-                    });
-                }
-            }
+        using FnType = [:std::meta::type_of(u):];
+        if constexpr (route == proxy_route::oper) {
+            constexpr const char* d = operator_dunder(
+                std::meta::operator_of(u), std::meta::parameters_of(u).size());
+            if constexpr (d != nullptr)
+                reflect_method_binder<T, proxy, FnType>::bind(
+                    cls, d, is_operator());
+        } else if constexpr (route == proxy_route::static_method) {
+            // A static member of the (public-in-itself) base is callable via
+            // the underlying entity directly.
+            with_arg_call_extras<u>([&](auto&&... e) {
+                reflect_static_method_binder<u, FnType>::bind(
+                    cls, entity_name<u>(), std::forward<decltype(e)>(e)...);
+            });
+        } else {
+            with_arg_call_extras<u>([&](auto&&... e) {
+                reflect_method_binder<T, proxy, FnType>::bind(
+                    cls, entity_name<u>(), std::forward<decltype(e)>(e)...);
+            });
         }
     }
+}
+
+/// Kind-routing for one members_of entry of a class walk (a shared classifier,
+/// see data_member_route's section note); used identically by the direct-member
+/// pass (bind_class_contents) and the base-flattening pass. fn: a public,
+/// non-deleted, non-template, non-special member function (operators and
+/// conversions included; reflect_bind_member_function / classify_member_fn
+/// route further). tmpl: a public member function template (binds via its
+/// default instantiation when one exists). proxy: a public using-redeclaration.
+/// Each kind is gated against the pack's nb::exclude_ set.
+enum class class_member_kind { skip, fn, tmpl, proxy };
+consteval class_member_kind classify_class_member(
+        std::meta::info fn, std::span<const std::meta::info> ex) {
+    if (std::meta::is_function(fn)
+        && std::meta::is_public(fn)
+        && !std::meta::is_deleted(fn)
+        && !std::meta::is_template(fn)
+        && !std::meta::is_constructor(fn)
+        && !std::meta::is_destructor(fn)
+        && !std::meta::is_special_member_function(fn))
+        return fn_mentions_excluded(fn, ex) ? class_member_kind::skip
+                                            : class_member_kind::fn;
+    if (std::meta::is_function_template(fn)
+        && std::meta::is_public(fn)
+        && !std::meta::is_constructor_template(fn)
+        && !std::meta::is_conversion_function_template(fn))
+        return member_template_mentions_excluded(fn, ex) ? class_member_kind::skip
+                                                         : class_member_kind::tmpl;
+    if (is_using_proxy(fn)
+        && std::meta::is_public(fn)
+        && !proxy_mentions_excluded(fn, ex))
+        return class_member_kind::proxy;
+    return class_member_kind::skip;
 }
 
 // Bind the constructors, data members, static data members, and methods declared
@@ -1754,48 +1850,33 @@ void bind_class_contents(auto& cls) {
     };
 
     // Bind methods (instance, static, operators, conversions). Property accessors are
-    // skipped here (see reflect_bind_member_function) and bound by the pass below.
-    // Member function templates bind via their default instantiation when every
-    // template parameter is defaulted (reflect_bind_member_template); others skip.
-    // Deleted functions are filtered on every path: public + enumerable, but calling
-    // one is a hard error (BINDER-0012).
+    // skipped here (see classify_member_fn) and bound by the pass below. Member
+    // function templates bind via their default instantiation when every template
+    // parameter is defaulted; others skip. Deleted functions are filtered on every
+    // path: public + enumerable, but calling one is a hard error (BINDER-0012).
     template for (constexpr auto fn :
         std::define_static_array(std::meta::members_of(
             ^^T, std::meta::access_context::unchecked()))) {
-        if constexpr (std::meta::is_function(fn)
-            && std::meta::is_public(fn)
-            && !std::meta::is_deleted(fn)
-            && !std::meta::is_template(fn)
-            && !std::meta::is_constructor(fn)
-            && !std::meta::is_destructor(fn)
-            && !std::meta::is_special_member_function(fn)) {
-            if constexpr (!fn_mentions_excluded(fn, excluded_v<Rs...>))
-                reflect_bind_member_function<T, fn>(cls);
-        } else if constexpr (std::meta::is_function_template(fn)
-            && std::meta::is_public(fn)
-            && !std::meta::is_constructor_template(fn)
-            && !std::meta::is_conversion_function_template(fn)) {
-            if constexpr (!member_template_mentions_excluded(fn, excluded_v<Rs...>))
-                reflect_bind_member_template<T, fn>(cls);
-        } else if constexpr (is_using_proxy(fn)) {
-            if constexpr (std::meta::is_public(fn)
-                && !proxy_mentions_excluded(fn, excluded_v<Rs...>))
-                reflect_bind_proxy<T, fn>(cls);
-        }
+        constexpr class_member_kind kind =
+            classify_class_member(fn, excluded_v<Rs...>);
+        if constexpr (kind == class_member_kind::fn)
+            reflect_bind_member_function<T, fn>(cls);
+        else if constexpr (kind == class_member_kind::tmpl)
+            reflect_bind_member_template<T, fn>(cls);
+        else if constexpr (kind == class_member_kind::proxy)
+            reflect_bind_proxy<T, fn>(cls);
     };
 
-    // Bind properties from [[=r::property{"name"}]] getter/setter pairs. The is_template
+    // Bind properties from [[=r::property{"name"}]] getter/setter pairs. The kind
     // guard must gate the is_property_getter<fn>() call itself: that helper queries
-    // annotations_of(fn), which is ill-formed on a template, so a templated member must be
-    // excluded *before* it is instantiated (a nested if constexpr, not an && short-circuit).
+    // annotations_of(fn), which is ill-formed on a template, so a templated member must
+    // be excluded *before* it is instantiated (a nested if constexpr, not an &&
+    // short-circuit).
     template for (constexpr auto fn :
         std::define_static_array(std::meta::members_of(
             ^^T, std::meta::access_context::unchecked()))) {
-        if constexpr (std::meta::is_function(fn)
-            && std::meta::is_public(fn)
-            && !std::meta::is_deleted(fn)
-            && !std::meta::is_template(fn)
-            && !fn_mentions_excluded(fn, excluded_v<Rs...>)) {
+        if constexpr (classify_class_member(fn, excluded_v<Rs...>)
+                      == class_member_kind::fn) {
             if constexpr (is_property_getter<fn>()) {
                 reflect_bind_property<T, fn>(cls);
             }
@@ -1827,35 +1908,23 @@ void flatten_base_members(auto& cls) {
         }
     };
 
+    // Same kind-routing as bind_class_contents. Member function templates with
+    // all-defaulted parameters bind via their default instantiation -- this is
+    // where flat_hash_map's heterogeneous contains/find/erase/operator[] live
+    // (declared on the flattened raw_hash_map/raw_hash_set ancestry). A proxy
+    // here is a using-redeclaration inside the flattened base re-exporting from
+    // ITS OWN inaccessible base.
     template for (constexpr auto fn :
         std::define_static_array(std::meta::members_of(
             Base, std::meta::access_context::unchecked()))) {
-        if constexpr (std::meta::is_function(fn)
-            && std::meta::is_public(fn)
-            && !std::meta::is_deleted(fn)
-            && !std::meta::is_template(fn)
-            && !std::meta::is_constructor(fn)
-            && !std::meta::is_destructor(fn)
-            && !std::meta::is_special_member_function(fn)) {
-            if constexpr (!fn_mentions_excluded(fn, excluded_v<Rs...>))
-                reflect_bind_member_function<T, fn>(cls);
-        } else if constexpr (std::meta::is_function_template(fn)
-            && std::meta::is_public(fn)
-            && !std::meta::is_constructor_template(fn)
-            && !std::meta::is_conversion_function_template(fn)) {
-            // Member function templates with all-defaulted parameters bind via
-            // their default instantiation -- this is where flat_hash_map's
-            // heterogeneous contains/find/erase/operator[] live (declared on the
-            // flattened raw_hash_map/raw_hash_set ancestry).
-            if constexpr (!member_template_mentions_excluded(fn, excluded_v<Rs...>))
-                reflect_bind_member_template<T, fn>(cls);
-        } else if constexpr (is_using_proxy(fn)) {
-            // A using-redeclaration inside the flattened base re-exporting from
-            // ITS OWN inaccessible base; same routing as on T itself.
-            if constexpr (std::meta::is_public(fn)
-                && !proxy_mentions_excluded(fn, excluded_v<Rs...>))
-                reflect_bind_proxy<T, fn>(cls);
-        }
+        constexpr class_member_kind kind =
+            classify_class_member(fn, excluded_v<Rs...>);
+        if constexpr (kind == class_member_kind::fn)
+            reflect_bind_member_function<T, fn>(cls);
+        else if constexpr (kind == class_member_kind::tmpl)
+            reflect_bind_member_template<T, fn>(cls);
+        else if constexpr (kind == class_member_kind::proxy)
+            reflect_bind_proxy<T, fn>(cls);
     };
 }
 
@@ -2706,6 +2775,41 @@ void reflect_enum(module_& m) {
 // `r` is the entity being dispatched; `Rs...` is the WHOLE reflect_ pack,
 // threaded through so reflect_class can consult the pack-wide bind set
 // (bind_set_v<Rs...>) when deciding Python-base wiring.
+/// Kind-routing for one member of a namespace walk (a shared classifier, see
+/// data_member_route's section note). Guard ORDER is load-bearing: templates
+/// and proxies are rejected before any annotation query (annotations_of is
+/// ill-formed on both). Templates are skipped because only their
+/// specializations bind (discovered by reflect_user_specs or passed
+/// explicitly); a namespace-scope using-declaration (`using std::string;`) is
+/// not a binding seed. cls requires a COMPLETE type: a forward-declared
+/// namespace member (`struct Opaque;` -- the pImpl idiom, BINDER-0019) cannot
+/// be bound, exactly like the discovery walks treat it. A namespace ALIAS
+/// member is a shorthand, not a declaration of contents -- following it binds
+/// the entire aliased namespace (a fixture's `namespace sd = simdjson;` pulled
+/// in the world, BINDER-0028).
+enum class ns_member_kind { skip, cls, enum_, free_fn, ns };
+consteval ns_member_kind classify_namespace_member(
+        std::meta::info mem, std::span<const std::meta::info> ex) {
+    if (std::meta::is_template(mem) || is_using_proxy(mem))
+        return ns_member_kind::skip;
+    if (fn_skip_annotated(mem) || is_excluded_entity(mem, ex))
+        return ns_member_kind::skip;
+    if (std::meta::is_type(mem)) {
+        if (std::meta::is_class_type(mem))
+            return std::meta::is_complete_type(mem) ? ns_member_kind::cls
+                                                    : ns_member_kind::skip;
+        if (std::meta::is_enum_type(mem))
+            return ns_member_kind::enum_;
+        return ns_member_kind::skip;
+    }
+    if (std::meta::is_function(mem))
+        return fn_mentions_excluded(mem, ex) ? ns_member_kind::skip
+                                             : ns_member_kind::free_fn;
+    if (std::meta::is_namespace(mem) && !std::meta::is_namespace_alias(mem))
+        return ns_member_kind::ns;
+    return ns_member_kind::skip;
+}
+
 template <std::meta::info r, std::meta::info... Rs>
 void reflect_dispatch(module_& m) {
     if constexpr (is_exclude_marker(r) || is_excluded_entity(r, excluded_v<Rs...>)) {
@@ -2714,41 +2818,16 @@ void reflect_dispatch(module_& m) {
     } else if constexpr (std::meta::is_namespace(r)) {
         template for (constexpr auto mem :
             std::define_static_array(namespace_members_for_binding(r))) {
-            if constexpr (std::meta::is_template(mem)) {
-                // A class/function template declaration: not bindable directly (only
-                // its specializations are). Skip it here -- the specializations used
-                // by the reflected set are discovered and bound by reflect_user_specs,
-                // and others can be passed explicitly. Guarded first because
-                // annotations_of (used by has_ann) is ill-formed on a template.
-            } else if constexpr (is_using_proxy(mem)) {
-                // A namespace-scope using-declaration (e.g. `using std::string;`),
-                // enumerated under -fentity-proxy-reflection. Not a binding seed;
-                // guarded before has_ann (annotations_of is ill-formed on a proxy).
-            } else if constexpr (has_ann<mem, reflect::skip>()) {
-                // explicitly excluded -- bind nothing
-            } else if constexpr (is_excluded_entity(mem, excluded_v<Rs...>)) {
-                // nb::exclude_-listed class/enum/namespace -- bind nothing
-            } else if constexpr (std::meta::is_type(mem)
-                && std::meta::is_class_type(mem)) {
-                // A forward-declared namespace member (`struct Opaque;` -- the
-                // pImpl idiom, BINDER-0019) cannot be bound; skip it like the
-                // discovery walks do.
-                if constexpr (std::meta::is_complete_type(mem))
-                    reflect_class<typename [:mem:], mem, Rs...>(m);
-            } else if constexpr (std::meta::is_type(mem)
-                && std::meta::is_enum_type(mem)) {
+            constexpr ns_member_kind kind =
+                classify_namespace_member(mem, excluded_v<Rs...>);
+            if constexpr (kind == ns_member_kind::cls)
+                reflect_class<typename [:mem:], mem, Rs...>(m);
+            else if constexpr (kind == ns_member_kind::enum_)
                 reflect_enum<typename [:mem:], mem>(m);
-            } else if constexpr (std::meta::is_function(mem)
-                && !std::meta::is_template(mem)) {
-                if constexpr (!fn_mentions_excluded(mem, excluded_v<Rs...>))
-                    reflect_free_function<mem>(m);
-            } else if constexpr (std::meta::is_namespace(mem)
-                && !std::meta::is_namespace_alias(mem)) {
-                // A namespace ALIAS member is a shorthand, not a declaration of
-                // contents -- following it binds the entire aliased namespace
-                // (a fixture's `namespace sd = simdjson;` pulled in the world).
+            else if constexpr (kind == ns_member_kind::free_fn)
+                reflect_free_function<mem>(m);
+            else if constexpr (kind == ns_member_kind::ns)
                 reflect_dispatch<mem, Rs...>(m);
-            }
         };
     } else if constexpr (std::meta::is_type(r)) {
         // Nest the type-kind checks under is_type: is_class_type/is_enum_type are
