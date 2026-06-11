@@ -32,6 +32,7 @@
 
 #include <meta>
 #include "nb_reflect.h"
+#include "nb_reflect_spell.h"
 #include <string>
 #include <string_view>
 #include <vector>
@@ -53,54 +54,9 @@ consteval std::string num(std::size_t n) {
     return s;
 }
 
-// Fully-qualified name of a named entity, e.g. "::ns::Inner::Foo".
-consteval std::string qualified_name_of(std::meta::info e) {
-    std::string result(std::meta::identifier_of(e));
-    auto p = std::meta::parent_of(e);
-    while (p != ^^::) {  // walk up to (but not including) the global namespace
-        result = std::string(std::meta::identifier_of(p)) + "::" + result;
-        p = std::meta::parent_of(p);
-    }
-    return "::" + result;
-}
-
-// A C++-identifier-safe mangling of a qualified name, for the trampoline struct
-// name (e.g. "::ns::Foo" -> "_ns_Foo"). Only ':' occurs in a plain qualified name.
-consteval std::string mangle(std::string_view qualified) {
-    std::string s;
-    for (char c : qualified)
-        s += (c == ':') ? '_' : c;
-    return s;
-}
-
-// A fully-qualified, compilable C++ spelling of a type -- including template
-// specializations, which qualified_name_of cannot handle (identifier_of is
-// ill-formed on a specialization). For a specialization, spell the template's
-// qualified name followed by its arguments (recursing into type args, rendering
-// value args); for a plain class/enum, qualified_name_of; for anything else
-// (fundamentals, pointers, ...), the display spelling. Unlike display_string_of on
-// the whole type, this keeps every class/template fully qualified, so the result
-// compiles from the generated trampoline namespace.
-consteval std::string type_spelling(std::meta::info t) {
-    if (std::meta::has_template_arguments(t)) {
-        std::string s = qualified_name_of(std::meta::template_of(t)) + "<";
-        bool first = true;
-        for (auto arg : std::meta::template_arguments_of(t)) {
-            if (!first)
-                s += ", ";
-            first = false;
-            if (std::meta::is_type(arg))
-                s += type_spelling(arg);
-            else
-                s += std::string(std::meta::display_string_of(arg));
-        }
-        s += ">";
-        return s;
-    }
-    if (std::meta::is_class_type(t) || std::meta::is_enum_type(t))
-        return qualified_name_of(t);
-    return std::string(std::meta::display_string_of(t));
-}
+// The fully-qualified, compilable type renderer lives in nb_reflect_spell.h
+// (detail::type_spelling), shared with the emit backend; unqualified
+// type_spelling calls below resolve to it through the enclosing namespace.
 
 // A signature key used to de-duplicate a virtual across a class hierarchy (so a
 // derived override shadows the base declaration).
