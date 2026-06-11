@@ -237,7 +237,13 @@ if (NB_REFLECT_FLAGS)
       COMMENT "Generating nanobind binding source via reflection (emit backend)")
   add_custom_target(test_reflect_emit_generate DEPENDS ${NB_REFLECT_EMIT_SRC})
 
-  nanobind_add_module(test_reflect_emit_ext ${NB_REFLECT_EMIT_SRC} ${NB_EXTRA_ARGS})
+  # NB_DOMAIN: the emit module binds the SAME C++ types as test_reflect_ext;
+  # in one interpreter they would share nanobind's type registry and the
+  # second import's idempotence guards would skip everything. A separate
+  # domain gives each backend its own registry, so the suite can compare them
+  # side by side.
+  nanobind_add_module(test_reflect_emit_ext NB_DOMAIN reflect_emit
+                      ${NB_REFLECT_EMIT_SRC} ${NB_EXTRA_ARGS})
   # Deliberately NO ${NB_REFLECT_FLAGS}: the generated TU is plain C++20.
   target_compile_features(test_reflect_emit_ext PRIVATE cxx_std_20)
   target_include_directories(test_reflect_emit_ext PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

@@ -1059,8 +1059,7 @@ consteval const char* emit_reached_name() {
 }
 
 // The bind-function NAME for one class/enum occurrence, or "" when the entity
-// is skipped (truly anonymous, or its type unspellable). Memoized below: a
-// tiny per-entity constant evaluation.
+// is skipped (truly anonymous, or its type unspellable).
 template <std::meta::info EntR, std::meta::info Named>
 consteval std::string emit_fname_text() {
     constexpr auto Ent = std::meta::dealias(EntR);
@@ -1076,10 +1075,6 @@ consteval std::string emit_fname_text() {
         return out;
     }
 }
-
-template <std::meta::info EntR, std::meta::info Named>
-inline constexpr const char* emit_fname_v =
-    std::define_static_string(emit_fname_text<EntR, Named>());
 
 // The COMPLETE per-class definition text: opt-in trampoline struct + the
 // templated bind function (idempotence guard, base-first call, BINDER-0022
@@ -1122,8 +1117,8 @@ consteval std::string emit_class_def_text() {
         // member gets one); forward declarations at the top of the namespace
         // make the call well-formed regardless of definition order.
         if constexpr (pybase != ^^void) {
-            constexpr const char* bf = emit_fname_v<pybase, ^^void>;
-            if (bf[0] != '\0') {
+            std::string bf = emit_fname_text<pybase, ^^void>();
+            if (!bf.empty()) {
                 out += "    ";
                 out += bf;
                 out += "(m);\n";
@@ -1164,9 +1159,6 @@ consteval std::string emit_class_def_text() {
     }
 }
 
-template <std::meta::info ClsR, std::meta::info Named, std::meta::info... Rs>
-inline constexpr std::span<const char* const> emit_class_def_v =
-    make_static_chunks(emit_class_def_text<ClsR, Named, Rs...>());
 
 template <std::meta::info EnumR, std::meta::info Named>
 consteval std::string emit_enum_def_text() {
@@ -1214,9 +1206,6 @@ consteval std::string emit_enum_def_text() {
     }
 }
 
-template <std::meta::info EnumR, std::meta::info Named>
-inline constexpr std::span<const char* const> emit_enum_def_v =
-    make_static_chunks(emit_enum_def_text<EnumR, Named>());
 
 template <std::meta::info Fn>
 consteval std::string emit_free_fn_text() {
@@ -1225,17 +1214,121 @@ consteval std::string emit_free_fn_text() {
     return out;
 }
 
-template <std::meta::info Fn>
-inline constexpr std::span<const char* const> emit_free_fn_v =
-    make_static_chunks(emit_free_fn_text<Fn>());
 
-// --- Dispatch (mirrors reflect_dispatch / reflect_user_specs / reflect_) ---
+// --- The worklist (mirrors reflect_user_specs / reflect_dispatch order) ---
 //
-// The walk concatenates the precomputed per-entity texts (cheap pointer
-// appends), deduplicates definitions by bind-function name across every seed
-// path (a class reachable as both a discovered spec and a namespace member
-// gets one definition; calls stay idempotent regardless), and accumulates the
-// NB_MODULE body in reflect_'s order.
+// The walks are VALUE-FORM (every classifier already is), producing one
+// ordered list of (entity, reached-through, kind) items per pack. Each item's
+// text is then memoized in a variable template keyed by INDEX into that list
+// -- never by the entity reflection: a deep specialization's reflection NTTP
+// mangling (nlohmann's detail types) blows past the linker's symbol-length
+// cap (ld-prime asserts in makeSymbolStringInPlace). The heavy reflections
+// only ever parameterize consteval FUNCTIONS, which produce no symbols.
+
+enum class emit_kind { cls, enum_, free_fn };
+struct emit_item {
+    std::meta::info ent;
+    std::meta::info named;
+    emit_kind kind;
+};
+
+consteval void worklist_dispatch(std::meta::info R,
+                                 std::span<const std::meta::info> ex,
+                                 std::vector<emit_item>& out) {
+    if (is_exclude_marker(R) || is_trampoline_marker(R)
+        || is_excluded_entity(R, ex))
+        return;
+    if (std::meta::is_namespace(R)) {
+        for (auto mem : namespace_members_for_binding(R)) {
+            switch (classify_namespace_member(mem, ex)) {
+            case ns_member_kind::cls:
+                out.push_back({mem, mem, emit_kind::cls});
+                break;
+            case ns_member_kind::enum_:
+                out.push_back({mem, mem, emit_kind::enum_});
+                break;
+            case ns_member_kind::free_fn:
+                out.push_back({mem, ^^void, emit_kind::free_fn});
+                break;
+            case ns_member_kind::ns:
+                worklist_dispatch(mem, ex, out);
+                break;
+            default:
+                break;
+            }
+        }
+    } else if (std::meta::is_type(R)) {
+        if (std::meta::is_class_type(R))
+            out.push_back({R, R, emit_kind::cls});
+        else if (std::meta::is_enum_type(R))
+            out.push_back({R, R, emit_kind::enum_});
+    } else if (std::meta::is_function(R)) {
+        out.push_back({R, ^^void, emit_kind::free_fn});
+    }
+}
+
+template <std::meta::info... Rs>
+consteval std::vector<emit_item> compute_emit_worklist() {
+    std::vector<emit_item> out;
+    std::vector<std::meta::info> ex = compute_excluded<Rs...>();
+    // Mirror reflect_'s order: discovered template specializations first,
+    // then the dispatch walks.
+    auto specs = [&](std::meta::info R) {
+        if (is_exclude_marker(R) || is_trampoline_marker(R))
+            return;
+        for (auto ty : required_user_specs(R, ex))
+            out.push_back({ty, ^^void, emit_kind::cls});
+    };
+    (specs(Rs), ...);
+    (worklist_dispatch(Rs, ex, out), ...);
+    return out;
+}
+
+template <std::meta::info... Rs>
+inline constexpr auto emit_worklist_v =
+    std::define_static_array(compute_emit_worklist<Rs...>());
+
+// Per-item memoized text, each in its OWN constant evaluation (a fresh step
+// budget per entity, mirroring how the constexpr backend's per-class
+// instantiations evaluate independently). For classes/enums the first chunk
+// sequence is the definition text; fname/decl are memoized alongside.
+template <std::size_t I, std::meta::info... Rs>
+inline constexpr std::span<const char* const> emit_item_def_v = [] {
+    constexpr emit_item it = emit_worklist_v<Rs...>[I];
+    if constexpr (it.kind == emit_kind::cls)
+        return make_static_chunks(
+            emit_class_def_text<it.ent, it.named, Rs...>());
+    else if constexpr (it.kind == emit_kind::enum_)
+        return make_static_chunks(emit_enum_def_text<it.ent, it.named>());
+    else
+        return make_static_chunks(emit_free_fn_text<it.ent>());
+}();
+
+template <std::size_t I, std::meta::info... Rs>
+inline constexpr const char* emit_item_fname_v = [] {
+    constexpr emit_item it = emit_worklist_v<Rs...>[I];
+    if constexpr (it.kind == emit_kind::free_fn)
+        return std::define_static_string(std::string_view{});
+    else
+        return std::define_static_string(
+            emit_fname_text<it.ent, it.named>());
+}();
+
+template <std::size_t I, std::meta::info... Rs>
+inline constexpr const char* emit_item_decl_v = [] {
+    constexpr emit_item it = emit_worklist_v<Rs...>[I];
+    if constexpr (it.kind == emit_kind::free_fn) {
+        return std::define_static_string(std::string_view{});
+    } else {
+        std::string fname = emit_fname_text<it.ent, it.named>();
+        if (fname.empty())
+            return std::define_static_string(std::string_view{});
+        std::string s = "template <class Self = "
+                      + type_spelling(std::meta::dealias(it.ent))
+                      + "> static void " + fname + "(nb::module_ &m);\n";
+        return std::define_static_string(s);
+    }
+}();
 
 consteval bool str_in(const std::vector<std::string>& v, std::string_view x) {
     for (auto& e : v)
@@ -1244,89 +1337,11 @@ consteval bool str_in(const std::vector<std::string>& v, std::string_view x) {
     return false;
 }
 
-template <std::meta::info ClsR, std::meta::info Named, std::meta::info... Rs>
-consteval void emit_class(std::vector<const char*>& defs, std::string& decls,
-                          std::string& body, std::vector<std::string>& seen) {
-    constexpr const char* fname = emit_fname_v<ClsR, Named>;
-    if (fname[0] == '\0')
-        return;  // anonymous / unspellable: skipped (mirrors reflect_class)
-    body += "    nbgen::";
-    body += fname;
-    body += "(m);\n";
-    if (str_in(seen, fname))
-        return;
-    seen.push_back(std::string(fname));
-    constexpr auto Cls = std::meta::dealias(ClsR);
-    std::string spell = type_spelling(Cls);
-    decls += "template <class Self = " + spell + "> static void ";
-    decls += fname;
-    decls += "(nb::module_ &m);\n";
-    for (const char* chunk : emit_class_def_v<ClsR, Named, Rs...>)
-        defs.push_back(chunk);
-}
-
-template <std::meta::info EnumR, std::meta::info Named>
-consteval void emit_enum(std::vector<const char*>& defs, std::string& decls,
-                         std::string& body, std::vector<std::string>& seen) {
-    constexpr const char* fname = emit_fname_v<EnumR, Named>;
-    if (fname[0] == '\0')
-        return;
-    body += "    nbgen::";
-    body += fname;
-    body += "(m);\n";
-    if (str_in(seen, fname))
-        return;
-    seen.push_back(std::string(fname));
-    constexpr auto E = std::meta::dealias(EnumR);
-    std::string spell = type_spelling(E);
-    decls += "template <class Self = " + spell + "> static void ";
-    decls += fname;
-    decls += "(nb::module_ &m);\n";
-    for (const char* chunk : emit_enum_def_v<EnumR, Named>)
-        defs.push_back(chunk);
-}
-
-template <std::meta::info R, std::meta::info... Rs>
-consteval void emit_dispatch(std::vector<const char*>& defs,
-                             std::string& decls, std::string& body,
-                             std::vector<std::string>& seen) {
-    if constexpr (is_exclude_marker(R) || is_trampoline_marker(R)
-                  || is_excluded_entity(R, excluded_v<Rs...>)) {
-        // configuration / excluded seed: nothing
-    } else if constexpr (std::meta::is_namespace(R)) {
-        template for (constexpr auto mem : std::define_static_array(
-                          namespace_members_for_binding(R))) {
-            constexpr ns_member_kind kind =
-                classify_namespace_member(mem, excluded_v<Rs...>);
-            if constexpr (kind == ns_member_kind::cls)
-                emit_class<mem, mem, Rs...>(defs, decls, body, seen);
-            else if constexpr (kind == ns_member_kind::enum_)
-                emit_enum<mem, mem>(defs, decls, body, seen);
-            else if constexpr (kind == ns_member_kind::free_fn) {
-                for (const char* chunk : emit_free_fn_v<mem>)
-                    body += chunk;
-            } else if constexpr (kind == ns_member_kind::ns)
-                emit_dispatch<mem, Rs...>(defs, decls, body, seen);
-        };
-    } else if constexpr (std::meta::is_type(R)) {
-        if constexpr (std::meta::is_class_type(R))
-            emit_class<R, R, Rs...>(defs, decls, body, seen);
-        else if constexpr (std::meta::is_enum_type(R))
-            emit_enum<R, R>(defs, decls, body, seen);
-    } else if constexpr (std::meta::is_function(R)) {
-        for (const char* chunk : emit_free_fn_v<R>)
-            body += chunk;
-    }
-}
-
-template <std::meta::info R, std::meta::info... Rs>
-consteval void emit_user_specs(std::vector<const char*>& defs,
-                               std::string& decls, std::string& body,
-                               std::vector<std::string>& seen) {
-    template for (constexpr auto ty : std::define_static_array(
-                      required_user_specs(R, excluded_v<Rs...>))) {
-        emit_class<ty, ^^void, Rs...>(defs, decls, body, seen);
-    };
+consteval std::vector<std::size_t> iota_vec(std::size_t n) {
+    std::vector<std::size_t> v;
+    for (std::size_t i = 0; i < n; ++i)
+        v.push_back(i);
+    return v;
 }
 
 NAMESPACE_END(emitgen)
@@ -1344,13 +1359,35 @@ NAMESPACE_END(detail)
 template <std::meta::info... Rs>
 consteval std::span<const char* const> emit_bindings(const char* module_name,
                                                      const char* preamble) {
+    namespace eg = detail::emitgen;
     std::vector<const char*> defs;
     std::string decls, body;
     std::vector<std::string> seen;
-    // Mirror reflect_'s order: discovered template specializations first
-    // (their members feed caster detection), then the dispatch walks.
-    (detail::emitgen::emit_user_specs<Rs, Rs...>(defs, decls, body, seen), ...);
-    (detail::emitgen::emit_dispatch<Rs, Rs...>(defs, decls, body, seen), ...);
+    // Walk the precomputed worklist (reflect_'s order), concatenating the
+    // per-item memoized texts. Definitions deduplicate by bind-function name
+    // (a class reachable as both a discovered spec and a namespace member
+    // gets one definition; the body calls stay idempotent regardless).
+    template for (constexpr auto I : std::define_static_array(
+                      eg::iota_vec(eg::emit_worklist_v<Rs...>.size()))) {
+        constexpr eg::emit_item it = eg::emit_worklist_v<Rs...>[I];
+        if constexpr (it.kind == eg::emit_kind::free_fn) {
+            for (const char* c : eg::emit_item_def_v<I, Rs...>)
+                body += c;
+        } else {
+            constexpr const char* fname = eg::emit_item_fname_v<I, Rs...>;
+            if constexpr (fname[0] != '\0') {
+                body += "    nbgen::";
+                body += fname;
+                body += "(m);\n";
+                if (!eg::str_in(seen, fname)) {
+                    seen.push_back(std::string(fname));
+                    decls += eg::emit_item_decl_v<I, Rs...>;
+                    for (const char* c : eg::emit_item_def_v<I, Rs...>)
+                        defs.push_back(c);
+                }
+            }
+        }
+    };
 
     std::vector<const char*> parts;
     std::string head;
@@ -1366,7 +1403,8 @@ consteval std::span<const char* const> emit_bindings(const char* module_name,
         "#include <ostream>\n"
         "#include <sstream>\n"
         "#include <utility>\n";
-    ((head += detail::codegen::emit_stl_includes(Rs)), ...);
+    ((head += detail::codegen::emit_stl_includes(
+         Rs, detail::excluded_v<Rs...>)), ...);
     head +=
         "\n"
         "namespace nb = nanobind;\n"

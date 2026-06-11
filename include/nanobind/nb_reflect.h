@@ -2421,7 +2421,8 @@ consteval void collect_scope_user_specs(std::meta::info r,
                                         std::vector<std::meta::info>& visited,
                                         std::vector<std::meta::info>& walked,
                                         std::span<const std::meta::info> ex = {}) {
-    if (is_exclude_marker(r) || is_excluded_entity(r, ex))
+    if (is_exclude_marker(r) || is_trampoline_marker(r)
+        || is_excluded_entity(r, ex))
         return;  // a marker is not a seed; an excluded seed is opaque
     if (std::meta::is_namespace(r)) {
         for (auto mem : std::meta::members_of(r, std::meta::access_context::unchecked())) {

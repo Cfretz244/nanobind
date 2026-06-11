@@ -37,9 +37,18 @@ def _interesting(name):
     return True
 
 
-def _describe_attr(owner_name, name, attr):
+def _norm_doc(doc, mod_name):
+    # nanobind renders bound types into docstring signatures qualified by the
+    # OWNING module's name, which legitimately differs between the two
+    # backends' test modules; normalize before comparing.
+    if isinstance(doc, str):
+        return doc.replace(mod_name + ".", "M.")
+    return doc
+
+
+def _describe_attr(owner_name, name, attr, mod_name):
     kind = type(attr).__name__
-    doc = getattr(attr, "__doc__", None)
+    doc = _norm_doc(getattr(attr, "__doc__", None), mod_name)
     info = {"kind": kind}
     if callable(attr) or kind in ("property", "nb_func", "nb_method"):
         info["doc"] = doc
@@ -57,13 +66,13 @@ def _describe_attr(owner_name, name, attr):
     return info
 
 
-def _describe_class(name, cls, seen):
+def _describe_class(name, cls, seen, mod_name):
     if name in seen:
         return {"recursive": True}
     seen = seen | {name}
     desc = {
         "bases": [b.__name__ for b in cls.__bases__],
-        "doc": cls.__doc__,
+        "doc": _norm_doc(cls.__doc__, mod_name),
         "attrs": {},
     }
     for aname, attr in sorted(cls.__dict__.items()):
@@ -72,9 +81,9 @@ def _describe_class(name, cls, seen):
         if aname == "__doc__":
             continue
         if isinstance(attr, type):
-            desc["attrs"][aname] = _describe_class(aname, attr, seen)
+            desc["attrs"][aname] = _describe_class(aname, attr, seen, mod_name)
         else:
-            desc["attrs"][aname] = _describe_attr(name, aname, attr)
+            desc["attrs"][aname] = _describe_attr(name, aname, attr, mod_name)
     return desc
 
 
@@ -85,9 +94,9 @@ def describe_module(mod):
             continue
         attr = getattr(mod, name)
         if isinstance(attr, type):
-            out[name] = _describe_class(name, attr, frozenset())
+            out[name] = _describe_class(name, attr, frozenset(), mod.__name__)
         else:
-            out[name] = _describe_attr(mod.__name__, name, attr)
+            out[name] = _describe_attr(mod.__name__, name, attr, mod.__name__)
     return out
 
 
