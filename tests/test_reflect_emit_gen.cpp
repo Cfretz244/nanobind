@@ -13,9 +13,17 @@ namespace nb = nanobind;
 
 int main(int argc, char** argv) {
     const char* out = (argc > 1) ? argv[1] : "test_reflect_emit.gen.cpp";
-    return nb::write_bindings<TEST_REFLECT_ARGS>(
-               out, "test_reflect_emit_ext",
-               "#include \"test_reflect_fixture.h\"\n")
-               ? 0
-               : 1;
+    if (!nb::write_bindings<TEST_REFLECT_ARGS>(
+            out, "test_reflect_emit_ext",
+            "#include \"test_reflect_fixture.h\"\n"))
+        return 1;
+    // The spelling-probe TU: every spelled signature re-stated as an
+    // overload-exact cast / decltype identity, compiled with no nanobind and
+    // no reflection -- the round-trip oracle for nb_reflect_spell.h.
+    if (argc > 2)
+        return nb::write_spelling_probe<TEST_REFLECT_ARGS>(
+                   argv[2], "#include \"test_reflect_fixture.h\"\n")
+                   ? 0
+                   : 1;
+    return 0;
 }

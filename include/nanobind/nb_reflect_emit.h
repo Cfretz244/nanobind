@@ -1347,6 +1347,249 @@ consteval std::vector<std::size_t> iota_vec(std::size_t n) {
     return v;
 }
 
+// ===== Spelling-probe TU (the hardening oracle) ==========================
+//
+// write_spelling_probe<Rs...> renders a SECOND generated TU asserting, in
+// plain C++ with no nanobind headers, that every signature the emit backend
+// SPELLS names the real entity exactly:
+//   methods/operators/conversions -- overload-exact member-pointer casts
+//     (`static_cast<Ret (Cls::*)(Args...) cv ref noexcept>(&Cls::f)`), the
+//     same round-trip append_memfn_ptr_cast performs for properties;
+//   static methods / free functions -- overload-exact function-pointer casts;
+//   data members (incl. statics) -- `decltype(Cls::x)` identity asserts;
+//   constructors -- a function-type alias over the spelled parameter list;
+//   enums -- is_enum_v + a mention of every enumerator.
+// A wrong spelling is a COMPILE error in this TU. Probed members mirror the
+// binding TU's walks gate-for-gate; forms the binding TU does not spell
+// through these constructs (entity proxies' unqualified calls, member
+// templates' `self.template f<>`) are not probed.
+
+// The probe's member-name text: named members, operator members
+// ("operator+"), conversion functions ("operator <ret-spelling>").
+consteval std::string probe_member_name(std::meta::info fn) {
+    if (std::meta::has_identifier(fn))
+        return std::string(std::meta::identifier_of(fn));
+    if (std::meta::is_operator_function(fn)) {
+        std::string s = "operator";
+        s += std::meta::symbol_of(std::meta::operator_of(fn));
+        return s;
+    }
+    if (std::meta::is_conversion_function(fn)) {
+        std::string r = type_spelling(
+            std::meta::return_type_of(std::meta::type_of(fn)));
+        if (r.empty())
+            return {};
+        return "operator " + r;
+    }
+    return {};
+}
+
+// One overload-exact cast probe for a member or free function. Member
+// pointers target the DECLARING class (an inherited member's pointer is what
+// `&Base::f` yields, and it is exactly what the binding TU's qualified calls
+// and def_rw pointers name).
+template <std::meta::info Fn>
+consteval void append_probe_fn(std::string& out, std::string_view tag,
+                               std::size_t& n) {
+    auto ft = std::meta::type_of(Fn);
+    std::string name = probe_member_name(Fn);
+    std::string ret = type_spelling(std::meta::return_type_of(ft));
+    std::string tail = spell_fn_tail(ft);
+    std::string owner = std::meta::parent_of(Fn) == ^^::
+        ? std::string{}
+        : (std::meta::is_namespace(std::meta::parent_of(Fn))
+               ? spell_qualified(std::meta::parent_of(Fn))
+               : type_spelling(std::meta::parent_of(Fn)));
+    if (name.empty() || ret.empty() || tail.empty()
+        || (owner.empty() && std::meta::parent_of(Fn) != ^^::))
+        return;
+    constexpr bool memptr = std::meta::is_class_member(Fn)
+                            && !std::meta::is_static_member(Fn);
+    out += "[[maybe_unused]] inline constexpr auto nbprobe_";
+    out += tag;
+    out += "_" + spell_num(n++) + " =\n    static_cast<" + ret + " (";
+    if constexpr (memptr)
+        out += owner + "::";
+    out += "*)" + tail + ">(&" + owner + "::" + name + ");\n";
+}
+
+// decltype identity assert for a (static or non-static) data member.
+template <std::meta::info Mem>
+consteval void append_probe_data(std::string& out,
+                                 std::string_view owner_spell) {
+    std::string ty = type_spelling(std::meta::type_of(Mem));
+    if (ty.empty())
+        return;
+    out += "static_assert(::std::is_same_v<decltype(";
+    out += owner_spell;
+    out += "::";
+    out += std::meta::identifier_of(Mem);
+    out += "), " + ty + ">);\n";
+}
+
+// Function-type alias over a bound constructor's spelled parameter list
+// (type_of is not valid on a constructor reflection; walk parameters_of
+// like append_ctor does).
+template <std::meta::info Fn>
+consteval void append_probe_ctor(std::string& out, std::string_view tag,
+                                 std::size_t& n) {
+    if (!fn_signature_spellable(Fn))
+        return;
+    std::string params;
+    bool first = true;
+    for (auto p : std::meta::parameters_of(Fn)) {
+        if (!first)
+            params += ", ";
+        first = false;
+        std::string ty = type_spelling(std::meta::type_of(p));
+        if (ty.empty())
+            return;
+        params += ty;
+    }
+    out += "using nbprobe_" + std::string(tag) + "_" + spell_num(n++)
+         + " = void (" + params + ");\n";
+}
+
+// The probeable member functions of `Owner`, with `Cls` as the routing
+// context (mirrors append_class_contents / append_flatten_base gates).
+template <std::meta::info Cls, std::meta::info Owner, std::meta::info... Rs>
+consteval void probe_member_fns(std::string& out, std::string_view tag,
+                                std::size_t& n) {
+    template for (constexpr auto fn : std::define_static_array(
+                      std::meta::members_of(
+                          Owner, std::meta::access_context::unchecked()))) {
+        if constexpr (classify_class_member(fn, excluded_v<Rs...>)
+                      == class_member_kind::fn) {
+            constexpr member_fn_route route = classify_member_fn(Cls, fn);
+            if constexpr (route == member_fn_route::method
+                          || route == member_fn_route::oper
+                          || route == member_fn_route::conversion
+                          || route == member_fn_route::static_method) {
+                if constexpr (method_shape_bindable(fn)
+                              && !std::meta::is_deleted(fn)
+                              && fn_signature_spellable(fn))
+                    append_probe_fn<fn>(out, tag, n);
+            }
+        }
+    };
+}
+
+template <std::meta::info Owner, std::meta::info... Rs>
+consteval void probe_data_members(std::string& out,
+                                  std::string_view owner_spell) {
+    template for (constexpr auto mem : std::define_static_array(
+                      std::meta::nonstatic_data_members_of(
+                          Owner, std::meta::access_context::unchecked()))) {
+        if constexpr (std::meta::is_public(mem)
+                      && std::meta::has_identifier(mem)
+                      && !data_member_excluded(mem, excluded_v<Rs...>))
+            append_probe_data<mem>(out, owner_spell);
+    };
+    template for (constexpr auto mem : std::define_static_array(
+                      std::meta::static_data_members_of(
+                          Owner, std::meta::access_context::unchecked()))) {
+        if constexpr (std::meta::is_public(mem)
+                      && std::meta::has_identifier(mem)
+                      && !data_member_excluded(mem, excluded_v<Rs...>))
+            append_probe_data<mem>(out, owner_spell);
+    };
+}
+
+template <std::meta::info Cls, std::meta::info... Rs>
+consteval std::string probe_class_text(std::string_view tag) {
+    std::string spell = type_spelling(std::meta::dealias(Cls));
+    std::string out;
+    if (spell.empty())
+        return out;
+    out += "// probe " + spell + "\n";
+    out += "static_assert(::std::is_class_v<" + spell + ">);\n";
+    std::size_t n = 0;
+
+    constexpr bool has_tramp = emit_wants_trampoline<Rs...>(Cls);
+    if constexpr (class_constructs(Cls, has_tramp)) {
+        template for (constexpr auto fn : std::define_static_array(
+                          std::meta::members_of(
+                              Cls, std::meta::access_context::unchecked()))) {
+            if constexpr (ctor_binds(fn, excluded_v<Rs...>))
+                append_probe_ctor<fn>(out, tag, n);
+        };
+    }
+
+    probe_data_members<Cls, Rs...>(out, spell);
+    probe_member_fns<Cls, Cls, Rs...>(out, tag, n);
+
+    // Flattened bases: their spellings appear in the binding TU as
+    // qualified calls and declaring-class member pointers.
+    constexpr auto pybase = python_base_of(Cls, bind_set_v<Rs...>);
+    template for (constexpr auto base : std::define_static_array(
+                      flatten_bases_vec(Cls, pybase))) {
+        if constexpr (!is_excluded_entity(base, excluded_v<Rs...>)) {
+            constexpr std::string_view bspell =
+                std::define_static_string(type_spelling(base));
+            if constexpr (!bspell.empty()) {
+                probe_data_members<base, Rs...>(out, bspell);
+                probe_member_fns<Cls, base, Rs...>(out, tag, n);
+            }
+        }
+    };
+    return out;
+}
+
+template <std::meta::info EnumR>
+consteval std::string probe_enum_text() {
+    constexpr auto E = std::meta::dealias(EnumR);
+    std::string out;
+    if constexpr (!std::meta::is_enumerable_type(E)) {
+        return out;
+    } else {
+        std::string spell = type_spelling(E);
+        if (spell.empty())
+            return out;
+        out += "// probe enum " + spell + "\n";
+        out += "static_assert(::std::is_enum_v<" + spell + ">);\n";
+        template for (constexpr auto e : std::define_static_array(
+                          std::meta::enumerators_of(E))) {
+            out += "static_assert((static_cast<void>(";
+            out += spell;
+            out += "::";
+            out += std::meta::identifier_of(e);
+            out += "), true));\n";
+        };
+        return out;
+    }
+}
+
+// Per-item probe text, memoized in the same bounded-chunk shape as the
+// binding TU's text (same constraints: consteval budgets, TC-0018, the
+// linker's symbol-length cap).
+template <std::size_t I, std::meta::info... Rs>
+consteval std::string probe_item_text() {
+    constexpr emit_item it = emit_worklist_v<Rs...>[I];
+    if constexpr (it.kind == emit_kind::cls)
+        return probe_class_text<it.ent, Rs...>("i" + spell_num(I));
+    else if constexpr (it.kind == emit_kind::enum_)
+        return probe_enum_text<it.ent>();
+    else {
+        std::string out;
+        std::size_t n = 0;
+        if (!std::meta::is_deleted(it.ent) && fn_signature_spellable(it.ent))
+            append_probe_fn<it.ent>(out, "i" + spell_num(I), n);
+        return out;
+    }
+}
+
+template <std::size_t I, std::meta::info... Rs>
+inline constexpr std::size_t probe_item_nchunks_v =
+    (probe_item_text<I, Rs...>().size() + emit_chunk_size - 1)
+    / emit_chunk_size;
+
+template <std::size_t I, std::size_t J, std::meta::info... Rs>
+inline constexpr const char* probe_item_chunk_v = [] {
+    std::string s = probe_item_text<I, Rs...>();
+    return std::define_static_string(
+        std::string_view(s).substr(J * emit_chunk_size, emit_chunk_size));
+}();
+
 NAMESPACE_END(emitgen)
 NAMESPACE_END(detail)
 
@@ -1457,6 +1700,39 @@ bool write_bindings(const char* path, const char* module_name,
 
     out << "} // namespace nbgen\n\nNB_MODULE(" << module_name << ", m) {\n"
         << body << "}\n";
+    return bool(out);
+}
+
+/// Generate the SPELLING-PROBE TU for Rs... and write it to `path`: a plain
+/// C++ source (no nanobind, no reflection) that re-states every signature
+/// the emit backend spells as an overload-exact cast / decltype identity /
+/// enumerator mention, so a wrong spelling in the binding TU is ALSO a
+/// compile error here -- against the library headers alone, with the
+/// production compiler. `preamble` supplies the library #includes (same one
+/// passed to write_bindings).
+///
+///   nb::write_spelling_probe<CORPUS_REFLECT_ARGS>(
+///       "spelling_probe.gen.cpp", "#include \"binding_includes.h\"\n");
+template <std::meta::info... Rs>
+bool write_spelling_probe(const char* path, const char* preamble) {
+    namespace eg = detail::emitgen;
+    std::ofstream out(path);
+    if (!out)
+        return false;
+
+    out << "// Generated by nanobind reflection emit backend (spelling "
+           "probe) -- do not edit.\n";
+    out << preamble;
+    out << "\n#include <type_traits>\n\n";
+
+    constexpr auto indices = std::define_static_array(
+        eg::iota_vec(eg::emit_worklist_v<Rs...>.size()));
+    template for (constexpr auto I : indices) {
+        template for (constexpr auto J : std::define_static_array(
+                          eg::iota_vec(eg::probe_item_nchunks_v<I, Rs...>))) {
+            out << eg::probe_item_chunk_v<I, J, Rs...>;
+        };
+    };
     return bool(out);
 }
 

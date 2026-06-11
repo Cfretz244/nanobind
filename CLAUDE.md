@@ -200,9 +200,18 @@ thing that cannot be expressed in-language (a virtual-override **trampoline**) h
   recursive surface diff. The corpus validates three-way per run (oracle /
   constexpr / emit + surface diff; corpus/lib/run_gates.py).
 
+- **Emit-mode spelling-probe TU**: `nb::write_spelling_probe<Rs...>(path,
+  preamble)` renders a second generated TU (plain C++, no nanobind) that
+  re-states every spelled signature as an overload-exact cast
+  (`static_cast<Ret (Cls::*)(Args...) cv ref noexcept>(&Cls::f)`), a
+  `decltype(Cls::x)` identity assert, a ctor function-type alias, or an
+  enumerator mention -- the round-trip oracle for nb_reflect_spell.h: a wrong
+  spelling is a COMPILE error against the library headers alone. Wired into
+  the unit build as the `test_reflect_spelling_probe` OBJECT library
+  (c++20, no reflection flags).
+
 Roadmap / not yet: per-argument ownership-transfer annotations; member function templates
-needing explicit arguments; trampoline hardening for final/ref-qualified virtuals;
-emit-mode cast-based spelling probe TU (round-trip oracle for nb_reflect_spell.h).
+needing explicit arguments; trampoline hardening for final/ref-qualified virtuals.
 
 ## Key gotchas (clang-p2996 @ the pinned toolchain commit)
 

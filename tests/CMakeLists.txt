@@ -220,6 +220,7 @@ if (NB_REFLECT_FLAGS)
   # flags, which is the in-tree proof that the output needs no reflection
   # toolchain (the corpus's emit lane repeats this with Apple Clang).
   set(NB_REFLECT_EMIT_SRC ${CMAKE_CURRENT_BINARY_DIR}/test_reflect_emit.gen.cpp)
+  set(NB_REFLECT_PROBE_SRC ${CMAKE_CURRENT_BINARY_DIR}/test_reflect_spelling_probe.gen.cpp)
 
   add_executable(test_reflect_emit_gen test_reflect_emit_gen.cpp)
   # Rendering the whole module as a consteval string outspends the default
@@ -231,8 +232,8 @@ if (NB_REFLECT_FLAGS)
       PRIVATE ${NB_DIR}/include ${Python_INCLUDE_DIRS})
 
   add_custom_command(
-      OUTPUT ${NB_REFLECT_EMIT_SRC}
-      COMMAND test_reflect_emit_gen ${NB_REFLECT_EMIT_SRC}
+      OUTPUT ${NB_REFLECT_EMIT_SRC} ${NB_REFLECT_PROBE_SRC}
+      COMMAND test_reflect_emit_gen ${NB_REFLECT_EMIT_SRC} ${NB_REFLECT_PROBE_SRC}
       DEPENDS test_reflect_emit_gen
       COMMENT "Generating nanobind binding source via reflection (emit backend)")
   add_custom_target(test_reflect_emit_generate DEPENDS ${NB_REFLECT_EMIT_SRC})
@@ -248,6 +249,18 @@ if (NB_REFLECT_FLAGS)
   target_compile_features(test_reflect_emit_ext PRIVATE cxx_std_20)
   target_include_directories(test_reflect_emit_ext PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   add_dependencies(test_reflect_emit_ext test_reflect_emit_generate)
+
+  # The spelling-probe TU: pure C++ (no nanobind, no reflection flags),
+  # asserting every spelled signature names the real entity exactly. A wrong
+  # spelling is a compile error of THIS object library.
+  add_library(test_reflect_spelling_probe OBJECT ${NB_REFLECT_PROBE_SRC})
+  target_compile_features(test_reflect_spelling_probe PRIVATE cxx_std_20)
+  # NB_DIR include: the fixture header pulls nb_reflect_annotations.h (a
+  # dependency-free vocabulary header, fine for a no-nanobind TU).
+  target_include_directories(test_reflect_spelling_probe
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${NB_DIR}/include
+              ${Python_INCLUDE_DIRS})
+  add_dependencies(test_reflect_spelling_probe test_reflect_emit_generate)
 endif()
 
 add_library(
