@@ -2035,6 +2035,13 @@ consteval const char* stl_caster_header(std::meta::info type) {
     if (n == "unique_ptr")        return "nanobind/stl/unique_ptr.h";
     if (n == "function")          return "nanobind/stl/function.h";
     if (n == "complex")           return "nanobind/stl/complex.h";
+    // std::chrono types (std::chrono is nested under std, which the is_in_std
+    // walk already accepts). Found by spdlog's emit lane: logger::log's
+    // system_clock::time_point overload bound with a RAW chrono signature in
+    // the generated TU while the constexpr TU hand-included the caster -- the
+    // surface diff's exact purpose (D.surface, not a behavioral failure).
+    if (n == "time_point" || n == "duration")
+        return "nanobind/stl/chrono.h";
     return nullptr;
 }
 
