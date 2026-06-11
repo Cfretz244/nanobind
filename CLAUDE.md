@@ -173,8 +173,36 @@ thing that cannot be expressed in-language (a virtual-override **trampoline**) h
   hid every post-Python.h global from reflection -- and TC-0017 NEON
   Long-element mangling).
 
+- **The emit backend (full source codegen; Phase 4's deployability story)**:
+  `nb::write_bindings<Rs...>(path, module_name, preamble)` (include/nanobind/
+  nb_reflect_emit.h) walks the SAME metadata through the SAME shared
+  classifiers (the `classify_*`/`*_route`/`ctor_binds`/`plan_free_operator`
+  consteval value-form predicates factored into nb_reflect.h -- the single
+  source of truth for every WHAT-to-bind decision in both backends) and
+  renders them as ONE self-contained binding TU of plain C++17/20 nanobind
+  code (no reflection constructs); a production compiler builds the module.
+  Type text comes from include/nanobind/nb_reflect_spell.h (full recursive
+  grammar renderer, fully qualified, inline-std-namespace skipping,
+  typedef-for-linkage recovery; unspellable signatures skip with a
+  `// skipped:` comment -- the emit-only gate). Trampolines are inline and
+  OPT-IN via `nb::trampoline_<^^Cls...>` / `nb::trampoline_all_` pack markers
+  (inert in the constexpr lane) so the two backends present identical
+  surfaces; compiler-answered decisions (the BINDER-0020 static-const value
+  probe, `__str__` streamability) are EMITTED as identical probes, which is
+  why the generated bind functions are templates over a defaulted `Self`.
+  Internals: per-entity text memoized by WORKLIST INDEX (never by entity
+  reflection: deep specs' reflection-NTTP manglings blow the linker's
+  ~128K symbol cap) in 8K static chunks (define_static_string miscompiles
+  >=32K, TC-0018; char-pack symbols mangle ~7 bytes/char) and streamed at the
+  generator's runtime. Tests: tests/test_reflect.py runs against BOTH
+  backends (conftest `t` fixture; the emit module builds at c++20 with no
+  reflection flags in its own NB_DOMAIN), test_reflect_emit.py owns the
+  recursive surface diff. The corpus validates three-way per run (oracle /
+  constexpr / emit + surface diff; corpus/lib/run_gates.py).
+
 Roadmap / not yet: per-argument ownership-transfer annotations; member function templates
-needing explicit arguments; trampoline hardening for final/ref-qualified virtuals.
+needing explicit arguments; trampoline hardening for final/ref-qualified virtuals;
+emit-mode cast-based spelling probe TU (round-trip oracle for nb_reflect_spell.h).
 
 ## Key gotchas (clang-p2996 @ the pinned toolchain commit)
 

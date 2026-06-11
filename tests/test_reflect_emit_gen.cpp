@@ -13,10 +13,9 @@ namespace nb = nanobind;
 
 int main(int argc, char** argv) {
     const char* out = (argc > 1) ? argv[1] : "test_reflect_emit.gen.cpp";
-    return nb::write_bindings(
-               out, nb::emit_bindings<TEST_REFLECT_ARGS>(
-                        "test_reflect_emit_ext",
-                        "#include \"test_reflect_fixture.h\"\n"))
+    return nb::write_bindings<TEST_REFLECT_ARGS>(
+               out, "test_reflect_emit_ext",
+               "#include \"test_reflect_fixture.h\"\n")
                ? 0
                : 1;
 }

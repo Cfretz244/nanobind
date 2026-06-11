@@ -649,10 +649,10 @@ from that file.
    #include <my/lib.h>
 
    int main(int argc, char** argv) {
-       return nanobind::write_bindings(argv[1],
-           nanobind::emit_bindings<^^my_ns>(
-               "my_ext",                       // the NB_MODULE name
-               "#include <my/lib.h>\n"))       // the generated TU's preamble
+       return nanobind::write_bindings<^^my_ns>(
+           argv[1],
+           "my_ext",                        // the NB_MODULE name
+           "#include <my/lib.h>\n")         // the generated TU's preamble
            ? 0 : 1;
    }
 

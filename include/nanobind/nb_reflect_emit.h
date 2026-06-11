@@ -2,7 +2,7 @@
     nanobind/nb_reflect_emit.h: full source-codegen backend for the reflection
     binder.
 
-    nb::emit_bindings<Rs...>(module_name, preamble) walks EXACTLY the same
+    nb::write_bindings<Rs...>(path, module_name, preamble) walks EXACTLY the
     reflection metadata as nb::reflect_<Rs...>(m) -- through the same shared
     decision classifiers in nb_reflect.h (classify_*, *_route, ctor_binds,
     plan_free_operator, ...) -- but instead of binding at constexpr time it
@@ -38,14 +38,15 @@
     nb::trampoline_all_) so the two backends trampoline the same classes; see
     emit_wants_trampoline.
 
-    PERFORMANCE: the per-entity text is memoized into its own
-    std::define_static_string initializer (emit_class_def_v et al.), so each
-    class renders in a SEPARATE constant evaluation with a fresh step budget
-    -- mirroring how the constexpr backend's per-class instantiations each
-    evaluate independently -- and the top-level emit_bindings evaluation only
-    concatenates precomputed pointers. Renderers append into a shared
-    std::string out-parameter (no temporary-chain churn: consteval string
-    copies are interpreter-expensive).
+    PERFORMANCE/LIMITS: per-entity text is memoized in its own constant
+    evaluation (a fresh step budget per class, mirroring how the constexpr
+    backend's per-class instantiations evaluate independently), lifted to
+    static storage in bounded chunks (emit_item_chunk_v: consteval budgets,
+    TC-0018's >=32K define_static_string miscompile, and the linker's
+    symbol-length cap all forbid giant strings or pointer arrays), and
+    streamed to the output file at the generator's RUNTIME. Renderers append
+    into a shared std::string out-parameter (no temporary-chain churn:
+    consteval string copies are interpreter-expensive).
 
     This file contains NO binding decisions -- only text rendering. Every
     what-to-bind question is answered by the shared classifiers; every type is
@@ -71,6 +72,7 @@
 #include "nb_reflect.h"
 #include "nb_reflect_spell.h"
 #include "nb_reflect_codegen.h"   // emit_stl_includes, overridable_virtuals
+#include <algorithm>
 #include <span>
 #include <string>
 #include <string_view>
@@ -81,33 +83,21 @@ NAMESPACE_BEGIN(NB_NAMESPACE)
 NAMESPACE_BEGIN(detail)
 NAMESPACE_BEGIN(emitgen)
 
-// std::define_static_string silently MISCOMPILES for inputs >= 32768 chars on
-// the pinned toolchain: reflect_constant_string spells the whole string as
-// one NTTP pack, and each substituted element's PackIndex is a 15-bit
-// bitfield (SubstNonTypeTemplateParmExpr::PackIndex, clang AST) that
-// overflows -- "excess elements in array initializer" out of FixedArray
-// (TC-0018). Generated TUs run to megabytes, so per-entity text is lifted to
-// static storage as CHUNKS below this limit and the generated file is written
-// from the chunk sequence; no giant single pack is ever formed (which is also
-// kinder to compile time once the bitfield is widened).
-inline constexpr std::size_t emit_chunk_size = 16384;
-
-consteval std::span<const char* const> make_static_chunks(const std::string& s) {
-    std::vector<const char*> chunks;
-    std::string_view v(s);
-    for (std::size_t i = 0; i < v.size(); i += emit_chunk_size)
-        chunks.push_back(std::define_static_string(
-            v.substr(i, emit_chunk_size)));
-    return std::define_static_array(chunks);
-}
-
-consteval void push_chunked(std::vector<const char*>& parts,
-                            const std::string& s) {
-    std::string_view v(s);
-    for (std::size_t i = 0; i < v.size(); i += emit_chunk_size)
-        parts.push_back(std::define_static_string(
-            v.substr(i, emit_chunk_size)));
-}
+// Static-text chunking, for two hard limits:
+// - std::define_static_string silently MISCOMPILES for inputs >= 32768 chars
+//   on the pinned toolchain: reflect_constant_string spells the whole string
+//   as one NTTP pack, and each substituted element's PackIndex is a 15-bit
+//   bitfield (SubstTemplateTypeParmType/SubstNonTypeTemplateParmExpr, clang
+//   AST) that overflows -- "excess elements in array initializer" out of
+//   FixedArray (TC-0018).
+// - The backing FixedArray<char, ...> SYMBOL embeds every character at ~7
+//   mangled bytes each, and Apple's linker caps symbol names (ld-prime
+//   asserts in makeSymbolStringInPlace around 128K). 8K chunks keep the
+//   worst-case array symbol near 57K. For the same reason chunk POINTERS are
+//   never lifted into a define_static_array (its symbol would embed every
+//   chunk's full mangled name); per-chunk variables keyed by small indices
+//   carry them instead (emit_item_chunk_v below).
+inline constexpr std::size_t emit_chunk_size = 8192;
 
 // --- Small text utilities (append-style: out += ... only) ---
 
@@ -1290,18 +1280,32 @@ inline constexpr auto emit_worklist_v =
 
 // Per-item memoized text, each in its OWN constant evaluation (a fresh step
 // budget per entity, mirroring how the constexpr backend's per-class
-// instantiations evaluate independently). For classes/enums the first chunk
-// sequence is the definition text; fname/decl are memoized alongside.
+// instantiations evaluate independently). The definition text is exposed as
+// per-chunk const char* variables -- chunk count + J-indexed chunk -- so no
+// symbol ever embeds more than one chunk's mangled characters.
 template <std::size_t I, std::meta::info... Rs>
-inline constexpr std::span<const char* const> emit_item_def_v = [] {
+consteval std::string emit_item_text() {
     constexpr emit_item it = emit_worklist_v<Rs...>[I];
     if constexpr (it.kind == emit_kind::cls)
-        return make_static_chunks(
-            emit_class_def_text<it.ent, it.named, Rs...>());
+        return emit_class_def_text<it.ent, it.named, Rs...>();
     else if constexpr (it.kind == emit_kind::enum_)
-        return make_static_chunks(emit_enum_def_text<it.ent, it.named>());
+        return emit_enum_def_text<it.ent, it.named>();
     else
-        return make_static_chunks(emit_free_fn_text<it.ent>());
+        return emit_free_fn_text<it.ent>();
+}
+
+template <std::size_t I, std::meta::info... Rs>
+inline constexpr std::size_t emit_item_nchunks_v =
+    (emit_item_text<I, Rs...>().size() + emit_chunk_size - 1)
+    / emit_chunk_size;
+
+template <std::size_t I, std::size_t J, std::meta::info... Rs>
+inline constexpr const char* emit_item_chunk_v = [] {
+    // Named local: a nested-call temporary is not a constant expression when
+    // read back by define_static_string (cf. spec_python_name).
+    std::string s = emit_item_text<I, Rs...>();
+    return std::define_static_string(
+        std::string_view(s).substr(J * emit_chunk_size, emit_chunk_size));
 }();
 
 template <std::size_t I, std::meta::info... Rs>
@@ -1330,12 +1334,11 @@ inline constexpr const char* emit_item_decl_v = [] {
     }
 }();
 
-consteval bool str_in(const std::vector<std::string>& v, std::string_view x) {
-    for (auto& e : v)
-        if (e == x)
-            return true;
-    return false;
-}
+// The pack-dependent prologue piece (the auto-detected STL caster includes;
+// small, one static string per seed).
+template <std::meta::info R, std::meta::info... Rs>
+inline constexpr const char* emit_stl_includes_v = std::define_static_string(
+    codegen::emit_stl_includes(R, excluded_v<Rs...>));
 
 consteval std::vector<std::size_t> iota_vec(std::size_t n) {
     std::vector<std::size_t> v;
@@ -1350,107 +1353,110 @@ NAMESPACE_END(detail)
 /// Generate a COMPLETE binding TU for Rs... -- the same bind set, names,
 /// overloads, base wiring, dunders, and annotations the constexpr backend
 /// (nb::reflect_<Rs...>) produces -- as ordinary nanobind code a production
-/// (non-reflection) toolchain compiles. `preamble` supplies the library
-/// #includes (only the generator knows them); `module_name` names the
-/// NB_MODULE. The TU is returned as a sequence of static text chunks
-/// (concatenate in order, see write_bindings): per-entity text is rendered
-/// and lifted to static storage in bounded pieces, never as one giant string
-/// (consteval budgets, and define_static_string miscompiles >= 32K, TC-0018).
+/// (non-reflection) toolchain compiles -- and write it to `path`. `preamble`
+/// supplies the library #includes (only the generator knows them);
+/// `module_name` names the NB_MODULE.
+///
+/// All reflection work happens at COMPILE time of the caller: per-entity text
+/// is memoized in bounded static chunks (emit_item_chunk_v) -- never one
+/// giant string or pointer array, which consteval budgets, the
+/// define_static_string >=32K miscompile (TC-0018), and the linker's
+/// symbol-length cap (mangled char packs / pointee names) all forbid. This
+/// function streams the precomputed constants to the file at runtime,
+/// deduplicating definitions by bind-function name (a class reachable as
+/// both a discovered spec and a namespace member gets one definition; the
+/// body calls stay idempotent regardless).
+///
+///   int main(int argc, char** argv) {
+///       return nb::write_bindings<^^my_ns>(
+///                  argv[1], "my_ext", "#include \"my/lib.h\"\n") ? 0 : 1;
+///   }
 template <std::meta::info... Rs>
-consteval std::span<const char* const> emit_bindings(const char* module_name,
-                                                     const char* preamble) {
+bool write_bindings(const char* path, const char* module_name,
+                    const char* preamble) {
     namespace eg = detail::emitgen;
-    std::vector<const char*> defs;
-    std::string decls, body;
-    std::vector<std::string> seen;
-    // Walk the precomputed worklist (reflect_'s order), concatenating the
-    // per-item memoized texts. Definitions deduplicate by bind-function name
-    // (a class reachable as both a discovered spec and a namespace member
-    // gets one definition; the body calls stay idempotent regardless).
-    template for (constexpr auto I : std::define_static_array(
-                      eg::iota_vec(eg::emit_worklist_v<Rs...>.size()))) {
-        constexpr eg::emit_item it = eg::emit_worklist_v<Rs...>[I];
-        if constexpr (it.kind == eg::emit_kind::free_fn) {
-            for (const char* c : eg::emit_item_def_v<I, Rs...>)
-                body += c;
-        } else {
-            constexpr const char* fname = eg::emit_item_fname_v<I, Rs...>;
-            if constexpr (fname[0] != '\0') {
-                body += "    nbgen::";
-                body += fname;
-                body += "(m);\n";
-                if (!eg::str_in(seen, fname)) {
-                    seen.push_back(std::string(fname));
-                    decls += eg::emit_item_decl_v<I, Rs...>;
-                    for (const char* c : eg::emit_item_def_v<I, Rs...>)
-                        defs.push_back(c);
+    std::ofstream out(path);
+    if (!out)
+        return false;
+
+    out << "// Generated by nanobind reflection emit backend -- do not edit.\n";
+    out << preamble;
+    out << "\n"
+           "#include <nanobind/nanobind.h>\n"
+           "#include <nanobind/nb_paren_init.h>\n"
+           "#include <nanobind/trampoline.h>\n"
+           "#include <nanobind/stl/string.h>\n"
+           "#include <ostream>\n"
+           "#include <sstream>\n"
+           "#include <utility>\n";
+    ((out << eg::emit_stl_includes_v<Rs, Rs...>), ...);
+    out << "\n"
+           "namespace nb = nanobind;\n"
+           "\n"
+           "namespace nbgen {\n"
+           "\n"
+           "template <long double, class = void> struct value_probe;\n"
+           "\n"
+           "// Forward declarations (a derived class's bind function calls\n"
+           "// its base's regardless of definition order).\n";
+
+    constexpr auto indices = std::define_static_array(
+        eg::iota_vec(eg::emit_worklist_v<Rs...>.size()));
+
+    // Pass 1: forward declarations (deduplicated like the definitions).
+    {
+        std::vector<std::string> seen;
+        template for (constexpr auto I : indices) {
+            constexpr eg::emit_item it = eg::emit_worklist_v<Rs...>[I];
+            if constexpr (it.kind != eg::emit_kind::free_fn) {
+                constexpr const char* fname = eg::emit_item_fname_v<I, Rs...>;
+                if constexpr (fname[0] != '\0') {
+                    if (std::find(seen.begin(), seen.end(), fname)
+                        == seen.end()) {
+                        seen.push_back(fname);
+                        out << eg::emit_item_decl_v<I, Rs...>;
+                    }
                 }
             }
-        }
-    };
+        };
+    }
+    out << "\n";
 
-    std::vector<const char*> parts;
-    std::string head;
-    head.reserve(4096 + decls.size());
-    head += "// Generated by nanobind reflection emit backend -- do not edit.\n";
-    head += preamble;
-    head +=
-        "\n"
-        "#include <nanobind/nanobind.h>\n"
-        "#include <nanobind/nb_paren_init.h>\n"
-        "#include <nanobind/trampoline.h>\n"
-        "#include <nanobind/stl/string.h>\n"
-        "#include <ostream>\n"
-        "#include <sstream>\n"
-        "#include <utility>\n";
-    ((head += detail::codegen::emit_stl_includes(
-         Rs, detail::excluded_v<Rs...>)), ...);
-    head +=
-        "\n"
-        "namespace nb = nanobind;\n"
-        "\n"
-        "namespace nbgen {\n"
-        "\n"
-        "template <long double, class = void> struct value_probe;\n"
-        "\n"
-        "// Forward declarations (a derived class's bind function calls its\n"
-        "// base's regardless of definition order).\n";
-    head += decls;
-    head += "\n";
-    detail::emitgen::push_chunked(parts, head);
-    for (const char* chunk : defs)
-        parts.push_back(chunk);
-    std::string tail = "} // namespace nbgen\n\nNB_MODULE(";
-    tail += module_name;
-    tail += ", m) {\n";
-    tail += body;
-    tail += "}\n";
-    detail::emitgen::push_chunked(parts, tail);
-    return std::define_static_array(parts);
-}
+    // Pass 2: definitions (same dedup) + the NB_MODULE body accumulated in
+    // reflect_'s walk order.
+    std::string body;
+    {
+        std::vector<std::string> seen;
+        template for (constexpr auto I : indices) {
+            constexpr eg::emit_item it = eg::emit_worklist_v<Rs...>[I];
+            if constexpr (it.kind == eg::emit_kind::free_fn) {
+                template for (constexpr auto J : std::define_static_array(
+                                  eg::iota_vec(
+                                      eg::emit_item_nchunks_v<I, Rs...>))) {
+                    body += eg::emit_item_chunk_v<I, J, Rs...>;
+                };
+            } else {
+                constexpr const char* fname = eg::emit_item_fname_v<I, Rs...>;
+                if constexpr (fname[0] != '\0') {
+                    body += "    nbgen::";
+                    body += fname;
+                    body += "(m);\n";
+                    if (std::find(seen.begin(), seen.end(), fname)
+                        == seen.end()) {
+                        seen.push_back(fname);
+                        template for (constexpr auto J : std::define_static_array(
+                                          eg::iota_vec(
+                                              eg::emit_item_nchunks_v<I, Rs...>))) {
+                            out << eg::emit_item_chunk_v<I, J, Rs...>;
+                        };
+                    }
+                }
+            }
+        };
+    }
 
-/// Write generated binding source to `path`. For the generator program:
-///   int main(int argc, char** argv) {
-///       return nb::write_bindings(argv[1],
-///                  nb::emit_bindings<^^my_ns>("my_ext",
-///                                             "#include <my/lib.h>\n"))
-///                  ? 0 : 1;
-///   }
-inline bool write_bindings(const char* path,
-                           std::span<const char* const> chunks) {
-    std::ofstream out(path);
-    if (!out)
-        return false;
-    for (const char* c : chunks)
-        out << c;
-    return bool(out);
-}
-
-inline bool write_bindings(const char* path, const char* source) {
-    std::ofstream out(path);
-    if (!out)
-        return false;
-    out << source;
+    out << "} // namespace nbgen\n\nNB_MODULE(" << module_name << ", m) {\n"
+        << body << "}\n";
     return bool(out);
 }
 
