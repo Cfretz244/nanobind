@@ -629,6 +629,64 @@ pImpl idiom, e.g. pugixml's ``xml_node_struct`` behind ``internal_object()`` —
 is opaque on every path, and members mentioning a pointer/reference to one are
 skipped automatically (no manual ``nb::exclude_`` needed).
 
+The emit backend (full source codegen)
+---------------------------------------
+
+``nb::reflect_`` requires the experimental P2996 compiler to build the
+*shipping* module. The **emit backend** removes that requirement from the
+artifact: a small generator program -- the only thing compiled by the
+reflection toolchain -- walks exactly the same metadata, makes exactly the
+same decisions (both backends call one set of shared classifiers in
+``nb_reflect.h``), and writes a complete, self-contained binding translation
+unit of ordinary nanobind code: plain C++17/20, no reflection constructs, no
+``nb_reflect*.h`` includes. Any production compiler then builds the module
+from that file.
+
+.. code-block:: cpp
+
+   // gen.cpp -- compiled by the P2996 toolchain, run at build time
+   #include <nanobind/nb_reflect_emit.h>
+   #include <my/lib.h>
+
+   int main(int argc, char** argv) {
+       return nanobind::write_bindings(argv[1],
+           nanobind::emit_bindings<^^my_ns>(
+               "my_ext",                       // the NB_MODULE name
+               "#include <my/lib.h>\n"))       // the generated TU's preamble
+           ? 0 : 1;
+   }
+
+The caller supplies the include preamble (only the generator knows the
+library's headers); the required ``<nanobind/stl/*.h>`` caster includes are
+emitted automatically. The generated file is deterministic, reviewable, and
+auditable: members the emitter cannot express are skipped with a
+``// skipped:`` comment, never silently.
+
+**Trampolines are opt-in via pack markers**, so the two backends trampoline
+the same classes and present identical Python surfaces:
+``^^nb::trampoline_<^^my::Widget>`` gives exactly the listed classes inline
+generated trampolines (the analogue of a hand-written
+``NB_REFLECT_TRAMPOLINE``); ``^^nb::trampoline_all_`` covers every class with
+overridable virtuals (the two-stage ``emit_trampolines`` rule). The constexpr
+backend treats both markers as inert configuration.
+
+Decisions only a compiler can answer are emitted as the *identical probes*
+into the generated source -- the static-``const`` by-value probe
+(BINDER-0020) and the ``__str__`` streamability probe -- so the production
+compiler answers the same question the reflection compiler would have.
+
+Emit-mode limitations (relative to ``reflect_``):
+
+- Every bound entity must be **nameable as text** from the generated TU:
+  anonymous classes/enums without a typedef-for-linkage name, lambda-typed
+  members, and entities inside anonymous namespaces are skipped (with a
+  comment). The constexpr backend can bind some of these via splices.
+- The bound surface must live in **headers** reachable from the preamble;
+  declarations local to the generator's own TU cannot be re-included.
+- The emitted probes are answered by the production compiler against *its*
+  standard library; under extreme stdlib version skew the two backends could
+  in principle disagree.
+
 Limitations
 -----------
 
