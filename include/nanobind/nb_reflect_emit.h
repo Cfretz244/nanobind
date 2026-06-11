@@ -425,7 +425,7 @@ consteval void append_method(std::string& out, std::string_view cls_spell,
                              std::string_view callee_name,
                              std::string_view call_prefix,
                              std::string_view extra_extras) {
-    auto ft = std::meta::type_of(Fn);
+    auto ft = nb_fn_type_of(Fn);   // resolves a deferred noexcept-spec (GCC-5)
     std::string ret = type_spelling(std::meta::return_type_of(ft));
     param_text pt = params_for(Fn);
     if (ret.empty() || !pt.ok) {
@@ -452,7 +452,7 @@ template <std::meta::info Fn>
 consteval void append_static_method(std::string& out,
                                     std::string_view bind_name,
                                     std::string_view callee) {
-    auto ft = std::meta::type_of(Fn);
+    auto ft = nb_fn_type_of(Fn);   // resolves a deferred noexcept-spec (GCC-5)
     std::string ret = type_spelling(std::meta::return_type_of(ft));
     param_text pt = params_for(Fn);
     if (ret.empty() || !pt.ok) {
@@ -627,7 +627,7 @@ consteval void append_stream_str(std::string& out) {
 consteval bool append_memfn_ptr_cast(std::string& out,
                                      std::string_view owner_spell,
                                      std::meta::info fn) {
-    auto ft = std::meta::type_of(fn);
+    auto ft = nb_fn_type_of(fn);   // resolves a deferred noexcept-spec (GCC-5)
     std::string ret = type_spelling(std::meta::return_type_of(ft));
     std::string tail = spell_fn_tail(ft);
     if (ret.empty() || tail.empty())
@@ -1341,7 +1341,7 @@ consteval std::string probe_member_name(std::meta::info fn) {
 template <std::meta::info Fn>
 consteval void append_probe_fn(std::string& out, std::string_view tag,
                                std::size_t& n) {
-    auto ft = std::meta::type_of(Fn);
+    auto ft = nb_fn_type_of(Fn);   // resolves a deferred noexcept-spec (GCC-5)
     std::string name = probe_member_name(Fn);
     std::string ret = type_spelling(std::meta::return_type_of(ft));
     std::string tail = spell_fn_tail(ft);

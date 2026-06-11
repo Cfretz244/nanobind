@@ -585,6 +585,15 @@ struct Box {
     explicit Box(T v) : value(v) {}
     T get() const { return value; }
     void set(T v) { value = v; }
+    // Dependent noexcept-specifier (the nlohmann basic_json::swap shape):
+    // GCC 16 keeps it deferred for the instantiated member, and matching the
+    // spliced function type against the method-binder matrix ICE'd until the
+    // binder forced resolution via nb_fn_type_of (GCC-5).
+    void swap_with(Box& other) noexcept(noexcept(T(static_cast<T&&>(other.value)))) {
+        T tmp = static_cast<T&&>(value);
+        value = static_cast<T&&>(other.value);
+        other.value = static_cast<T&&>(tmp);
+    }
 };
 
 template <class A, class B>

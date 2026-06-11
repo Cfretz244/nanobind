@@ -543,6 +543,20 @@ consteval bool method_shape_bindable(std::meta::info fn) {
         && !nb_has_ellipsis_parameter(fn);
 }
 
+// GCC 16 keeps a member's DEPENDENT noexcept-specifier deferred until
+// something forces its resolution; matching such a function type against a
+// binder-spec partial-specialization matrix then ICEs the compiler
+// (most_specialized_partial_spec -> nothrow_spec_p assert; GCC-5,
+// gcc16-proveout/probes/xfail_gcc5_deferred_noexcept_partial_spec.cpp --
+// nlohmann basic_json's swap(reference) with its trait-expression noexcept
+// was the field shape). is_noexcept resolves the specifier as a side effect,
+// so every matrix dispatch takes the function type through this helper
+// instead of splicing type_of directly. Behavior-neutral on clang-p2996.
+consteval std::meta::info nb_fn_type_of(std::meta::info fn) {
+    (void)std::meta::is_noexcept(fn);
+    return std::meta::type_of(fn);
+}
+
 template <typename T, std::meta::info fn, typename FnType>
 struct reflect_method_binder;
 
@@ -579,7 +593,7 @@ void reflect_bind_method(auto& cls) {
     // breaking the build (an unmatched function type would select the
     // incomplete binder primary).
     if constexpr (method_shape_bindable(fn)) {
-        using FnType = [:std::meta::type_of(fn):];
+        using FnType = [:nb_fn_type_of(fn):];
         with_arg_call_extras<fn>([&](auto&&... e) {
             reflect_method_binder<T, fn, FnType>::bind(
                 cls, entity_name<fn>(), std::forward<decltype(e)>(e)...);
@@ -611,7 +625,7 @@ NB_REFLECT_DEFINE_STATIC_BINDER(noexcept)
 template <std::meta::info fn>
 void reflect_bind_static_method(auto& cls) {
     if constexpr (!nb_has_ellipsis_parameter(fn)) {
-        using FnType = [:std::meta::type_of(fn):];
+        using FnType = [:nb_fn_type_of(fn):];
         with_arg_call_extras<fn>([&](auto&&... e) {
             reflect_static_method_binder<fn, FnType>::bind(
                 cls, entity_name<fn>(), std::forward<decltype(e)>(e)...);
@@ -829,7 +843,7 @@ void reflect_free_function(module_& m) {
                   !has_unbindable_signature(fn) &&
                   (std::meta::has_identifier(fn) ||
                    std::meta::has_template_arguments(fn))) {
-        using FnType = [:std::meta::type_of(fn):];
+        using FnType = [:nb_fn_type_of(fn):];
         with_arg_call_extras<fn>([&](auto&&... e) {
             reflect_free_fn_binder<fn, FnType>::bind(
                 m, entity_name<fn>(), std::forward<decltype(e)>(e)...);
@@ -1055,7 +1069,7 @@ void reflect_bind_operator(auto& cls) {
     constexpr const char* dunder =
         operator_dunder(op, std::meta::parameters_of(fn).size());
     if constexpr (dunder != nullptr && !nb_has_ellipsis_parameter(fn)) {
-        using FnType = [:std::meta::type_of(fn):];
+        using FnType = [:nb_fn_type_of(fn):];
         // The volatile/&&-qualified shapes are excluded by the binder-spec
         // completeness gate (no partial specialization exists for them; sizeof
         // on the undefined primary is a substitution failure) rather than by
@@ -1518,7 +1532,7 @@ void bind_free_operators(auto& cls) {
             if constexpr (is_bindable_free_operator<fn>()
                 && !has_ann<fn, reflect::skip>()
                 && !fn_mentions_excluded(fn, excluded_v<Rs...>)) {
-                using FnType = [:std::meta::type_of(fn):];
+                using FnType = [:nb_fn_type_of(fn):];
                 reflect_free_operator_binder<T, fn, FnType>::bind(cls);
             }
         };
@@ -1692,7 +1706,7 @@ void reflect_bind_member_template(auto& cls) {
         reflect_bind_operator<T, default_spec(tmpl)>(cls);
     } else if constexpr (route != member_tmpl_route::skip) {
         constexpr auto spec = default_spec(tmpl);
-        using FnType = [:std::meta::type_of(spec):];
+        using FnType = [:nb_fn_type_of(spec):];
         constexpr const char* nm = std::define_static_string(
             std::meta::identifier_of(tmpl));
         if constexpr (route == member_tmpl_route::static_method) {

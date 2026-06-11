@@ -529,6 +529,13 @@ def test36_template_nested_and_multi_arg(t):
     a = t.ArrayInt3()
     assert a.size() == 3
 
+    # Dependent-noexcept member (the basic_json::swap shape; GCC-5
+    # regression): the matrix dispatch must not choke on the deferred
+    # noexcept-specifier, and the method binds and works.
+    s1, s2 = t.BoxInt(1), t.BoxInt(2)
+    s1.swap_with(s2)
+    assert s1.get() == 2 and s2.get() == 1
+
 
 def test37_template_auto_discovery(t):
     # UsesBoxes references the specializations only via its signatures; they are
