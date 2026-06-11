@@ -425,30 +425,76 @@ void with_arg_call_extras(F&& emit) {
         with_call_extras<fn>(std::forward<F>(emit));
 }
 
+// --- Shared binding-decision classifiers (value-form) ---
+//
+// Each classifier below is the single source of truth for one WHAT-to-bind
+// decision, shared verbatim by the constexpr backend (reflect_) and the emit
+// backend (nb_reflect_emit.h, which renders the same decisions as generated
+// source for a production toolchain). Emission stays in the reflect_bind_* /
+// emit_* layers; no binding decision may live only there.
+
+/// How a non-static data member binds: not at all, read-only, or read-write.
+/// skip: [[=reflect::skip]] members and C-array-typed members -- an array data
+/// member (e.g. an internal `T storage[N]`, as in absl::FixedArray's storage
+/// wrapper) has no def_rw-able form: the setter `c.*p = value` is ill-formed
+/// for an array, and even def_ro can't expose it usefully. ro: def_rw's setter
+/// assigns (`c.*p = value`), so a const or non-copy-assignable member (e.g. a
+/// move-only `node_handle` inside absl's insert_return_type) is exposed
+/// read-only via def_ro instead of breaking the build.
+enum class data_route { skip, ro, rw };
+consteval data_route data_member_route(std::meta::info mem) {
+    auto t = std::meta::type_of(mem);
+    if (!std::meta::annotations_of(mem, ^^reflect::skip).empty()
+        || std::meta::is_array_type(t))
+        return data_route::skip;
+    if (std::meta::is_const_type(t) || !std::meta::is_copy_assignable_type(t))
+        return data_route::ro;
+    return data_route::rw;
+}
+
+/// How a static data member binds. const_member splits further at COMPILE time
+/// in the consuming TU (value_as_nttp_probe below: by VALUE when the member is
+/// constant-readable, by address otherwise); both backends compile the
+/// identical probe, so the production compiler answers the same question for
+/// generated source.
+enum class static_data_route { skip, const_member, mutable_member };
+consteval static_data_route static_member_route(std::meta::info mem) {
+    if (!std::meta::annotations_of(mem, ^^reflect::skip).empty())
+        return static_data_route::skip;
+    return std::meta::is_const_type(std::meta::type_of(mem))
+        ? static_data_route::const_member : static_data_route::mutable_member;
+}
+
 template <typename T, std::meta::info mem>
 void reflect_bind_member(auto& cls) {
-    // Skip [[=reflect::skip]] members and C-array-typed members. An array data member
-    // (e.g. an internal `T storage[N]`, as in absl::FixedArray's storage wrapper) has no
-    // def_rw-able form: the setter `c.*p = value` is ill-formed for an array, and even
-    // def_ro can't expose it usefully. Mirrors the unnamed/volatile/template member skips.
-    if constexpr (!has_ann<mem, reflect::skip>()
-                  && !std::meta::is_array_type(std::meta::type_of(mem))) {
+    constexpr data_route route = data_member_route(mem);
+    if constexpr (route != data_route::skip) {
         constexpr auto name = entity_name<mem>();
         // Bind via a pointer-to-data-member (&[:mem:]) rather than getter/setter
         // lambdas: a lambda whose signature mentions the spliced member type
         // [:type_of(mem):] crashes the clang-p2996 mangler when passed to the
         // dependent `cls.def_*` call (placeholder-type mangling at parse time).
         with_data_extras<mem>([&](auto&&... e) {
-            // def_rw's setter assigns (`c.*p = value`), so a const or non-copy-assignable
-            // member (e.g. a move-only `node_handle` inside absl's insert_return_type) is
-            // exposed read-only via def_ro instead of breaking the build.
-            if constexpr (std::meta::is_const_type(std::meta::type_of(mem)) ||
-                          !std::meta::is_copy_assignable_type(std::meta::type_of(mem)))
+            if constexpr (route == data_route::ro)
                 cls.def_ro(name, &[:mem:], std::forward<decltype(e)>(e)...);
             else
                 cls.def_rw(name, &[:mem:], std::forward<decltype(e)>(e)...);
         });
     }
+}
+
+/// Shape filter for instance methods (and the matrix the method binders below
+/// model): volatile and rvalue-ref-qualified (&&) member functions, and
+/// C-variadic functions, cannot bind meaningfully to a persistent Python
+/// instance. The operator/member-template/proxy paths express the SAME filter
+/// structurally, as the binder-spec completeness gate (`sizeof` on the
+/// undefined reflect_method_binder primary is a substitution failure for any
+/// unmodeled shape) -- this predicate and that gate must accept exactly the
+/// same function types.
+consteval bool method_shape_bindable(std::meta::info fn) {
+    return !std::meta::is_volatile(fn)
+        && !std::meta::is_rvalue_reference_qualified(fn)
+        && !std::meta::has_ellipsis_parameter(fn);
 }
 
 template <typename T, std::meta::info fn, typename FnType>
@@ -483,13 +529,10 @@ NB_REFLECT_DEFINE_METHOD_BINDER(const & noexcept, const)
 
 template <typename T, std::meta::info fn>
 void reflect_bind_method(auto& cls) {
-    // Skip shapes that cannot bind meaningfully to a persistent Python instance:
-    // volatile and rvalue-ref-qualified (&&) member functions, and C-variadic
-    // functions. Skipping leaves them simply unexposed rather than breaking the
-    // build (an unmatched function type would select the incomplete primary).
-    if constexpr (!std::meta::is_volatile(fn) &&
-                  !std::meta::is_rvalue_reference_qualified(fn) &&
-                  !std::meta::has_ellipsis_parameter(fn)) {
+    // Skipping unmodeled shapes leaves them simply unexposed rather than
+    // breaking the build (an unmatched function type would select the
+    // incomplete binder primary).
+    if constexpr (method_shape_bindable(fn)) {
         using FnType = [:std::meta::type_of(fn):];
         with_arg_call_extras<fn>([&](auto&&... e) {
             reflect_method_binder<T, fn, FnType>::bind(
@@ -544,9 +587,10 @@ template <long double> struct value_as_nttp_probe;
 
 template <typename T, std::meta::info mem>
 void reflect_bind_static_member(auto& cls) {
-    if constexpr (!has_ann<mem, reflect::skip>()) {
+    constexpr static_data_route route = static_member_route(mem);
+    if constexpr (route != static_data_route::skip) {
         constexpr auto name = entity_name<mem>();
-        if constexpr (std::meta::is_const_type(std::meta::type_of(mem))) {
+        if constexpr (route == static_data_route::const_member) {
             // def_ro_static binds by ADDRESS (&[:mem:]), which ODR-uses the
             // member; an in-class-initialized `static const` with no
             // out-of-line definition (moodycamel::ConcurrentQueue's BLOCK_SIZE
@@ -797,12 +841,12 @@ void reflect_bind_ctor_expand(auto& cls, std::index_sequence<Is...>) {
     }
 }
 
+// Eligibility (skip-annotation, move-only by-value params, unbindable shapes,
+// exclusions, ...) is decided by ctor_binds at the call site in
+// bind_class_contents; this only expands the parameter list.
 template <std::meta::info ctor>
 void reflect_bind_ctor(auto& cls) {
-    if constexpr (!has_ann<ctor, reflect::skip>()
-                  && !has_move_only_by_value_param(ctor)
-                  && !has_unbindable_signature(ctor))
-        reflect_bind_ctor_expand<ctor>(cls, std::make_index_sequence<ctor_param_count<ctor>()>{});
+    reflect_bind_ctor_expand<ctor>(cls, std::make_index_sequence<ctor_param_count<ctor>()>{});
 }
 
 // --- Inheritance ---
@@ -841,18 +885,23 @@ consteval void collect_public_base_subtree(std::meta::info type,
 // facade chain like flat_hash_map -> raw_hash_map -> raw_hash_set). Note an
 // unbound link BETWEEN T and an indirect PyBase is not in PyBase's subtree, so
 // its members correctly flatten onto T.
-template <typename T, std::meta::info PyBase>
-consteval std::vector<std::meta::info> flatten_bases_vec() {
+consteval std::vector<std::meta::info> flatten_bases_vec(std::meta::info cls,
+                                                         std::meta::info pybase) {
     std::vector<std::meta::info> all, covered, result;
-    collect_public_base_subtree(^^T, all);
-    if (PyBase != ^^void) {
-        covered.push_back(PyBase);
-        collect_public_base_subtree(PyBase, covered);
+    collect_public_base_subtree(cls, all);
+    if (pybase != ^^void) {
+        covered.push_back(pybase);
+        collect_public_base_subtree(pybase, covered);
     }
     for (auto t : all)
         if (!info_vec_contains(covered, t))
             result.push_back(t);
     return result;
+}
+
+template <typename T, std::meta::info PyBase>
+consteval std::vector<std::meta::info> flatten_bases_vec() {
+    return flatten_bases_vec(^^T, PyBase);
 }
 
 // --- Operators and conversions ---
@@ -969,11 +1018,10 @@ void reflect_bind_operator(auto& cls) {
 // type, or ^^void if there is none. Multiple integral conversions would otherwise
 // each bind __int__ with the last-bound silently winning, which can pick an
 // arbitrarily narrow result (absl::int128's operator char/int/long/...).
-template <typename T>
-consteval std::meta::info widest_integral_conversion() {
+consteval std::meta::info widest_integral_conversion(std::meta::info cls) {
     std::meta::info best = ^^void;
     std::size_t best_size = 0;
-    for (auto fn : std::meta::members_of(^^T, std::meta::access_context::unchecked())) {
+    for (auto fn : std::meta::members_of(cls, std::meta::access_context::unchecked())) {
         if (!std::meta::is_function(fn) || std::meta::is_template(fn))
             continue;
         if (!std::meta::is_public(fn) || !std::meta::is_conversion_function(fn))
@@ -993,6 +1041,11 @@ consteval std::meta::info widest_integral_conversion() {
         }
     }
     return best;
+}
+
+template <typename T>
+consteval std::meta::info widest_integral_conversion() {
+    return widest_integral_conversion(^^T);
 }
 
 template <typename T, std::meta::info fn>
@@ -1195,6 +1248,52 @@ consteval bool proxy_mentions_excluded(std::meta::info proxy,
         || std::meta::is_constructor(u) || std::meta::is_destructor(u))
         return false;
     return fn_mentions_excluded(u, ex);
+}
+
+// --- Constructor classifiers (shared, see data_member_route's section note) ---
+
+/// True when class `cls` may bind declared constructors at all. An abstract
+/// class WITHOUT a trampoline (e.g. an interface base bound only so its
+/// concrete descendants have a Python base, like spdlog::sinks::sink) gets
+/// none: nb::init would have to instantiate it, ill-formed -- Python-side
+/// instantiation raises TypeError instead (BINDER-0011). With a registered
+/// trampoline the ctors DO bind: nb::init then constructs the Alias, which is
+/// exactly how a Python subclass overriding pure virtuals is instantiated.
+consteval bool class_constructs(std::meta::info cls, bool has_trampoline) {
+    return !std::meta::is_abstract_type(cls) || has_trampoline;
+}
+
+/// True when Python-side COPY construction binds (BINDER-0013, found via
+/// tl::expected): the ctor pass skips copy/move ctors (a bound init<T&&> would
+/// gut its Python source object), but copying a bound instance is part of any
+/// copyable type's real API -- init<const T&> binds when T is publicly
+/// copy-constructible. Trampolined classes are excluded: nb::init
+/// placement-news the Alias for Python-derived instances, and a trampoline has
+/// no (const T&) constructor. Move ctors never bind.
+consteval bool binds_copy_ctor(std::meta::info cls, bool has_trampoline) {
+    return !std::meta::is_abstract_type(cls) && !has_trampoline
+        && std::meta::is_copy_constructible_type(cls);
+}
+
+/// The full eligibility gate for one declared constructor. The proxy guard
+/// comes first: is_constructor on an entity proxy was an UNREACHABLE in
+/// clang-p2996 before the TC-0003 fix (upstreamed as bloomberg/clang-p2996
+/// #290), so the binder does not rely on the patched ordering of the kind
+/// switch. `T() = delete;` is enumerable but must not bind: init<> would call
+/// it, a TU-wide hard error (BINDER-0012, tl::unexpected<E>). Constructor
+/// templates cannot reflect and are skipped.
+consteval bool ctor_binds(std::meta::info fn, std::span<const std::meta::info> ex) {
+    return !is_using_proxy(fn)
+        && std::meta::is_constructor(fn)
+        && std::meta::is_public(fn)
+        && !std::meta::is_deleted(fn)
+        && !std::meta::is_template(fn)
+        && !std::meta::is_copy_constructor(fn)
+        && !std::meta::is_move_constructor(fn)
+        && !fn_skip_annotated(fn)
+        && !has_move_only_by_value_param(fn)
+        && !has_unbindable_signature(fn)
+        && !fn_mentions_excluded(fn, ex);
 }
 
 // --- Free (namespace-scope) operators -> dunders ---
@@ -1413,10 +1512,9 @@ void reflect_bind_property(auto& cls) {
 // Database::getHeaderInfo -- const member + static overload) compiles clean
 // and then ABORTS at import during type finalization. The instance method
 // wins; the shadowed static is skipped.
-template <typename T>
-consteval bool instance_method_shadows(std::string_view name) {
+consteval bool instance_method_shadows(std::meta::info cls, std::string_view name) {
     for (auto m : std::meta::members_of(
-             ^^T, std::meta::access_context::unchecked())) {
+             cls, std::meta::access_context::unchecked())) {
         if (is_using_proxy(m) || !std::meta::is_function(m)
             || std::meta::is_template(m))
             continue;
@@ -1429,6 +1527,11 @@ consteval bool instance_method_shadows(std::string_view name) {
             return true;
     }
     return false;
+}
+
+template <typename T>
+consteval bool instance_method_shadows(std::string_view name) {
+    return instance_method_shadows(^^T, name);
 }
 
 // Route a public member function to the right binder. Operators and conversion
@@ -1612,44 +1715,20 @@ void reflect_bind_proxy(auto& cls) {
 // the pack's nb::exclude_ set (a signature mentioning an excluded entity skips).
 template <typename T, std::meta::info... Rs>
 void bind_class_contents(auto& cls) {
-    // Bind constructors. An abstract class WITHOUT a trampoline (e.g. an interface
-    // base bound only so its concrete descendants have a Python base, like
-    // spdlog::sinks::sink) gets none: nb::init would have to instantiate T, which is
-    // ill-formed -- Python-side instantiation raises TypeError instead (BINDER-0011).
-    // With a registered trampoline the ctors DO bind: nb::init then constructs the
-    // Alias, which is exactly how a Python subclass overriding pure virtuals is
-    // instantiated. The proxy guard comes first: is_constructor on an
-    // entity proxy was an UNREACHABLE in clang-p2996 before the TC-0003 fix
-    // (upstreamed as bloomberg/clang-p2996#290), so the binder does not rely
-    // on the patched ordering of the kind switch.
-    if constexpr (!std::is_abstract_v<T> || has_reflect_trampoline<T>) {
+    // Bind constructors; class_constructs / ctor_binds (the shared classifiers)
+    // hold the BINDER-0011/0012 rationale.
+    if constexpr (class_constructs(^^T, has_reflect_trampoline<T>)) {
         template for (constexpr auto fn :
             std::define_static_array(std::meta::members_of(
                 ^^T, std::meta::access_context::unchecked()))) {
-            if constexpr (!is_using_proxy(fn)
-                && std::meta::is_constructor(fn)
-                && std::meta::is_public(fn)
-                && !std::meta::is_deleted(fn)    // `T() = delete;` is enumerable but must
-                                                 // not bind: init<> would call it, a TU-wide
-                                                 // hard error (BINDER-0012, tl::unexpected<E>)
-                && !std::meta::is_template(fn)   // skip constructor templates (cannot reflect)
-                && !std::meta::is_copy_constructor(fn)
-                && !std::meta::is_move_constructor(fn)
-                && !fn_mentions_excluded(fn, excluded_v<Rs...>)) {
+            if constexpr (ctor_binds(fn, excluded_v<Rs...>)) {
                 reflect_bind_ctor<fn>(cls);
             }
         };
     }
 
-    // Python-side COPY construction (BINDER-0013, found via tl::expected): the
-    // pass above skips copy/move ctors (a bound init<T&&> would gut its Python
-    // source object), but copying a bound instance is part of any copyable
-    // type's real API -- bind init<const T&> when T is publicly
-    // copy-constructible. Trampolined classes are excluded: nb::init
-    // placement-news the Alias for Python-derived instances, and a trampoline
-    // has no (const T&) constructor.
-    if constexpr (!std::is_abstract_v<T> && !has_reflect_trampoline<T>
-                  && std::is_copy_constructible_v<T>)
+    // Python-side COPY construction (BINDER-0013; rationale on binds_copy_ctor).
+    if constexpr (binds_copy_ctor(^^T, has_reflect_trampoline<T>))
         cls.def(reflect_init<const T&>());
 
     // Bind data members. Skip unnamed members (anonymous union/struct fields, e.g. glm's
