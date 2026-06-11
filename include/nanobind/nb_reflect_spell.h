@@ -335,7 +335,19 @@ consteval std::string type_spelling(std::meta::info t) {
     if (std::meta::dealias(t) == ^^char8_t)  return "char8_t";
     if (std::meta::dealias(t) == ^^char16_t) return "char16_t";
     if (std::meta::dealias(t) == ^^char32_t) return "char32_t";
-    return std::string(std::meta::display_string_of(t));
+    // The GNU/Clang builtin 128-bit integers: display_string_of punts with
+    // "(anonymous type)" (absl::int128's ctor/conversion surface), but both
+    // toolchains spell them as keywords.
+    if (std::meta::dealias(t) == ^^__int128)          return "__int128";
+    if (std::meta::dealias(t) == ^^unsigned __int128) return "unsigned __int128";
+    // Safety net for any remaining display punt ("(anonymous type)",
+    // "(unsupported-reflection)", ...): propagate UNSPELLABLE rather than
+    // emitting a parse error into the generated TU; the spellability gates
+    // then skip the member.
+    std::string_view d = std::meta::display_string_of(t);
+    if (d.empty() || d[0] == '(')
+        return {};
+    return std::string(d);
 }
 
 consteval bool type_spellable(std::meta::info t) {

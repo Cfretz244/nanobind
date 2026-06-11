@@ -30,6 +30,12 @@ static_assert(
     nb::detail::type_spelling(^^std::wstring)
         == "::std::basic_string<wchar_t, ::std::char_traits<wchar_t>, "
            "::std::allocator<wchar_t>>");
+// The builtin 128-bit integers display as "(anonymous type)" (absl::int128's
+// ctor/conversion surface) but spell as keywords; any other display punt
+// propagates UNSPELLABLE rather than emitting a parse error.
+static_assert(nb::detail::type_spelling(^^__int128) == "__int128");
+static_assert(nb::detail::type_spelling(^^unsigned __int128)
+              == "unsigned __int128");
 
 // The trampoline lives OUTSIDE the reflected namespace so reflect_ does not try
 // to bind it as a class; it is wired in only via NB_REFLECT_TRAMPOLINE.
