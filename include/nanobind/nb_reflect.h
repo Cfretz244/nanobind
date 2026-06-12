@@ -163,6 +163,53 @@ consteval std::string sanitize_identifier(std::string_view in) {
     return s;
 }
 
+// Compiler-neutral CamelCase fragment for a builtin scalar type. Builtin types
+// carry no identifier, so spec_camel_name otherwise falls back to
+// display_string_of -- which spells the integral types differently across
+// compilers (clang: "long long"/"long"/"short"/"unsigned long long";
+// libstdc++/GCC: "long long int"/"long int"/"short int"/"long long unsigned
+// int"). That made template-spec Python names diverge by backend
+// (to_string<long long> -> "to_stringLonglong0" vs "to_stringLonglongint0").
+// Mapping the canonical builtin types to a fixed fragment keeps both backends
+// identical; returns an empty string for non-builtins (caller falls back). The
+// fragments reproduce EXACTLY what the prior display_string_of path produced on
+// clang-p2996 (sanitize_identifier + capitalize_first of clang's spelling), so
+// no clang-backend Python name changes; only GCC's divergent integral spellings
+// are pinned to the same value.
+consteval std::string builtin_camel_fragment(std::meta::info type) {
+    type = std::meta::remove_cvref(type);
+    struct Entry { std::meta::info t; std::string_view frag; };
+    const Entry table[] = {
+        {^^bool, "Bool"},
+        {^^char, "Char"},
+        {^^signed char, "Signedchar"},
+        {^^unsigned char, "Unsignedchar"},
+        {^^char8_t, "Char8_t"},
+        {^^char16_t, "Char16_t"},
+        {^^char32_t, "Char32_t"},
+        {^^short, "Short"},
+        {^^unsigned short, "Unsignedshort"},
+        {^^int, "Int"},
+        {^^unsigned int, "Unsignedint"},
+        {^^long, "Long"},
+        {^^unsigned long, "Unsignedlong"},
+        {^^long long, "Longlong"},
+        {^^unsigned long long, "Unsignedlonglong"},
+        {^^float, "Float"},
+        {^^double, "Double"},
+        {^^long double, "Longdouble"},
+        {^^void, "Void"},
+    };
+    for (auto& e : table)
+        if (type == e.t)
+            return std::string(e.frag);
+    // wchar_t deliberately omitted: clang's display_string_of spells it "int"
+    // (-> "Int"), GCC spells it "wchar_t". Neither is depended on; leaving it to
+    // the caller's fallback preserves each backend's historical name. (If a run
+    // ever binds a wchar_t spec, pin it here.)
+    return std::string();
+}
+
 // Build a CamelCase Python name for a class/function template specialization:
 // the template's base identifier followed by each template argument, capitalized
 // and concatenated. Type args that are themselves specializations recurse
@@ -194,6 +241,9 @@ consteval std::string spec_camel_name(std::meta::info type) {
                 if (is_stl_policy(a))
                     continue;                            // allocator/comparator/...
                 out += capitalize_first(spec_camel_name(a));
+            } else if (std::string frag = builtin_camel_fragment(a);
+                       !frag.empty()) {
+                out += frag;                             // compiler-neutral builtin
             } else if (std::meta::has_identifier(a)) {
                 out += capitalize_first(std::string(std::meta::identifier_of(a)));
             } else {
