@@ -1957,6 +1957,17 @@ consteval std::vector<std::meta::info> liftable_class_members(std::meta::info cl
     return liftable_class_members(cls, cls, {});
 }
 
+// The lifted member list, memoized once per (class, derived, pack): the
+// constructor, method, and property passes (and their emit twins) all walk the
+// same list, and recomputing it per pass repeats the members_of walk plus -- in
+// the presence of exclude_member_ rules -- a base-subtree scan per member. A
+// variable template also satisfies GCC's expansion-statement-range rule (a
+// constexpr local would be rejected inside a template, the emit_indices_v
+// pattern).
+template <std::meta::info Cls, std::meta::info Derived, std::meta::info... Rs>
+inline constexpr auto liftable_members_v = std::define_static_array(
+    liftable_class_members(Cls, Derived, excluded_members_v<Rs...>));
+
 consteval class_member_kind classify_class_member(
         std::meta::info fn, std::span<const std::meta::info> ex) {
     if (std::meta::is_function(fn)
@@ -1987,8 +1998,7 @@ void bind_class_contents(auto& cls) {
     // Bind constructors; class_constructs / ctor_binds (the shared classifiers)
     // hold the BINDER-0011/0012 rationale.
     if constexpr (class_constructs(^^T, has_reflect_trampoline<T>)) {
-        template for (constexpr auto fn :
-            std::define_static_array(liftable_class_members(^^T, ^^T, excluded_members_v<Rs...>))) {
+        template for (constexpr auto fn : liftable_members_v<^^T, ^^T, Rs...>) {
             if constexpr (ctor_binds(fn, excluded_v<Rs...>)) {
                 reflect_bind_ctor<fn>(cls);
             }
@@ -2026,8 +2036,7 @@ void bind_class_contents(auto& cls) {
     // function templates bind via their default instantiation when every template
     // parameter is defaulted; others skip. Deleted functions are filtered on every
     // path: public + enumerable, but calling one is a hard error (BINDER-0012).
-    template for (constexpr auto fn :
-        std::define_static_array(liftable_class_members(^^T, ^^T, excluded_members_v<Rs...>))) {
+    template for (constexpr auto fn : liftable_members_v<^^T, ^^T, Rs...>) {
         constexpr class_member_kind kind =
             classify_class_member(fn, excluded_v<Rs...>);
         if constexpr (kind == class_member_kind::fn)
@@ -2041,8 +2050,7 @@ void bind_class_contents(auto& cls) {
     // annotations_of(fn), which is ill-formed on a template, so a templated member must
     // be excluded *before* it is instantiated (a nested if constexpr, not an &&
     // short-circuit).
-    template for (constexpr auto fn :
-        std::define_static_array(liftable_class_members(^^T, ^^T, excluded_members_v<Rs...>))) {
+    template for (constexpr auto fn : liftable_members_v<^^T, ^^T, Rs...>) {
         if constexpr (classify_class_member(fn, excluded_v<Rs...>)
                       == class_member_kind::fn) {
             if constexpr (is_property_getter<fn>()) {
@@ -2080,8 +2088,7 @@ void flatten_base_members(auto& cls) {
     // all-defaulted parameters bind via their default instantiation -- this is
     // where flat_hash_map's heterogeneous contains/find/erase/operator[] live
     // (declared on the flattened raw_hash_map/raw_hash_set ancestry).
-    template for (constexpr auto fn :
-        std::define_static_array(liftable_class_members(Base, ^^T, excluded_members_v<Rs...>))) {
+    template for (constexpr auto fn : liftable_members_v<Base, ^^T, Rs...>) {
         constexpr class_member_kind kind =
             classify_class_member(fn, excluded_v<Rs...>);
         if constexpr (kind == class_member_kind::fn)

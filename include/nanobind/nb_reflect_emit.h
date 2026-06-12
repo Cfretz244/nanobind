@@ -649,8 +649,7 @@ template <std::meta::info Cls, std::meta::info Getter>
 consteval std::meta::info emit_find_setter() {
     constexpr std::string_view gname = prop_name<Getter>();
     std::meta::info found = ^^void;
-    template for (constexpr auto fn : std::define_static_array(
-                      liftable_class_members(Cls))) {
+    template for (constexpr auto fn : liftable_members_v<Cls, Cls>) {
         if constexpr (is_property_setter<fn>() && !std::meta::is_deleted(fn)) {
             if (std::string_view(prop_name<fn>()) == gname)
                 found = fn;
@@ -766,8 +765,7 @@ consteval void append_class_contents(std::string& out,
     // Constructors (class_constructs / ctor_binds hold the BINDER-0011/0012
     // rationale).
     if constexpr (class_constructs(Cls, HasTramp)) {
-        template for (constexpr auto fn : std::define_static_array(
-                          liftable_class_members(Cls, Cls, excluded_members_v<Rs...>))) {
+        template for (constexpr auto fn : liftable_members_v<Cls, Cls, Rs...>) {
             if constexpr (ctor_binds(fn, excluded_v<Rs...>))
                 append_ctor<fn>(out);
         };
@@ -801,8 +799,7 @@ consteval void append_class_contents(std::string& out,
     };
 
     // Methods / member templates (one shared kind-router).
-    template for (constexpr auto fn : std::define_static_array(
-                      liftable_class_members(Cls, Cls, excluded_members_v<Rs...>))) {
+    template for (constexpr auto fn : liftable_members_v<Cls, Cls, Rs...>) {
         constexpr class_member_kind kind =
             classify_class_member(fn, excluded_v<Rs...>);
         if constexpr (kind == class_member_kind::fn)
@@ -812,8 +809,7 @@ consteval void append_class_contents(std::string& out,
     };
 
     // Properties.
-    template for (constexpr auto fn : std::define_static_array(
-                      liftable_class_members(Cls, Cls, excluded_members_v<Rs...>))) {
+    template for (constexpr auto fn : liftable_members_v<Cls, Cls, Rs...>) {
         if constexpr (classify_class_member(fn, excluded_v<Rs...>)
                       == class_member_kind::fn) {
             if constexpr (is_property_getter<fn>())
@@ -857,8 +853,7 @@ consteval void append_flatten_base(std::string& out,
     // the splice does -- a same-named member of Cls cannot shadow it. The
     // `template` disambiguator for member templates is part of their callee.
     std::string call_prefix = base_spell + "::";
-    template for (constexpr auto fn : std::define_static_array(
-                      liftable_class_members(Base, Cls, excluded_members_v<Rs...>))) {
+    template for (constexpr auto fn : liftable_members_v<Base, Cls, Rs...>) {
         constexpr class_member_kind kind =
             classify_class_member(fn, excluded_v<Rs...>);
         if constexpr (kind == class_member_kind::fn)
@@ -1406,8 +1401,7 @@ consteval void append_probe_ctor(std::string& out, std::string_view tag,
 template <std::meta::info Cls, std::meta::info Owner, std::meta::info... Rs>
 consteval void probe_member_fns(std::string& out, std::string_view tag,
                                 std::size_t& n) {
-    template for (constexpr auto fn : std::define_static_array(
-                      liftable_class_members(Owner, Cls, excluded_members_v<Rs...>))) {
+    template for (constexpr auto fn : liftable_members_v<Owner, Cls, Rs...>) {
         if constexpr (classify_class_member(fn, excluded_v<Rs...>)
                       == class_member_kind::fn) {
             constexpr member_fn_route route = classify_member_fn(Cls, fn);
@@ -1457,8 +1451,7 @@ consteval std::string probe_class_text(std::string_view tag) {
 
     constexpr bool has_tramp = emit_wants_trampoline<Rs...>(Cls);
     if constexpr (class_constructs(Cls, has_tramp)) {
-        template for (constexpr auto fn : std::define_static_array(
-                          liftable_class_members(Cls))) {
+        template for (constexpr auto fn : liftable_members_v<Cls, Cls>) {
             if constexpr (ctor_binds(fn, excluded_v<Rs...>))
                 append_probe_ctor<fn>(out, tag, n);
         };
