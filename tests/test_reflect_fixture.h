@@ -17,6 +17,7 @@
 #include <memory>
 #include <ostream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 // GCC 16 (P3394 annotations under -freflection): key off the reflection
@@ -875,3 +876,51 @@ struct Config {
 inline int Config::counter = 3;
 
 } // namespace static_const_test
+
+// --- Matcher API fixture (match_ / exclude_if_ / instantiate_) ---
+// match_test is reached ONLY through a match_ marker in TEST_REFLECT_ARGS
+// (never as a plain namespace seed), so anything the matcher rejects must be
+// absent from the module. The detail sub-namespace is dropped by an
+// exclude_if_ predicate; the re-opened block checks that later declarations
+// still reach the match_ walk.
+namespace match_test {
+
+struct VecA {
+    int x = 1;
+    int get_x() const { return x; }
+};
+struct VecB { int y = 2; };
+struct Scalar { int v = 0; };                 // rejected by the matcher
+enum class VecMode { row = 0, col = 1 };      // name-matched enum
+
+namespace detail {                            // exclude_if_<in_namespace_<...>>
+struct VecImpl { int z = 0; };
+}
+
+inline int vec_count() { return 2; }          // name-matched free function
+inline int other_count() { return 0; }        // rejected by the matcher
+
+} // namespace match_test
+
+namespace match_test {                        // re-opened: must still match
+struct VecR { int r = 3; };
+}
+
+// instantiate_ targets: Grid is minted explicitly (with_) and as a grid
+// (product_); Cell through a matcher-target rule. The constraint on Cell is
+// the documented way a template declares its valid corners (a combination
+// failing SUBSTITUTION skips silently in product_).
+namespace inst_test {
+
+template <class T, int N> struct Grid {
+    T fill{};
+    int size() const { return N; }
+};
+
+template <class T>
+    requires (!std::is_void_v<T>)
+struct Cell {
+    T value{};
+};
+
+} // namespace inst_test

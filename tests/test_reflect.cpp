@@ -129,6 +129,68 @@ static_assert(std::string_view(xvec_excl_rules[0].name) == "named_out");
 static_assert(!liftable_has(^^exclude_test::XVec, "named_out"));  // dropped by name
 static_assert(liftable_has(^^exclude_test::XVec, "len"));         // sibling unaffected
 
+// --- The matcher DSL (nb_reflect_match.h) ---
+// Glob engine: anchored, * / ? only.
+static_assert(nb::detail::glob_match("Vec*", "VecA"));
+static_assert(!nb::detail::glob_match("Vec*", "Scalar"));
+static_assert(nb::detail::glob_match("*View", "SparseView"));
+static_assert(nb::detail::glob_match("?at", "mat"));
+static_assert(!nb::detail::glob_match("", "x"));
+// Leaves answer false on hostile input (P3560: never throw), and normalize
+// (dealias, spec -> template) before name/scope tests.
+static_assert(nb::matcher<nb::named_<"Vec*">>);
+static_assert(!nb::matcher<int>);
+static_assert(nb::named_<"Box">{}(^^template_test::Box<int>));   // spec -> template
+static_assert(!nb::named_<"x">{}(^^int));                        // no identifier
+static_assert(nb::is_class_{}(^^match_test::VecA));
+static_assert(!nb::is_class_{}(^^match_test));                   // namespace
+static_assert(nb::in_namespace_<^^match_test>{}(^^match_test::detail::VecImpl));
+static_assert(!nb::in_namespace_<^^match_test>{}(^^match_test)); // not inside itself
+static_assert(nb::all_of_<nb::is_class_, nb::named_<"Vec?">>{}(^^match_test::VecA));
+static_assert(nb::not_<nb::is_enum_>{}(^^match_test::VecA));
+
+// --- Effective seeds: match_ / instantiate_ expansion (see the module-level
+// behavioral tests in test_reflect.py; these pin the seed/bind-set layer) ---
+namespace {
+consteval bool seed_has(const std::vector<std::meta::info>& v, std::meta::info x) {
+    return nb::detail::info_vec_contains(v, x);
+}
+consteval bool match_seeds_ok() {
+    auto s = nb::detail::seeds_of<^^MATCH_MARKER,
+                                  ^^nb::exclude_if_<
+                                      nb::in_namespace_<^^match_test::detail>>>();
+    return seed_has(s, ^^match_test::VecA) && seed_has(s, ^^match_test::VecB)
+        && seed_has(s, ^^match_test::VecR)            // re-opened block
+        && seed_has(s, ^^match_test::VecMode)         // name-matched enum
+        && seed_has(s, ^^match_test::vec_count)       // name-matched free fn
+        && !seed_has(s, ^^match_test::Scalar)
+        && !seed_has(s, ^^match_test::other_count)
+        && !seed_has(s, ^^match_test::detail::VecImpl); // exclude_if_'d
+}
+consteval bool inst_seeds_ok() {
+    auto g = nb::detail::seeds_of<^^INST_GRID_MARKER>();
+    auto c = nb::detail::seeds_of<^^INST_CELL_MARKER, ^^inst_test>();
+    return g.size() == 3
+        && seed_has(g, ^^inst_test::Grid<int, 2>)
+        && seed_has(g, ^^inst_test::Grid<float, 3>)
+        && seed_has(g, ^^inst_test::Grid<double, 3>)
+        && c.size() == 1 && seed_has(c, ^^inst_test::Cell<int>);
+}
+// A product_ corner failing SUBSTITUTION (Cell's constraint rejects void)
+// skips silently; the valid corner survives.
+consteval bool product_corner_ok() {
+    auto s = nb::detail::seeds_of<^^nb::instantiate_<^^inst_test::Cell,
+        nb::product_<nb::set_<^^int, ^^void>>>>();
+    return s.size() == 1 && s[0] == (^^inst_test::Cell<int>);
+}
+}
+static_assert(match_seeds_ok());
+static_assert(inst_seeds_ok());
+static_assert(product_corner_ok());
+// Minted specs ride the existing CamelCase naming path.
+static_assert(std::string_view{nb::detail::entity_name<^^inst_test::Grid<int, 2>>()}
+              == "GridInt2");
+
 // --- Compile-time checks for the emit backend's type renderer (nb_reflect_spell.h) ---
 // The cast-based round-trip probe (overload-exact member-pointer casts compiled
 // WITHOUT reflection) lives with the emit test; these pin the renderer's output

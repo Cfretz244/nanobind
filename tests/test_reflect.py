@@ -740,3 +740,46 @@ def test45_static_const_by_value(t):
     t.Config.counter = 5
     assert t.Config.counter == 5
     t.Config.counter = 3
+
+
+def test52_match_marker_selects(t):
+    # match_<^^match_test, any_of_<named_<"Vec*">, named_<"vec*">>>: the scope
+    # is reached ONLY through the marker, so matched members bind exactly like
+    # explicit listings and unmatched ones are absent entirely.
+    a = t.VecA()
+    assert a.x == 1 and a.get_x() == 1
+    assert t.VecB().y == 2
+    assert t.VecR().r == 3                    # declared in a re-opened block
+    assert t.VecMode.row.value == 0           # name-matched enum
+    assert t.vec_count() == 2                 # name-matched free function
+    assert not hasattr(t, 'Scalar')           # rejected by the matcher
+    assert not hasattr(t, 'other_count')
+
+
+def test53_exclude_if_drops_namespace(t):
+    # exclude_if_<in_namespace_<^^match_test::detail>>: VecImpl matches the
+    # name pattern but the predicate exclusion makes it opaque everywhere.
+    assert not hasattr(t, 'VecImpl')
+
+
+def test54_instantiate_explicit_and_product(t):
+    # instantiate_<^^Grid, with_<^^int, val_<2>>, product_<set_<^^float,
+    # ^^double>, set_<val_<3>>>>: minted specs bind with CamelCase names and
+    # full class surfaces, exactly like pack-listed specializations.
+    g = t.GridInt2()
+    assert g.size() == 2
+    g.fill = 9
+    assert g.fill == 9
+    assert t.GridFloat3().size() == 3
+    assert t.GridDouble3().size() == 3
+    assert not hasattr(t, 'GridInt3')         # not in any rule
+
+
+def test55_instantiate_matcher_target(t):
+    # instantiate_<^^named_<"Cell">, with_<^^int>>: the rule's matcher sweeps
+    # the pack's namespace roots for class templates; inst_test itself holds
+    # only templates, so the plain namespace walk binds nothing from it.
+    c = t.CellInt()
+    assert c.value == 0
+    c.value = 5
+    assert c.value == 5

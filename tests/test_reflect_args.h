@@ -38,6 +38,26 @@ consteval std::meta::info xvec_member(std::string_view name) {
 // emit backend's analogue of test_reflect.cpp's hand-written PyShape
 // (NB_REFLECT_TRAMPOLINE); the constexpr backend treats it as inert
 // configuration -- so the two backends trampoline the SAME single class.
+// The matcher-API entries: match_test is reached ONLY through the match_
+// marker (its scope is not a pack namespace), so unmatched members must be
+// absent; the exclude_if_ predicate drops match_test::detail everywhere;
+// the instantiate_ rules mint Grid<int,2> (explicit with_),
+// Grid<float,3>/Grid<double,3> (product_ grid), and Cell<int> through a
+// matcher-target rule (its named_ sweeps the pack's namespace roots,
+// inst_test among them -- a namespace holding only templates, which the
+// plain walk binds nothing from).
+#define MATCH_MARKER                                                           \
+    nanobind::match_<^^match_test,                                             \
+                     nanobind::any_of_<nanobind::named_<"Vec*">,               \
+                                       nanobind::named_<"vec*">>>
+#define INST_GRID_MARKER                                                       \
+    nanobind::instantiate_<^^inst_test::Grid,                                  \
+        nanobind::with_<^^int, nanobind::val_<2>>,                             \
+        nanobind::product_<nanobind::set_<^^float, ^^double>,                  \
+                           nanobind::set_<nanobind::val_<3>>>>
+#define INST_CELL_MARKER                                                       \
+    nanobind::instantiate_<^^nanobind::named_<"Cell">, nanobind::with_<^^int>>
+
 #define TEST_REFLECT_ARGS                                                      \
     ^^nanobind::trampoline_<^^reflect_test::Shape>,                            \
     ^^reflect_test, ^^template_test,                                           \
@@ -50,4 +70,8 @@ consteval std::meta::info xvec_member(std::string_view name) {
     ^^anon_typedef_test, ^^static_const_test,                                  \
     ^^collide_a, ^^collide_b, ^^shadow_test,                                   \
     ^^alias_fixture, ^^ref_return_test,                                        \
-    ^^parens_init_test
+    ^^parens_init_test,                                                        \
+    ^^MATCH_MARKER,                                                            \
+    ^^nanobind::exclude_if_<                                                   \
+        nanobind::in_namespace_<^^match_test::detail>>,                        \
+    ^^inst_test, ^^INST_GRID_MARKER, ^^INST_CELL_MARKER
