@@ -218,7 +218,7 @@ consteval std::string emit_spec_classes(std::meta::info r,
 // spec-aware walk so a discovered specialization's members (e.g. a Holder<int> with a
 // std::vector<int> field) pull their casters too.
 consteval std::string emit_stl_includes(std::meta::info r,
-                                        std::span<const std::meta::info> ex = {}) {
+                                        const exclusion_set& ex = {}) {
     std::vector<std::string_view> hdrs;
     // The exclusion set MUST reach the spec-discovery fixpoint: without it,
     // an expression-template shape (exclude_test's Expr, Eigen) diverges --

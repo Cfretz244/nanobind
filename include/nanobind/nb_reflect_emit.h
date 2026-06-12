@@ -604,7 +604,7 @@ consteval void append_class_free_operators(std::string& out) {
                 scope, std::meta::access_context::unchecked()))) {
             if constexpr (is_bindable_free_operator<fn>()
                           && !has_ann<fn, reflect::skip>()
-                          && !fn_mentions_excluded(fn, excluded_v<Rs...>)) {
+                          && !fn_mentions_excluded(fn, excluded_q<Rs...>())) {
                 append_free_operator<Cls, fn>(out);
             }
         };
@@ -769,7 +769,7 @@ consteval void append_class_contents(std::string& out,
     // rationale).
     if constexpr (class_constructs(Cls, HasTramp)) {
         template for (constexpr auto fn : liftable_members_v<Cls, Cls, Rs...>) {
-            if constexpr (ctor_binds(fn, excluded_v<Rs...>))
+            if constexpr (ctor_binds(fn, excluded_q<Rs...>()))
                 append_ctor<fn>(out);
         };
     }
@@ -787,7 +787,7 @@ consteval void append_class_contents(std::string& out,
                           Cls, std::meta::access_context::unchecked()))) {
         if constexpr (std::meta::is_public(mem)
                       && std::meta::has_identifier(mem)
-                      && !data_member_excluded(mem, excluded_v<Rs...>))
+                      && !data_member_excluded(mem, excluded_q<Rs...>()))
             append_data_member<mem>(out, cls_spell);
     };
 
@@ -797,14 +797,14 @@ consteval void append_class_contents(std::string& out,
                           Cls, std::meta::access_context::unchecked()))) {
         if constexpr (std::meta::is_public(mem)
                       && std::meta::has_identifier(mem)
-                      && !data_member_excluded(mem, excluded_v<Rs...>))
+                      && !data_member_excluded(mem, excluded_q<Rs...>()))
             append_static_member<mem>(out, cls_spell);
     };
 
     // Methods / member templates (one shared kind-router).
     template for (constexpr auto fn : liftable_members_v<Cls, Cls, Rs...>) {
         constexpr class_member_kind kind =
-            classify_class_member(fn, excluded_v<Rs...>);
+            classify_class_member(fn, excluded_q<Rs...>());
         if constexpr (kind == class_member_kind::fn)
             append_member_function<Cls, fn>(out, cls_spell, "");
         else if constexpr (kind == class_member_kind::tmpl)
@@ -813,7 +813,7 @@ consteval void append_class_contents(std::string& out,
 
     // Properties.
     template for (constexpr auto fn : liftable_members_v<Cls, Cls, Rs...>) {
-        if constexpr (classify_class_member(fn, excluded_v<Rs...>)
+        if constexpr (classify_class_member(fn, excluded_q<Rs...>())
                       == class_member_kind::fn) {
             if constexpr (is_property_getter<fn>())
                 append_property<Cls, fn>(out, cls_spell);
@@ -837,7 +837,7 @@ consteval void append_flatten_base(std::string& out,
                           Base, std::meta::access_context::unchecked()))) {
         if constexpr (std::meta::is_public(mem)
                       && std::meta::has_identifier(mem)
-                      && !data_member_excluded(mem, excluded_v<Rs...>))
+                      && !data_member_excluded(mem, excluded_q<Rs...>()))
             // Pointer through the DECLARING base: int Base::* is what the
             // splice yields, and def_rw/def_ro accept it for the derived class.
             append_data_member<mem>(out, base_spell);
@@ -848,7 +848,7 @@ consteval void append_flatten_base(std::string& out,
                           Base, std::meta::access_context::unchecked()))) {
         if constexpr (std::meta::is_public(mem)
                       && std::meta::has_identifier(mem)
-                      && !data_member_excluded(mem, excluded_v<Rs...>))
+                      && !data_member_excluded(mem, excluded_q<Rs...>()))
             append_static_member<mem>(out, base_spell);
     };
 
@@ -858,7 +858,7 @@ consteval void append_flatten_base(std::string& out,
     std::string call_prefix = base_spell + "::";
     template for (constexpr auto fn : liftable_members_v<Base, Cls, Rs...>) {
         constexpr class_member_kind kind =
-            classify_class_member(fn, excluded_v<Rs...>);
+            classify_class_member(fn, excluded_q<Rs...>());
         if constexpr (kind == class_member_kind::fn)
             append_member_function<Cls, fn>(out, cls_spell, call_prefix);
         else if constexpr (kind == class_member_kind::tmpl)
@@ -872,7 +872,7 @@ consteval void append_flattened_bases(std::string& out,
     constexpr auto pybase = python_base_of(Cls, bind_set_v<Rs...>);
     template for (constexpr auto base : std::define_static_array(
                       flatten_bases_vec(Cls, pybase))) {
-        if constexpr (!is_excluded_entity(base, excluded_v<Rs...>))
+        if constexpr (!is_excluded_entity(base, excluded_q<Rs...>()))
             append_flatten_base<Cls, base, Rs...>(out, cls_spell);
     };
 }
@@ -1172,7 +1172,7 @@ struct emit_item {
 };
 
 consteval void worklist_dispatch(std::meta::info R,
-                                 std::span<const std::meta::info> ex,
+                                 const exclusion_set& ex,
                                  std::vector<emit_item>& out) {
     if (is_config_marker(R) || is_excluded_entity(R, ex))
         return;
@@ -1208,7 +1208,8 @@ consteval void worklist_dispatch(std::meta::info R,
 template <std::meta::info... Rs>
 consteval std::vector<emit_item> compute_emit_worklist() {
     std::vector<emit_item> out;
-    std::vector<std::meta::info> ex = compute_excluded<Rs...>();
+    std::vector<std::meta::info> exl = compute_excluded<Rs...>();
+    exclusion_set ex{exl, excluded_matchers<Rs...>()};
     // Mirror reflect_'s order: discovered template specializations first,
     // then the dispatch walks.
     auto specs = [&](std::meta::info R) {
@@ -1286,7 +1287,7 @@ inline constexpr const char* emit_item_decl_v = [] {
 // small, one static string per seed).
 template <std::meta::info R, std::meta::info... Rs>
 inline constexpr const char* emit_stl_includes_v = std::define_static_string(
-    codegen::emit_stl_includes(R, excluded_v<Rs...>));
+    codegen::emit_stl_includes(R, excluded_q<Rs...>()));
 
 consteval std::vector<std::size_t> iota_vec(std::size_t n) {
     std::vector<std::size_t> v;
@@ -1404,7 +1405,7 @@ template <std::meta::info Cls, std::meta::info Owner, std::meta::info... Rs>
 consteval void probe_member_fns(std::string& out, std::string_view tag,
                                 std::size_t& n) {
     template for (constexpr auto fn : liftable_members_v<Owner, Cls, Rs...>) {
-        if constexpr (classify_class_member(fn, excluded_v<Rs...>)
+        if constexpr (classify_class_member(fn, excluded_q<Rs...>())
                       == class_member_kind::fn) {
             constexpr member_fn_route route = classify_member_fn(Cls, fn);
             if constexpr (route == member_fn_route::method
@@ -1428,7 +1429,7 @@ consteval void probe_data_members(std::string& out,
                           Owner, std::meta::access_context::unchecked()))) {
         if constexpr (std::meta::is_public(mem)
                       && std::meta::has_identifier(mem)
-                      && !data_member_excluded(mem, excluded_v<Rs...>))
+                      && !data_member_excluded(mem, excluded_q<Rs...>()))
             append_probe_data<mem>(out, owner_spell);
     };
     template for (constexpr auto mem : std::define_static_array(
@@ -1436,7 +1437,7 @@ consteval void probe_data_members(std::string& out,
                           Owner, std::meta::access_context::unchecked()))) {
         if constexpr (std::meta::is_public(mem)
                       && std::meta::has_identifier(mem)
-                      && !data_member_excluded(mem, excluded_v<Rs...>))
+                      && !data_member_excluded(mem, excluded_q<Rs...>()))
             append_probe_data<mem>(out, owner_spell);
     };
 }
@@ -1454,7 +1455,7 @@ consteval std::string probe_class_text(std::string_view tag) {
     constexpr bool has_tramp = emit_wants_trampoline<Rs...>(Cls);
     if constexpr (class_constructs(Cls, has_tramp)) {
         template for (constexpr auto fn : liftable_members_v<Cls, Cls>) {
-            if constexpr (ctor_binds(fn, excluded_v<Rs...>))
+            if constexpr (ctor_binds(fn, excluded_q<Rs...>()))
                 append_probe_ctor<fn>(out, tag, n);
         };
     }
@@ -1467,7 +1468,7 @@ consteval std::string probe_class_text(std::string_view tag) {
     constexpr auto pybase = python_base_of(Cls, bind_set_v<Rs...>);
     template for (constexpr auto base : std::define_static_array(
                       flatten_bases_vec(Cls, pybase))) {
-        if constexpr (!is_excluded_entity(base, excluded_v<Rs...>)) {
+        if constexpr (!is_excluded_entity(base, excluded_q<Rs...>())) {
             constexpr std::string_view bspell =
                 std::define_static_string(type_spelling(base));
             if constexpr (!bspell.empty()) {

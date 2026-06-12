@@ -1442,13 +1442,58 @@ consteval bool info_span_contains(std::span<const std::meta::info> v,
     return false;
 }
 
-// True if entity `e` is excluded: listed itself, a specialization of a listed
-// template, or declared (transitively) inside a listed namespace or class.
+// A pointer to a consteval invoker for matcher type M. Such pointers are
+// formable and callable INSIDE constant evaluation only; they must never be
+// persisted (no define_static_array / NTTP / static storage), which is why
+// exclusion_set below is rebuilt per evaluation rather than memoized.
+using matcher_fn = bool (*)(std::meta::info);
+template <typename M>
+consteval bool matcher_invoke(std::meta::info r) { return M{}(r); }
+
+/// The exclusion context threaded through every discovery walk and bind-time
+/// gate: the nb::exclude_-listed entities plus the nb::exclude_if_ matcher
+/// predicates. Predicates participate at exactly the points the listed span
+/// is consulted, so an entity a matcher accepts is opaque in precisely the
+/// ways a listed entity is. The listed half stays memoized (excluded_v); the
+/// predicate half is rebuilt per constant evaluation by excluded_q.
+struct exclusion_set {
+    std::span<const std::meta::info> listed = {};
+    std::vector<matcher_fn> preds = {};
+
+    consteval exclusion_set() = default;
+    consteval exclusion_set(std::span<const std::meta::info> l) : listed(l) {}
+    consteval exclusion_set(const std::vector<std::meta::info>& l)
+        : listed(l) {}
+    consteval exclusion_set(std::span<const std::meta::info> l,
+                            std::vector<matcher_fn> p)
+        : listed(l), preds(std::move(p)) {}
+
+    consteval bool empty() const { return listed.empty() && preds.empty(); }
+
+    // Direct hit on one reflection: listed, or accepted by any predicate.
+    // (No parent/template resolution here -- is_excluded_entity adds that,
+    // for the listed half and predicates alike.)
+    consteval bool contains(std::meta::info e) const {
+        if (info_span_contains(listed, e))
+            return true;
+        for (auto p : preds)
+            if (p(e))
+                return true;
+        return false;
+    }
+};
+
+// True if entity `e` is excluded: listed itself (or matched by an exclude_if_
+// predicate), a specialization of a listed template, or declared
+// (transitively) inside a listed namespace or class. Predicates run at each
+// of the same points: on the entity, its template, and every enclosing scope
+// -- so exclude_if_<named_<"internal">> excludes a namespace's contents just
+// like listing the namespace does.
 consteval bool is_excluded_entity(std::meta::info e,
-                                  std::span<const std::meta::info> ex) {
+                                  const exclusion_set& ex) {
     if (ex.empty())
         return false;
-    if (info_span_contains(ex, e))
+    if (ex.contains(e))
         return true;
     // Resolve a specialization to its template; only scoped entities (classes,
     // enums, namespaces, templates) have a parent chain worth walking.
@@ -1456,7 +1501,7 @@ consteval bool is_excluded_entity(std::meta::info e,
     if (std::meta::is_type(e)) {
         if (std::meta::has_template_arguments(e)) {
             auto tmpl = std::meta::template_of(e);
-            if (info_span_contains(ex, tmpl))
+            if (ex.contains(tmpl))
                 return true;
             e = tmpl;
             scoped = true;
@@ -1467,11 +1512,53 @@ consteval bool is_excluded_entity(std::meta::info e,
     if (!scoped || e == ^^::)
         return false;
     for (auto p = std::meta::parent_of(e);; p = std::meta::parent_of(p)) {
-        if (info_span_contains(ex, p))
+        if (ex.contains(p))
             return true;
         if (p == ^^::)
             return false;
     }
+}
+
+// Collect the matcher invoker from one pack element: a top-level
+// exclude_if_<M> marker, or any exclude_if_<M> nested inside exclude_<...>
+// (the same two placements exclude_member_ supports). The marker type is an
+// NTTP here, so the matcher type argument splices out statically.
+template <std::meta::info R>
+consteval void collect_exclude_if_preds(std::vector<matcher_fn>& out) {
+    if constexpr (is_exclude_if_marker(R)) {
+        constexpr auto margs = std::define_static_array(
+            std::meta::template_arguments_of(std::meta::dealias(R)));
+        out.push_back(&matcher_invoke<typename [:margs[0]:]>);
+    } else if constexpr (is_exclude_marker(R)) {
+        template for (constexpr auto a :
+                      std::define_static_array(
+                          std::meta::template_arguments_of(std::meta::dealias(R)))) {
+            constexpr auto e = std::meta::extract<std::meta::info>(a);
+            if constexpr (is_exclude_if_marker(e)) {
+                constexpr auto margs = std::define_static_array(
+                    std::meta::template_arguments_of(std::meta::dealias(e)));
+                out.push_back(&matcher_invoke<typename [:margs[0]:]>);
+            }
+        };
+    }
+}
+
+template <std::meta::info... Rs>
+consteval std::vector<matcher_fn> excluded_matchers() {
+    std::vector<matcher_fn> out;
+    (collect_exclude_if_preds<Rs>(out), ...);
+    return out;
+}
+
+// The full exclusion context for a reflect_ pack: the memoized listed half
+// (excluded_v) plus the exclude_if_ predicates. Rebuilt per constant
+// evaluation -- a pointer to a consteval function is not a persistable
+// constant, so this CANNOT be memoized in a variable template; every gate
+// that previously read excluded_v<Rs...> calls this instead. The rebuild is
+// O(#markers) and is noise next to the walks it gates.
+template <std::meta::info... Rs>
+consteval exclusion_set excluded_q() {
+    return {excluded_v<Rs...>, excluded_matchers<Rs...>()};
 }
 
 // True if `type` (after stripping cv/ref/pointers) is, or mentions anywhere in
@@ -1485,7 +1572,7 @@ consteval bool is_excluded_entity(std::meta::info e,
 // bind-time half of BINDER-0014 (the discovery half is the is_complete_type
 // gate in is_user_class_template_spec).
 consteval bool type_mentions_excluded(std::meta::info type,
-                                      std::span<const std::meta::info> ex) {
+                                      const exclusion_set& ex) {
     // Dealias: a member typedef (Eigen's `DenseBase<D>::iterator` =
     // internal::pointer_based_stl_iterator<D>) must not hide the entity it
     // names from the exclusion/completeness tests below.
@@ -1529,8 +1616,8 @@ consteval bool type_mentions_excluded(std::meta::info type,
 // be detected by any reflection query, so the binding author lists its exact
 // reflection (obtained via members_of) in the exclude_ marker.
 consteval bool fn_mentions_excluded(std::meta::info fn,
-                                    std::span<const std::meta::info> ex) {
-    if (info_span_contains(ex, fn))
+                                    const exclusion_set& ex) {
+    if (ex.contains(fn))
         return true;
     if (!std::meta::is_constructor(fn) && !std::meta::is_destructor(fn)
         && type_mentions_excluded(std::meta::return_type_of(fn), ex))
@@ -1543,8 +1630,8 @@ consteval bool fn_mentions_excluded(std::meta::info fn,
 
 // Gate for a data member: listed itself, or of an excluded type.
 consteval bool data_member_excluded(std::meta::info mem,
-                                    std::span<const std::meta::info> ex) {
-    return info_span_contains(ex, mem)
+                                    const exclusion_set& ex) {
+    return ex.contains(mem)
         || type_mentions_excluded(std::meta::type_of(mem), ex);
 }
 
@@ -1553,8 +1640,8 @@ consteval bool data_member_excluded(std::meta::info mem,
 // excluded entity. Templates that do not default-instantiate are skipped by
 // the binder anyway.
 consteval bool member_template_mentions_excluded(std::meta::info tmpl,
-                                                 std::span<const std::meta::info> ex) {
-    if (info_span_contains(ex, tmpl))
+                                                 const exclusion_set& ex) {
+    if (ex.contains(tmpl))
         return true;
     if (!std::meta::is_function_template(tmpl)
         || std::meta::is_constructor_template(tmpl)
@@ -1594,7 +1681,7 @@ consteval bool binds_copy_ctor(std::meta::info cls, bool has_trampoline) {
 /// enumerable but must not bind: init<> would call it, a TU-wide hard error
 /// (BINDER-0012, tl::unexpected<E>). Constructor templates cannot reflect and
 /// are skipped.
-consteval bool ctor_binds(std::meta::info fn, std::span<const std::meta::info> ex) {
+consteval bool ctor_binds(std::meta::info fn, const exclusion_set& ex) {
     return std::meta::is_constructor(fn)
         && std::meta::is_public(fn)
         && !std::meta::is_deleted(fn)
@@ -1750,7 +1837,7 @@ void bind_free_operators(auto& cls) {
                 scope, std::meta::access_context::unchecked()))) {
             if constexpr (is_bindable_free_operator<fn>()
                 && !has_ann<fn, reflect::skip>()
-                && !fn_mentions_excluded(fn, excluded_v<Rs...>)) {
+                && !fn_mentions_excluded(fn, excluded_q<Rs...>())) {
                 using FnType = [:nb_fn_type_of(fn):];
                 reflect_free_operator_binder<T, fn, FnType>::bind(cls);
             }
@@ -2048,7 +2135,7 @@ inline constexpr auto liftable_members_v = std::define_static_array(
     liftable_class_members(Cls, Derived, excluded_members_v<Rs...>));
 
 consteval class_member_kind classify_class_member(
-        std::meta::info fn, std::span<const std::meta::info> ex) {
+        std::meta::info fn, const exclusion_set& ex) {
     if (std::meta::is_function(fn)
         && std::meta::is_public(fn)
         && !std::meta::is_deleted(fn)
@@ -2078,7 +2165,7 @@ void bind_class_contents(auto& cls) {
     // hold the BINDER-0011/0012 rationale.
     if constexpr (class_constructs(^^T, has_reflect_trampoline<T>)) {
         template for (constexpr auto fn : liftable_members_v<^^T, ^^T, Rs...>) {
-            if constexpr (ctor_binds(fn, excluded_v<Rs...>)) {
+            if constexpr (ctor_binds(fn, excluded_q<Rs...>())) {
                 reflect_bind_ctor<fn>(cls);
             }
         };
@@ -2095,7 +2182,7 @@ void bind_class_contents(auto& cls) {
         std::define_static_array(std::meta::nonstatic_data_members_of(
             ^^T, std::meta::access_context::unchecked()))) {
         if constexpr (std::meta::is_public(mem) && std::meta::has_identifier(mem)
-            && !data_member_excluded(mem, excluded_v<Rs...>)) {
+            && !data_member_excluded(mem, excluded_q<Rs...>())) {
             reflect_bind_member<T, mem>(cls);
         }
     };
@@ -2105,7 +2192,7 @@ void bind_class_contents(auto& cls) {
         std::define_static_array(std::meta::static_data_members_of(
             ^^T, std::meta::access_context::unchecked()))) {
         if constexpr (std::meta::is_public(mem) && std::meta::has_identifier(mem)
-            && !data_member_excluded(mem, excluded_v<Rs...>)) {
+            && !data_member_excluded(mem, excluded_q<Rs...>())) {
             reflect_bind_static_member<T, mem>(cls);
         }
     };
@@ -2117,7 +2204,7 @@ void bind_class_contents(auto& cls) {
     // path: public + enumerable, but calling one is a hard error (BINDER-0012).
     template for (constexpr auto fn : liftable_members_v<^^T, ^^T, Rs...>) {
         constexpr class_member_kind kind =
-            classify_class_member(fn, excluded_v<Rs...>);
+            classify_class_member(fn, excluded_q<Rs...>());
         if constexpr (kind == class_member_kind::fn)
             reflect_bind_member_function<T, fn>(cls);
         else if constexpr (kind == class_member_kind::tmpl)
@@ -2130,7 +2217,7 @@ void bind_class_contents(auto& cls) {
     // be excluded *before* it is instantiated (a nested if constexpr, not an &&
     // short-circuit).
     template for (constexpr auto fn : liftable_members_v<^^T, ^^T, Rs...>) {
-        if constexpr (classify_class_member(fn, excluded_v<Rs...>)
+        if constexpr (classify_class_member(fn, excluded_q<Rs...>())
                       == class_member_kind::fn) {
             if constexpr (is_property_getter<fn>()) {
                 reflect_bind_property<T, fn>(cls);
@@ -2149,7 +2236,7 @@ void flatten_base_members(auto& cls) {
         std::define_static_array(std::meta::nonstatic_data_members_of(
             Base, std::meta::access_context::unchecked()))) {
         if constexpr (std::meta::is_public(mem)
-            && !data_member_excluded(mem, excluded_v<Rs...>)) {
+            && !data_member_excluded(mem, excluded_q<Rs...>())) {
             reflect_bind_member<T, mem>(cls);
         }
     };
@@ -2158,7 +2245,7 @@ void flatten_base_members(auto& cls) {
         std::define_static_array(std::meta::static_data_members_of(
             Base, std::meta::access_context::unchecked()))) {
         if constexpr (std::meta::is_public(mem)
-            && !data_member_excluded(mem, excluded_v<Rs...>)) {
+            && !data_member_excluded(mem, excluded_q<Rs...>())) {
             reflect_bind_static_member<T, mem>(cls);
         }
     };
@@ -2169,7 +2256,7 @@ void flatten_base_members(auto& cls) {
     // (declared on the flattened raw_hash_map/raw_hash_set ancestry).
     template for (constexpr auto fn : liftable_members_v<Base, ^^T, Rs...>) {
         constexpr class_member_kind kind =
-            classify_class_member(fn, excluded_v<Rs...>);
+            classify_class_member(fn, excluded_q<Rs...>());
         if constexpr (kind == class_member_kind::fn)
             reflect_bind_member_function<T, fn>(cls);
         else if constexpr (kind == class_member_kind::tmpl)
@@ -2186,7 +2273,7 @@ template <typename T, std::meta::info PyBase, std::meta::info... Rs>
 void flatten_unmodeled_bases(auto& cls) {
     template for (constexpr auto base :
         std::define_static_array(flatten_bases_vec<T, PyBase>())) {
-        if constexpr (!is_excluded_entity(base, excluded_v<Rs...>))
+        if constexpr (!is_excluded_entity(base, excluded_q<Rs...>()))
             flatten_base_members<T, base, Rs...>(cls);
     };
 }
@@ -2313,7 +2400,7 @@ consteval bool is_stl_policy(std::meta::info type) {
 consteval void collect_stl_types(std::meta::info type,
                                  std::vector<std::meta::info>& out,
                                  std::vector<std::meta::info>& visited,
-                                 std::span<const std::meta::info> ex = {}) {
+                                 const exclusion_set& ex = {}) {
     type = std::meta::remove_cvref(type);
     // A [[=reflect::skip]] type is opaque: do not walk its template arguments for
     // STL casters (e.g. nlohmann's output_adapter<uint8_t> resolves its default
@@ -2349,7 +2436,7 @@ consteval void collect_stl_types(std::meta::info type,
 consteval void collect_own_stl_member_types(std::meta::info owner,
                                             std::vector<std::meta::info>& out,
                                             std::vector<std::meta::info>& visited,
-                                            std::span<const std::meta::info> ex = {}) {
+                                            const exclusion_set& ex = {}) {
     for (auto mem : std::meta::members_of(owner, std::meta::access_context::unchecked())) {
         if (!std::meta::is_public(mem))
             continue;
@@ -2392,11 +2479,11 @@ consteval void collect_own_stl_member_types(std::meta::info owner,
     }
     for (auto mem : std::meta::nonstatic_data_members_of(
              owner, std::meta::access_context::unchecked()))
-        if (std::meta::is_public(mem) && !info_span_contains(ex, mem))
+        if (std::meta::is_public(mem) && !ex.contains(mem))
             collect_stl_types(std::meta::type_of(mem), out, visited, ex);
     for (auto mem : std::meta::static_data_members_of(
              owner, std::meta::access_context::unchecked()))
-        if (std::meta::is_public(mem) && !info_span_contains(ex, mem))
+        if (std::meta::is_public(mem) && !ex.contains(mem))
             collect_stl_types(std::meta::type_of(mem), out, visited, ex);
 }
 // A class's bound surface includes its public-base subtree (exposed via the real
@@ -2406,7 +2493,7 @@ consteval void collect_own_stl_member_types(std::meta::info owner,
 consteval void collect_class_stl_types(std::meta::info cls,
                                        std::vector<std::meta::info>& out,
                                        std::vector<std::meta::info>& visited,
-                                       std::span<const std::meta::info> ex = {}) {
+                                       const exclusion_set& ex = {}) {
     collect_own_stl_member_types(cls, out, visited, ex);
     std::vector<std::meta::info> bases;
     collect_public_base_subtree(cls, bases);
@@ -2425,7 +2512,7 @@ consteval void collect_class_stl_types(std::meta::info cls,
 consteval void collect_scope_stl_types(std::meta::info r,
                                        std::vector<std::meta::info>& out,
                                        std::vector<std::meta::info>& visited,
-                                       std::span<const std::meta::info> ex = {}) {
+                                       const exclusion_set& ex = {}) {
     if (std::meta::is_namespace(r)) {
         for (auto mem : std::meta::members_of(r, std::meta::access_context::unchecked())) {
             if (is_excluded_entity(mem, ex))
@@ -2516,7 +2603,7 @@ consteval bool is_user_class_template_spec(std::meta::info type) {
 consteval void collect_user_specs_from_type(std::meta::info type,
                                             std::vector<std::meta::info>& out,
                                             std::vector<std::meta::info>& visited,
-                                            std::span<const std::meta::info> ex = {}) {
+                                            const exclusion_set& ex = {}) {
     // Dealias (like type_mentions_excluded): spdlog's stdout_sink_base
     // reaches signatures through member typedefs, and the sugar would
     // otherwise defeat both the exclusion test and the is_complete_type gate
@@ -2560,7 +2647,7 @@ consteval void collect_user_specs_from_type(std::meta::info type,
 consteval void collect_own_member_specs(std::meta::info owner,
                                         std::vector<std::meta::info>& out,
                                         std::vector<std::meta::info>& visited,
-                                        std::span<const std::meta::info> ex = {}) {
+                                        const exclusion_set& ex = {}) {
     for (auto mem : std::meta::members_of(owner, std::meta::access_context::unchecked())) {
         if (!std::meta::is_public(mem))
             continue;
@@ -2592,11 +2679,11 @@ consteval void collect_own_member_specs(std::meta::info owner,
     }
     for (auto mem : std::meta::nonstatic_data_members_of(
              owner, std::meta::access_context::unchecked()))
-        if (std::meta::is_public(mem) && !info_span_contains(ex, mem))
+        if (std::meta::is_public(mem) && !ex.contains(mem))
             collect_user_specs_from_type(std::meta::type_of(mem), out, visited, ex);
     for (auto mem : std::meta::static_data_members_of(
              owner, std::meta::access_context::unchecked()))
-        if (std::meta::is_public(mem) && !info_span_contains(ex, mem))
+        if (std::meta::is_public(mem) && !ex.contains(mem))
             collect_user_specs_from_type(std::meta::type_of(mem), out, visited, ex);
 }
 
@@ -2611,7 +2698,7 @@ consteval void collect_class_user_specs(std::meta::info cls,
                                         std::vector<std::meta::info>& out,
                                         std::vector<std::meta::info>& visited,
                                         std::vector<std::meta::info>& walked,
-                                        std::span<const std::meta::info> ex = {}) {
+                                        const exclusion_set& ex = {}) {
     if (!info_vec_contains(walked, cls)) {
         walked.push_back(cls);
         collect_own_member_specs(cls, out, visited, ex);
@@ -2635,7 +2722,7 @@ consteval void collect_scope_user_specs(std::meta::info r,
                                         std::vector<std::meta::info>& out,
                                         std::vector<std::meta::info>& visited,
                                         std::vector<std::meta::info>& walked,
-                                        std::span<const std::meta::info> ex = {}) {
+                                        const exclusion_set& ex = {}) {
     if (is_config_marker(r) || is_excluded_entity(r, ex))
         return;  // a marker is not a seed; an excluded seed is opaque
     if (std::meta::is_namespace(r)) {
@@ -2691,7 +2778,7 @@ consteval void collect_scope_user_specs(std::meta::info r,
 consteval void reflect_discovery_diverged(std::meta::info last_discovered_spec);
 
 consteval std::vector<std::meta::info> required_user_specs(
-        std::meta::info r, std::span<const std::meta::info> ex = {}) {
+        std::meta::info r, const exclusion_set& ex = {}) {
     std::vector<std::meta::info> out, visited, walked;
     collect_scope_user_specs(r, out, visited, walked, ex);
     for (std::size_t i = 0; i < out.size(); ++i) {
@@ -2717,7 +2804,7 @@ consteval std::vector<std::meta::info> required_user_specs(
 // entities; recurses into sub-namespaces).
 consteval void collect_seed_classes(std::meta::info r,
                                     std::vector<std::meta::info>& out,
-                                    std::span<const std::meta::info> ex = {}) {
+                                    const exclusion_set& ex = {}) {
     if (is_config_marker(r) || is_excluded_entity(r, ex))
         return;
     if (std::meta::is_namespace(r)) {
@@ -2746,7 +2833,8 @@ consteval void collect_seed_classes(std::meta::info r,
 template <std::meta::info... Rs>
 consteval std::vector<std::meta::info> compute_bind_set() {
     std::vector<std::meta::info> out;
-    std::vector<std::meta::info> ex = compute_excluded<Rs...>();
+    std::vector<std::meta::info> exl = compute_excluded<Rs...>();
+    exclusion_set ex{exl, excluded_matchers<Rs...>()};
     (collect_seed_classes(Rs, out, ex), ...);
     auto merge = [&](std::vector<std::meta::info> specs) {
         for (auto s : specs)
@@ -2800,7 +2888,7 @@ consteval std::meta::info python_base_for() {
 }
 
 consteval std::vector<std::meta::info> required_stl_types(
-        std::meta::info r, std::span<const std::meta::info> ex = {}) {
+        std::meta::info r, const exclusion_set& ex = {}) {
     std::vector<std::meta::info> out, visited;
     collect_scope_stl_types(r, out, visited, ex);
     return out;
@@ -2813,7 +2901,7 @@ consteval std::vector<std::meta::info> required_stl_types(
 // -- the codegen path (emit_stl_includes), which must emit the #includes, calls this;
 // the header-only path leaves spec-member casters to surface at bind time.
 consteval std::vector<std::meta::info> required_stl_types_with_specs(
-        std::meta::info r, std::span<const std::meta::info> ex = {}) {
+        std::meta::info r, const exclusion_set& ex = {}) {
     std::vector<std::meta::info> out, visited;
     collect_scope_stl_types(r, out, visited, ex);
     for (auto spec : required_user_specs(r, ex))
@@ -2857,7 +2945,7 @@ consteval std::string_view stl_missing_caster_msg() {
 template <std::meta::info R, std::meta::info... Rs>
 void check_stl_casters() {
     template for (constexpr auto ty :
-                  std::define_static_array(required_stl_types(R, excluded_v<Rs...>))) {
+                  std::define_static_array(required_stl_types(R, excluded_q<Rs...>()))) {
         static_assert(!is_base_caster_v<make_caster<typename [:ty:]>>,
                       stl_missing_caster_msg<ty>());
     };
@@ -3029,7 +3117,7 @@ void reflect_enum(module_& m) {
 /// in the world, BINDER-0028).
 enum class ns_member_kind { skip, cls, enum_, free_fn, ns };
 consteval ns_member_kind classify_namespace_member(
-        std::meta::info mem, std::span<const std::meta::info> ex) {
+        std::meta::info mem, const exclusion_set& ex) {
     if (std::meta::is_template(mem))
         return ns_member_kind::skip;
     if (fn_skip_annotated(mem) || is_excluded_entity(mem, ex))
@@ -3067,7 +3155,7 @@ void reflect_enum_of(module_& m) {
 template <std::meta::info r, std::meta::info... Rs>
 void reflect_dispatch(module_& m) {
     if constexpr (is_config_marker(r)
-                  || is_excluded_entity(r, excluded_v<Rs...>)) {
+                  || is_excluded_entity(r, excluded_q<Rs...>())) {
         // A configuration marker (exclude_ / trampoline_ / match_ /
         // exclude_if_ / instantiate_ -- the latter two seed through the
         // seeds_of expansion, not this walk), or a seed that is itself
@@ -3077,7 +3165,7 @@ void reflect_dispatch(module_& m) {
             std::define_static_array(std::meta::members_of(
                 r, std::meta::access_context::unchecked()))) {
             constexpr ns_member_kind kind =
-                classify_namespace_member(mem, excluded_v<Rs...>);
+                classify_namespace_member(mem, excluded_q<Rs...>());
             if constexpr (kind == ns_member_kind::cls)
                 reflect_class_of<mem, Rs...>(m);
             else if constexpr (kind == ns_member_kind::enum_)
@@ -3107,7 +3195,7 @@ void reflect_dispatch(module_& m) {
 template <std::meta::info R, std::meta::info... Rs>
 void reflect_user_specs(module_& m) {
     template for (constexpr auto ty :
-                  std::define_static_array(required_user_specs(R, excluded_v<Rs...>))) {
+                  std::define_static_array(required_user_specs(R, excluded_q<Rs...>()))) {
         reflect_class<typename [:ty:], ^^void, Rs...>(m);
     };
 }
