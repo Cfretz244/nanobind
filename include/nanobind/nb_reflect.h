@@ -1695,11 +1695,30 @@ consteval member_tmpl_route classify_member_template(std::meta::info cls,
                                        : member_tmpl_route::skip;
 }
 
+// Mangling disambiguator for the dispatcher below. GCC 16 mangles a
+// TEMPLATE-kind reflection NTTP by NAME only, so the dispatcher's
+// instantiations for two same-named sibling member templates (a
+// const/non-const heterogeneous-lookup `at` pair -- ankerl unordered_dense's
+// shape) get ONE assembly symbol: "symbol ... is already defined" at
+// assembly time (GCC-8, gcc16-proveout/probes/xfail_gcc8_*.cpp; the
+// clang-p2996 fork had the same family as TC-0004/TC-0009, fixed in its
+// mangler). Folding the default-instantiation SPEC (a Declaration-kind
+// reflection, mangled by signature) into the template-id keeps sibling
+// instantiations distinct on both compilers. A non-default-instantiable
+// sibling contributes ^^void: it can collide only with another uninstantiable
+// same-named sibling, and those instantiations are both empty (route ==
+// skip), so the fold stays harmless there.
+consteval std::meta::info member_tmpl_mangle_hint(std::meta::info tmpl) {
+    return fn_template_default_instantiable(tmpl) ? default_spec(tmpl)
+                                                  : ^^void;
+}
+
 // Bind a member function template via its default instantiation. The Python
 // name is the TEMPLATE's identifier (`contains`, not `containsInt` -- the
 // defaulted argument is an implementation detail), so multiple such templates
 // and their non-template overloads stack as normal Python overloads.
-template <typename T, std::meta::info tmpl>
+template <typename T, std::meta::info tmpl,
+          std::meta::info Disambig = member_tmpl_mangle_hint(tmpl)>
 void reflect_bind_member_template(auto& cls) {
     constexpr member_tmpl_route route = classify_member_template(^^T, tmpl);
     if constexpr (route == member_tmpl_route::oper) {
@@ -1743,6 +1762,43 @@ enum class class_member_kind { skip, fn, tmpl };
 // so they are dropped BEFORE the lift; the implicit default constructor,
 // which the init<> path does consume, is kept. clang-p2996 lifts the raw
 // list unchanged.
+// GCC-2-family: a member function whose reflection is lifted into
+// define_static_array is body-instantiated by GCC 16 if it is `constexpr`
+// (the lift forces GCC to determine usability in constant evaluation). For a
+// member whose constexpr body is LAZILY ill-formed in this specialization --
+// tl::expected<void,E>'s `constexpr operator->()` calls `valptr()` ->
+// `addressof(this->m_val)`, and the void storage base has no m_val -- that
+// turns the lift itself into a hard error, even though no binding pass would
+// ever consume the member. clang-p2996 never instantiates on lift, so it is
+// unaffected; the divergence is GCC's (probe xfail_gcc6_constexpr_lift.cpp).
+// The general, surface-preserving workaround: do not lift a member function
+// that NO binding pass can consume. liftable_class_members feeds the ctor /
+// method / member-template / property passes; a non-template, non-special,
+// non-ctor/dtor member function is consumed by the method pass ONLY when it is
+// public AND (not an operator, or an operator that maps to a Python dunder).
+// A non-public function, or a public operator with no dunder mapping
+// (operator-> / unary operator* / address-of / prefix ++/-- / <=> / ...), is
+// always skipped downstream, so dropping it before the lift changes no bound
+// surface while keeping its lazily-ill-formed constexpr body out of static
+// storage. (Mapped operators, accessors, and every other kind stay in the
+// list -- their bodies are well-formed wherever they are reachable.)
+consteval bool never_bound_plain_member_fn(std::meta::info m) {
+    if (!std::meta::is_function(m)
+        || std::meta::is_template(m)
+        || std::meta::is_constructor(m)
+        || std::meta::is_destructor(m)
+        || std::meta::is_special_member_function(m))
+        return false;                       // ctor/dtor/template/special: other passes
+    if (!std::meta::is_public(m))
+        return true;                        // private/protected: never bound anywhere
+    if (std::meta::is_operator_function(m)) {
+        // Unmapped member operator (operator-> etc.) is skipped at bind time.
+        std::size_t arity = std::meta::parameters_of(m).size();
+        return operator_dunder(std::meta::operator_of(m), arity) == nullptr;
+    }
+    return false;                           // ordinary public method: the method pass binds it
+}
+
 consteval std::vector<std::meta::info> liftable_class_members(std::meta::info cls) {
     std::vector<std::meta::info> out;
     for (auto m : std::meta::members_of(
@@ -1752,6 +1808,8 @@ consteval std::vector<std::meta::info> liftable_class_members(std::meta::info cl
             && std::meta::is_special_member_function(m)
             && !std::meta::is_user_declared(m)
             && !std::meta::is_default_constructor(m))
+            continue;
+        if (never_bound_plain_member_fn(m))
             continue;
 #endif
         out.push_back(m);
@@ -1918,12 +1976,27 @@ void flatten_unmodeled_bases(auto& cls) {
 // into the current TU, so the header-only path can only detect/diagnose; only the
 // codegen path can actually emit the includes.
 
-// True if any enclosing namespace of e is named "std" (handles libc++'s inline
-// namespace, where std::vector is really std::__1::vector).
+// True if e belongs to the standard library implementation: any enclosing
+// namespace is named "std" (handles libc++'s inline namespace, where
+// std::vector is really std::__1::vector) or is a RESERVED implementation
+// namespace. The latter matters on libstdc++, which keeps vendor internals
+// OUTSIDE std -- std::vector<T>::iterator dealiases to
+// __gnu_cxx::__normal_iterator<T*, vector<T>> -- and such types must take the
+// type-caster path, never the user-class-binding path (the user-spec discovery
+// fixpoint would otherwise drag every container's iterator into the bind set).
 consteval bool is_in_std(std::meta::info e) {
-    for (auto p = std::meta::parent_of(e); p != ^^::; p = std::meta::parent_of(p))
-        if (std::meta::has_identifier(p) && std::meta::identifier_of(p) == "std")
+    for (auto p = std::meta::parent_of(e); p != ^^::; p = std::meta::parent_of(p)) {
+        if (!std::meta::has_identifier(p))
+            continue;
+        std::string_view n = std::meta::identifier_of(p);
+        if (n == "std")
             return true;
+        // Namespace names reserved to the implementation (double underscore, or
+        // underscore + capital): __gnu_cxx, __gnu_debug, __cxxabiv1, _LIBCPP_*.
+        if (n.size() >= 2 && n[0] == '_'
+            && (n[1] == '_' || (n[1] >= 'A' && n[1] <= 'Z')))
+            return true;
+    }
     return false;
 }
 

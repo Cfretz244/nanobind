@@ -85,6 +85,12 @@ static_assert(tt_has_spec(^^template_test::Wrap<int>));
 static_assert(tt_has_spec(^^template_test::Pair<int, double>));
 static_assert(tt_has_spec(^^template_test::Array<int, 3>));
 static_assert(!tt_has_spec(^^std::vector<int>));     // std -> caster path, not bound
+// A stdlib-internal class reached through a signature (UsesBoxes::first_of
+// returns std::vector<int>::iterator) is never discovered as a user spec, on
+// EITHER stdlib layout: libc++ keeps the iterator under std
+// (std::__wrap_iter), libstdc++ in a reserved namespace OUTSIDE std
+// (__gnu_cxx::__normal_iterator) -- is_in_std covers both.
+static_assert(!tt_has_spec(std::meta::dealias(^^std::vector<int>::iterator)));
 // Reachability: the spec itself is bound, its policy-only template arg is not.
 static_assert(tt_has_spec(^^template_test::Cont<int, template_test::Pol<int>>));
 static_assert(!tt_has_spec(^^template_test::Pol<int>));

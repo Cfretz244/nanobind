@@ -500,6 +500,9 @@ def test37_member_function_templates(t):
     assert not hasattr(t, 'HetBase')
     assert h.at(21) == 42                        # two defaulted params
     assert h.erase(1) == 1 and h.erase(-1) == 0
+    # Same-named const/non-const template pair: both siblings bind as stacked
+    # overloads with distinct dispatcher symbols (GCC-8 regression).
+    assert h.hat(4) == 5
     assert h[5] == 15                            # operator[] template -> __getitem__
     assert t.HetMap.sdouble(8) == 16             # static member template
     # No default / parameter packs stay skipped.
@@ -550,6 +553,12 @@ def test37_template_auto_discovery(t):
     assert isinstance(u.wrapped, t.WrapInt)
     u.wrapped.inner = t.BoxInt(1)
     assert u.wrapped.inner.get() == 1
+    # A stdlib-internal class in a signature (std::vector<int>::iterator,
+    # first_of's return type) must NOT be auto-discovered/bound: the method
+    # itself binds, its return type stays an unregistered class on both
+    # stdlibs (libc++ __wrap_iter / libstdc++ __gnu_cxx::__normal_iterator).
+    assert hasattr(u, "first_of")
+    assert not any("iterator" in n or "wrap_iter" in n for n in dir(t))
 
 
 def test38_function_template_specialization(t):

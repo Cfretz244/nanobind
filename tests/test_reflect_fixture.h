@@ -530,6 +530,14 @@ struct HetMap : member_template_detail::HetBase {
     int at(const K& k) const { return k * 2; }                  // multi-defaulted
     template <class K = int>
     std::size_t erase(const K& k) { return k > 0 ? 1u : 0u; }
+    // Const/non-const same-named default-instantiable pair (ankerl
+    // unordered_dense's heterogeneous at()): the dispatcher instantiations
+    // for the two siblings must get DISTINCT symbols (GCC-8; the
+    // member_tmpl_mangle_hint disambiguator).
+    template <class K = int>
+    int hat(const K& k) { return k + 1; }
+    template <class K = int>
+    int hat(const K& k) const { return k + 1; }
     template <class K = int>
     int operator[](const K& k) const { return k + 10; }         // -> __getitem__
     // SFINAE-false pack sibling of operator[] (TC-0004 trigger shape: mirrors absl
@@ -657,6 +665,17 @@ struct UsesBoxes {
     UsesBoxes() = default;
     Box<double> make_bd() const { return Box<double>(2.5); }   // return type -> BoxDouble
     void take(const Box<int>& b) { bi = b; }                  // param type (dup) -> BoxInt
+    // A stdlib-INTERNAL class in a signature: std::vector's iterator dealiases
+    // to an implementation-detail class template -- libc++'s std::__wrap_iter
+    // (under std) or libstdc++'s __gnu_cxx::__normal_iterator (a reserved
+    // namespace OUTSIDE std). is_in_std must classify BOTH as stdlib
+    // implementation so the user-spec discovery fixpoint never drags the
+    // iterator into the bind set (unordered_dense's table::begin/find field
+    // shape on libstdc++); the method itself binds, with an unregistered
+    // return type. Asserted via tt_has_spec in test_reflect.cpp.
+    std::vector<int>::iterator first_of(std::vector<int>& v) const {
+        return v.begin();
+    }
 };
 
 } // namespace template_test
