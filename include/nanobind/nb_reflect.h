@@ -60,7 +60,7 @@ template <std::meta::info... Excluded> struct exclude_ {};
 ///   nb::exclude_<^^Eigen::Transpose,
 ///                ^^nb::exclude_member_<^^Eigen::Matrix<double,3,3>, "w">>
 ///
-/// Honored identically on both backends, so one marker set serves clang and GCC.
+/// Honored identically by the constexpr and emit backends.
 template <std::meta::info Owner, reflect::fixed_string Name>
 struct exclude_member_ {};
 
@@ -833,9 +833,9 @@ consteval bool fn_skip_annotated(std::meta::info fn) {
 // hash/btree container query APIs use, while excluding emplace/try_emplace
 // (packs) and templates needing explicit arguments. The pack rejection probes
 // whether the template would absorb ONE MORE argument than the default
-// instantiation took; the probe argument must be ^^int, NEVER ^^void (placing
-// void into a `class...` pack forms void&& inside clang's Substitute and
-// crashes Sema).
+// instantiation took; the probe argument is ^^int, NEVER ^^void (a void
+// pack element forms void&& during substitution -- it crashed the retired
+// clang lane outright, and no compiler is obliged to take it gracefully).
 consteval bool fn_template_default_instantiable(std::meta::info tmpl) {
     if (!std::meta::can_substitute(tmpl, std::vector<std::meta::info>{}))
         return false;                       // some parameter lacks a default
@@ -1877,8 +1877,7 @@ enum class class_member_kind { skip, fn, tmpl };
 // the lift itself is a hard error. Implicit copy/move ctors and assignment
 // operators are never bound (ctor_binds / classify_class_member skip them),
 // so they are dropped BEFORE the lift; the implicit default constructor,
-// which the init<> path does consume, is kept. clang-p2996 lifts the raw
-// list unchanged.
+// which the init<> path does consume, is kept.
 // GCC-2-family: a member function whose reflection is lifted into
 // define_static_array is body-instantiated by GCC 16 if it is `constexpr`
 // (the lift forces GCC to determine usability in constant evaluation). For a
@@ -1886,8 +1885,7 @@ enum class class_member_kind { skip, fn, tmpl };
 // tl::expected<void,E>'s `constexpr operator->()` calls `valptr()` ->
 // `addressof(this->m_val)`, and the void storage base has no m_val -- that
 // turns the lift itself into a hard error, even though no binding pass would
-// ever consume the member. clang-p2996 never instantiates on lift, so it is
-// unaffected; the divergence is GCC's (probe xfail_gcc6_constexpr_lift.cpp).
+// ever consume the member (probe xfail_gcc6_constexpr_lift.cpp).
 // The general, surface-preserving workaround: do not lift a member function
 // that NO binding pass can consume. liftable_class_members feeds the ctor /
 // method / member-template / property passes; a non-template, non-special,
@@ -1940,10 +1938,6 @@ consteval std::vector<std::meta::info> liftable_class_members(
         out.push_back(m);
     }
     return out;
-}
-
-consteval std::vector<std::meta::info> liftable_class_members(std::meta::info cls) {
-    return liftable_class_members(cls, cls, {});
 }
 
 // The lifted member list, memoized once per (class, derived, pack): the
