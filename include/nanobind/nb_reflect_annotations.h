@@ -26,7 +26,8 @@
     string-bearing annotations (rename, doc) store the text in a fixed-size array
     (a `const char*` member would not be a valid template argument).
 
-    Requires a compiler with P2996 + P3394 support (-freflection-latest).
+    Requires a C++26 compiler with P2996 + P3394 support (GCC 16+,
+    -std=c++26 -freflection); without one the annotations are inert values.
 
     Copyright (c) 2025.
 

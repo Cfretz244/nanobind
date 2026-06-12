@@ -56,7 +56,7 @@
     skipped with a comment -- the constexpr backend can bind it via splices,
     text cannot (documented mode limitation).
 
-    Requires a compiler with P2996 support (e.g. Bloomberg clang-p2996).
+    Requires a C++26 compiler with P2996 support (GCC 16+, -std=c++26 -freflection).
 
     Copyright (c) 2025.
 
@@ -83,9 +83,12 @@ NAMESPACE_BEGIN(NB_NAMESPACE)
 NAMESPACE_BEGIN(detail)
 NAMESPACE_BEGIN(emitgen)
 
-// Static-text chunking, for two hard limits:
+// Static-text chunking. The hard limits below were measured on the retired
+// clang-p2996/macOS lane; bounded chunks remain the right shape on GCC too
+// (consteval budgets, assembler/linker symbol sizes, GCC-0007's evaluator
+// memory wall all reward small independent constants):
 // - std::define_static_string silently MISCOMPILES for inputs >= 32768 chars
-//   on the pinned toolchain: reflect_constant_string spells the whole string
+//   on clang-p2996: reflect_constant_string spells the whole string
 //   as one NTTP pack, and each substituted element's PackIndex is a 15-bit
 //   bitfield (SubstTemplateTypeParmType/SubstNonTypeTemplateParmExpr, clang
 //   AST) that overflows -- "excess elements in array initializer" out of

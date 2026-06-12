@@ -202,13 +202,13 @@ if (NB_REFLECT_FLAGS)
   # binding TU for the shared fixture via reflection; the build runs it and
   # compiles the GENERATED source as the module -- at c++20 with NO reflection
   # flags, which is the in-tree proof that the output needs no reflection
-  # toolchain (the corpus's emit lane repeats this with Apple Clang).
+  # toolchain (the corpus's emit lane repeats this with plain g++).
   set(NB_REFLECT_EMIT_SRC ${CMAKE_CURRENT_BINARY_DIR}/test_reflect_emit.gen.cpp)
   set(NB_REFLECT_PROBE_SRC ${CMAKE_CURRENT_BINARY_DIR}/test_reflect_spelling_probe.gen.cpp)
 
   add_executable(test_reflect_emit_gen test_reflect_emit_gen.cpp)
   # Rendering the whole module as a consteval string outspends the default
-  # walk budget; the bump is harmless (TC-0002 made budgets safe to raise).
+  # constant-evaluation budget; the bump is harmless.
   target_compile_options(test_reflect_emit_gen PRIVATE ${NB_REFLECT_FLAGS}
       ${NB_REFLECT_BIG_STEPS})
   target_link_options(test_reflect_emit_gen PRIVATE ${NB_REFLECT_FLAGS})

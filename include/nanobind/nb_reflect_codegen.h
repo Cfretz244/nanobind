@@ -18,7 +18,7 @@
     off the method's reflection (typename [: type_of(...) :]), so this header needs
     no general C++ type-name printer.
 
-    Requires a compiler with P2996 support (e.g. Bloomberg clang-p2996).
+    Requires a C++26 compiler with P2996 support (GCC 16+, -std=c++26 -freflection).
 
     Copyright (c) 2025.
 

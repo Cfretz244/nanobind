@@ -27,14 +27,13 @@
       typedef-for-linkage idiom (`typedef struct {...} name_t;`, BINDER-0018)
       is recovered at the anonymous record itself via its linkage name.
     - Inline std namespaces (std::__1) are skipped in qualified names via the
-      __-prefix-under-std heuristic; the pinned toolchain has no
-      is_inline_namespace metafunction (toolchain work item). Inline
-      namespaces elsewhere (absl::lts_*) are kept -- explicitly naming an
-      inline namespace is valid, just verbose.
+      __-prefix-under-std heuristic; GCC 16 has no is_inline_namespace
+      metafunction. Inline namespaces elsewhere (absl::lts_*) are kept --
+      explicitly naming an inline namespace is valid, just verbose.
     - Template-ids render EVERY argument explicitly (including defaulted
       ones): never rely on default arguments matching across stdlibs.
 
-    Requires a compiler with P2996 support (e.g. Bloomberg clang-p2996).
+    Requires a C++26 compiler with P2996 support (GCC 16+, -std=c++26 -freflection).
 
     Copyright (c) 2025.
 

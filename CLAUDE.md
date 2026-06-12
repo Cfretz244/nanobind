@@ -22,9 +22,11 @@ functions, and enums with reflection and emits ordinary `nb::class_<T>().def(...
 thing that cannot be expressed in-language (a virtual-override **trampoline**) has a
 **text-codegen fallback**.
 
-> Requires a C++26/P2996 compiler. Build everything with the umbrella repo's repo-local
-> from-source clang-p2996 toolchain at `../toolchain` (see "Building & testing" — these are
-> exact, this-laptop instructions).
+> Requires a C++26/P2996 compiler: **GCC 16+** (`-std=c++26 -freflection`) is the
+> sole supported toolchain. Everything builds and tests inside the umbrella repo's
+> `gcc16-reflect` docker container (see "Building & testing" — exact instructions).
+> The bloomberg clang-p2996 lane was retired; branch `mk-reflect` is the last
+> dual-toolchain state, `gcc16-only` is the simplified GCC-only line.
 
 ## Where the implementation lives
 
@@ -132,10 +134,10 @@ thing that cannot be expressed in-language (a virtual-override **trampoline**) h
   neither discovered nor bound (`is_complete_type` gates; sugar-blind on
   unpatched toolchains, TC-0012). The completeness probes cost constexpr
   steps: several corpus runs needed a raised `-fconstexpr-steps`.
-- **Deduction guides are stripped from the namespace walks** before the
-  `define_static_array` lift (`namespace_members_for_binding`): a guide is never bindable,
-  and pre-TC-0008 toolchains ICE mangling a guide reflection ("Can't mangle a deduction
-  guide name!" — tl's `unexpected(E) -> unexpected<E>` was the field shape).
+- **Deduction guides** need no special handling on GCC: the namespace walks
+  enumerate them, but they classify as templates and skip on every path (the
+  clang-era stripping pass, TC-0008, was removed -- it was verifiably a no-op
+  on GCC, whose guide reflections carry an identifier).
 - **Using-redeclarations**: public-base re-exports are covered by inheritance/flattening.
   Private-base re-exports (StatusOr's `value()`) do NOT bind — the entity-proxy feature
   (clang fork's `-fentity-proxy-reflection`) was REMOVED after P3687R1 deferred
@@ -199,7 +201,8 @@ thing that cannot be expressed in-language (a virtual-override **trampoline**) h
   backends (conftest `t` fixture; the emit module builds at c++20 with no
   reflection flags in its own NB_DOMAIN), test_reflect_emit.py owns the
   recursive surface diff. The corpus validates three-way per run (oracle /
-  constexpr / emit + surface diff; corpus/lib/run_gates.py).
+  constexpr / emit + surface diff; corpus/lib/run_gates.py); its emit lane's
+  production compiler is plain g++ with no reflection flags.
 
 - **Emit-mode spelling-probe TU**: `nb::write_spelling_probe<Rs...>(path,
   preamble)` renders a second generated TU (plain C++, no nanobind) that
@@ -214,83 +217,78 @@ thing that cannot be expressed in-language (a virtual-override **trampoline**) h
 Roadmap / not yet: per-argument ownership-transfer annotations; member function templates
 needing explicit arguments; trampoline hardening for final/ref-qualified virtuals.
 
-## Key gotchas (clang-p2996 @ the pinned toolchain commit)
+## Key gotchas (GCC 16)
 
-- **Mangler crash**: a lambda whose *signature* names a spliced type (`[:type_of(x):]` as a
-  parameter/return type), passed to a dependent `cls.def*(...)` call, crashes the compiler
-  (`UNREACHABLE … mangling a placeholder type`). The binder avoids this everywhere: data
-  members use pointer-to-member; method lambdas keep real `Ret`/`Args...` template params;
-  conversion lambdas use fixed concrete return types and cast.
+- **GCC-1 / GCC-6 (lift instantiates definitions)**: lifting a member reflection into
+  `define_static_array` instantiates an implicit special member's DEFINITION and a
+  `constexpr` member's BODY. EVERY class-member lift must go through
+  `liftable_class_members` / `liftable_members_v` (the single pre-lift drop point);
+  a BOUND member whose constexpr body is lazily ill-formed for the reflected spec is
+  excluded by name via `nb::exclude_member_<Owner, "name">`.
+- **GCC-2 (expansion ranges)**: a constexpr LOCAL is rejected as an
+  expansion-statement range inside a template — hoist to a variable template
+  (`emit_indices_v` / `liftable_members_v` pattern).
+- **GCC-5 (deferred noexcept)**: a dependent noexcept-specifier left unresolved ICEs
+  when the spliced function type meets the binder-spec matrix; every decl-derived
+  function type routes through `nb_fn_type_of` (forces resolution via `is_noexcept`).
+- **GCC-8 (template-NTTP mangling)**: same-named sibling member templates as
+  dispatcher NTTPs mangle identically ("symbol ... is already defined" at assembly
+  time); `member_tmpl_mangle_hint` folds the default-instantiation spec into the
+  template-id to keep instantiations distinct.
+- **Consteval-only lambdas**: a lambda whose body splices an enclosing info NTTP
+  cannot decay to a function pointer — hoist the splice
+  (`constexpr auto mp = &[:fn:];`, the `reflect_bind_conversion` pattern).
+- **P3560 strictness**: metafunctions THROW `std::meta::exception` on wrong-kind
+  arguments; always gate with `is_type`/`is_function` first. "uncaught
+  std::meta::exception" errors are often cascades of an earlier
+  `[-Wtemplate-body]` parse-time warning — fix those first.
+- **Discarded `if constexpr` branches inside an expanded `template for` body are
+  fully checked** (the loop variable is not dependent): a splice valid only for the
+  taken branch must live in an info-NTTP helper template (`reflect_class_of` /
+  `reflect_enum_of` pattern).
 - **Annotation values must be valid template arguments**: a `const char*` member is not, so
   `rename`/`doc` store text in a `fixed_string<N>` (char array) via CTAD.
 - `def_rw`/`def_ro` default to `rv_policy::reference_internal`; the binder only passes a
   policy when one is annotated, so it never clobbers that default.
-- **TC-0004 (fixed in the toolchain; workaround removed)**: same-named function-template
-  reflections as NTTPs used to mangle identically, so the two
-  `reflect_bind_member_template<T, tmpl>` instantiations for a sibling pair (raw_hash_map's
-  `operator[]` + its SFINAE-false lifetimebound twin) were silently folded into one body at
-  codegen — the operator never bound, no diagnostic. The toolchain mangler now appends an
-  ODR hash of the template head + pattern; substitution happens inline in
-  `reflect_bind_member_template` again, and HetMap's pack-sibling `operator[]` in the test
-  suite keeps the trigger shape covered. Qualifier filtering uses the binder-spec
-  completeness gate (`sizeof` on the undefined `reflect_method_binder` primary) — it is the
-  volatile/`&&` matrix filter on every binding path, with no duplicated qualifier logic.
-  (The "decl predicates misreport on proxy underlyings" caveat is RESOLVED: the real bug
-  was `[[clang::lifetimebound]]` wrapping the method type in AttributedType sugar that
-  blinded the qualifier predicates — proxies were incidental; fixed in the toolchain as
-  TC-0005.)
 - **Entity proxies were removed** (P3687R1 deferred shadow-declaration reflection past
-  C++26): the binder no longer passes `-fentity-proxy-reflection` and has no proxy
-  paths. `using` re-exports from private bases simply do not bind.
+  C++26): `using` re-exports from private bases simply do not bind.
+- The full GCC findings catalog lives in the umbrella repo:
+  `corpus/findings/GCC-000*.md`, repro probes in `gcc16-proveout/probes/`.
 
-## Building & testing (exact, this laptop)
+## Building & testing (GCC 16, docker)
 
-Everything is self-contained in the umbrella repo `~/git/cpp26-reflect-nanobind`, which pins
-this checkout as its `nanobind/` submodule: the toolchain at `<umbrella>/toolchain` (the
-from-source clang-p2996, built from the umbrella's `llvm-project/` submodule), the venv at
-`<umbrella>/.venv` (Homebrew `python3.12` — system `/usr/bin/python3` lacks dev headers), and
-the CMake build tree at `<umbrella>/build`. **Do not use the old `~/llvm-toolchain`,
-`~/git/nanobind`, `~/git/llvm-project`, `/tmp/nbvenv`, or `/tmp/nbbuild`** — those predate the
-self-contained umbrella repo.
-
-Fast front-end check (no build/link; run from this directory):
-
-```bash
-TC=../toolchain
-PYINC=$(/opt/homebrew/bin/python3.12 -c 'import sysconfig;print(sysconfig.get_path("include"))')
-$TC/bin/clang++ -std=c++26 -freflection-latest -stdlib=libc++ \
-  -isysroot "$(xcrun --show-sdk-path)" -nostdinc++ -isystem $TC/include/c++/v1 \
-  -I "$PYINC" -I include -fsyntax-only tests/test_reflect.cpp
-```
-
-Recreate the venv + build tree (run from the umbrella root; `git submodule update --init
---recursive` there covers `ext/robin_map`):
+Everything runs inside the umbrella repo's `gcc16-reflect` docker container (the
+repo mounts at `/work`; image built from `gcc16-proveout/Dockerfile`). The venv
+lives at `<umbrella>/gcc16-proveout/venv` (container paths), the build tree at
+`<umbrella>/gcc16-proveout/build-nanobind`. Both are git-ignored and rebuildable.
 
 ```bash
 cd ~/git/cpp26-reflect-nanobind
-TC=$PWD/toolchain
-python3.12 -m venv .venv && .venv/bin/pip -q install pytest
-cmake -S nanobind -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_COMPILER=$TC/bin/clang -DCMAKE_CXX_COMPILER=$TC/bin/clang++ \
-  -DCMAKE_OSX_SYSROOT="$(xcrun --show-sdk-path)" \
-  -DPython_EXECUTABLE="$PWD/.venv/bin/python" \
-  -DNB_TEST=ON -DNB_TEST_FREE_THREADED=OFF -DNB_TEST_STABLE_ABI=OFF \
-  -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-rpath,$TC/lib" \
-  -DCMAKE_MODULE_LINKER_FLAGS="-Wl,-rpath,$TC/lib"
-```
-(Configure prints `NB_HAS_REFLECTION_BLOOMBERG - Success` when the toolchain is detected.)
+docker build -t gcc16-reflect gcc16-proveout   # once
 
-Build + run the reflection tests (from the umbrella root):
-
-```bash
-ninja -C build test_reflect_ext test_reflect_codegen_ext
-DYLD_LIBRARY_PATH=$PWD/toolchain/lib PYTHONPATH=$PWD/build/tests \
-  .venv/bin/python -m pytest nanobind/tests/test_reflect.py \
-  nanobind/tests/test_reflect_codegen.py -W error::RuntimeWarning
+docker run --rm -v "$PWD":/work gcc16-reflect bash -c '
+  python3 -m venv /work/gcc16-proveout/venv 2>/dev/null
+  /work/gcc16-proveout/venv/bin/pip -q install pytest
+  cmake -S /work/nanobind -B /work/gcc16-proveout/build-nanobind -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
+    -DPython_EXECUTABLE=/work/gcc16-proveout/venv/bin/python \
+    -DNB_TEST=ON -DNB_TEST_FREE_THREADED=OFF -DNB_TEST_STABLE_ABI=OFF
+  ninja -C /work/gcc16-proveout/build-nanobind \
+    test_reflect_ext test_reflect_emit_ext test_reflect_codegen_ext
+  cd /work/nanobind/tests && \
+    PYTHONPATH=/work/gcc16-proveout/build-nanobind/tests \
+    /work/gcc16-proveout/venv/bin/python -m pytest \
+      test_reflect.py test_reflect_codegen.py test_reflect_emit.py \
+      -q -W error::RuntimeWarning'
 ```
-All reflection tests pass (`-W error::RuntimeWarning` turns nanobind's double-registration
-warning into a failure). Only `test_reflect*` targets are reflection-related; the rest of
-nanobind's suite is upstream and not the focus here.
+
+Configure prints `NB_HAS_REFLECTION_GCC - Success`. All reflection tests pass
+(`-W error::RuntimeWarning` turns nanobind's double-registration warning into a
+failure). Only `test_reflect*` targets are reflection-related; the rest of
+nanobind's suite is upstream and not the focus here. Notes: keep the venv under
+`/work/...` (a `/tmp` venv dies with the container) and re-pass
+`-DPython_EXECUTABLE` on any re-`cmake`; the corpus wrapper
+`corpus/lib/gcc16_run.sh` runs ad-hoc container commands.
 
 ## Contribution workflow
 

@@ -11,10 +11,7 @@ Requirements
 ------------
 
 A C++ compiler with `P2996 <https://wg21.link/p2996>`_ static reflection
-support. Known compatible compilers include:
-
-- **GCC 16+** with ``-std=c++26 -freflection``
-- **Bloomberg clang-p2996** fork
+support: **GCC 16+** with ``-std=c++26 -freflection``.
 
 The header is guarded by ``__cpp_reflection`` / ``__cpp_impl_reflection`` and
 compiles to nothing on compilers without reflection support, so it is safe to
@@ -746,9 +743,8 @@ Limitations
   ``using`` re-exports, free functions, and free operators — and their
   signatures neither demand STL casters nor pull template specializations into
   the bind set. A deleted integral conversion does not compete for ``__int__``.
-- **Deduction guides** are stripped from the namespace walks (never bindable;
-  on toolchains without the guide-mangling fix their reflections cannot even
-  appear in mangled-name position).
+- **Deduction guides** are never bindable; the namespace walks classify them
+  as templates and skip them.
 - Member and free (unary + binary) operators are mapped to Python dunders (see
   `Operators`_); ``operator<=>``, ``++``/``--``, and logical ``&&``/``||``/``!``
   are skipped.

@@ -1,7 +1,7 @@
 /*
     nanobind/nb_reflect.h: Automatic binding via C++26 static reflection (P2996)
 
-    Requires a compiler with P2996 support (e.g. GCC 16+, Bloomberg clang-p2996)
+    Requires a C++26 compiler with P2996 support (GCC 16+, -std=c++26 -freflection)
 
     Copyright (c) 2025 Matthew Kolbe
 
@@ -79,8 +79,8 @@ NAMESPACE_BEGIN(detail)
 // --- Trampoline hook ---
 //
 // A trampoline (a class derived from T that overrides T's virtuals to forward
-// into Python) cannot be synthesized in-language on this fork, so reflect_ never
-// generates one itself. Instead it consults this trait: if a trampoline type is
+// into Python) cannot be synthesized in-language on a P2996 compiler, so
+// reflect_ never generates one itself. Instead it consults this trait: if a trampoline type is
 // registered for T, reflect_class passes it to nanobind as the class_ "Alias"
 // (enabling Python subclasses to override C++ virtuals). The trampoline may be
 // hand-written or produced by the codegen fallback (nb_reflect_codegen.h); both
@@ -166,12 +166,10 @@ consteval std::string sanitize_identifier(std::string_view in) {
 // libstdc++/GCC: "long long int"/"long int"/"short int"/"long long unsigned
 // int"). That made template-spec Python names diverge by backend
 // (to_string<long long> -> "to_stringLonglong0" vs "to_stringLonglongint0").
-// Mapping the canonical builtin types to a fixed fragment keeps both backends
-// identical; returns an empty string for non-builtins (caller falls back). The
-// fragments reproduce EXACTLY what the prior display_string_of path produced on
-// clang-p2996 (sanitize_identifier + capitalize_first of clang's spelling), so
-// no clang-backend Python name changes; only GCC's divergent integral spellings
-// are pinned to the same value.
+// Mapping the canonical builtin types to a fixed fragment pins the Python
+// names; returns an empty string for non-builtins (caller falls back). The
+// fragments reproduce what the retired clang-p2996 lane produced, so every
+// historical Python name (and corpus expectation) stays stable.
 consteval std::string builtin_camel_fragment(std::meta::info type) {
     type = std::meta::remove_cvref(type);
     struct Entry { std::meta::info t; std::string_view frag; };
@@ -562,10 +560,8 @@ void reflect_bind_member(auto& cls) {
     constexpr data_route route = data_member_route(mem);
     if constexpr (route != data_route::skip) {
         constexpr auto name = entity_name<mem>();
-        // Bind via a pointer-to-data-member (&[:mem:]) rather than getter/setter
-        // lambdas: a lambda whose signature mentions the spliced member type
-        // [:type_of(mem):] crashes the clang-p2996 mangler when passed to the
-        // dependent `cls.def_*` call (placeholder-type mangling at parse time).
+        // Bind via a pointer-to-data-member (&[:mem:]): def_rw/def_ro take it
+        // directly, with no synthesized getter/setter lambdas.
         with_data_extras<mem>([&](auto&&... e) {
             if constexpr (route == data_route::ro)
                 cls.def_ro(name, &[:mem:], std::forward<decltype(e)>(e)...);
@@ -597,7 +593,7 @@ consteval bool method_shape_bindable(std::meta::info fn) {
 // nlohmann basic_json's swap(reference) with its trait-expression noexcept
 // was the field shape). is_noexcept resolves the specifier as a side effect,
 // so every matrix dispatch takes the function type through this helper
-// instead of splicing type_of directly. Behavior-neutral on clang-p2996.
+// instead of splicing type_of directly.
 consteval std::meta::info nb_fn_type_of(std::meta::info fn) {
     (void)std::meta::is_noexcept(fn);
     return std::meta::type_of(fn);
@@ -609,9 +605,9 @@ struct reflect_method_binder;
 // A method's function type carries its cv-, ref-, and noexcept-qualifiers, and a
 // partial specialization must match them exactly. Stamp out one specialization per
 // supported qualifier combination (cv in {-, const} x ref in {-, &} x noexcept).
-// The forwarding lambda's signature uses the real Ret/Args... template parameters
-// (never type splices), which keeps it clear of the clang-p2996 mangler crash that
-// spliced-type lambda signatures trigger in a dependent cls.def call.
+// The matrix is also the shape gate: an unmodeled qualifier combination matches
+// no specialization, and `sizeof` on the undefined primary is the completeness
+// probe the operator/member-template paths use.
 #define NB_REFLECT_DEFINE_METHOD_BINDER(QUALS, CONST)                          \
     template <typename T, std::meta::info fn, typename Ret, typename... Args>  \
     struct reflect_method_binder<T, fn, Ret(Args...) QUALS> {                  \
@@ -686,9 +682,10 @@ void reflect_bind_static_method(auto& cls) {
 // arithmetic/enum -- i.e. when it can be bound by value with no ODR-use of the
 // member. (In-class initializers are only permitted on integral/enum consts
 // and constexpr members, so the arithmetic restriction loses nothing.) The
-// NTTP is a FIXED type, not `auto`: deducing an auto NTTP from a dependent
-// splice inside a requires-expression ICEs the toolchain at parse (TC-0013,
-// DeduceAutoType classifying a non-existent value).
+// NTTP is a FIXED type, not `auto`: the identical probe is emitted verbatim
+// into generated source (BINDER-0020), the fixed type loses nothing, and an
+// auto NTTP deduced from a dependent splice ICE'd the retired clang-p2996
+// lane at parse (TC-0013).
 template <long double> struct value_as_nttp_probe;
 
 template <typename T, std::meta::info mem>
@@ -1163,9 +1160,9 @@ consteval const char* conversion_dunder(std::meta::info cls, std::meta::info fn)
 
 template <typename T, std::meta::info fn>
 void reflect_bind_conversion(auto& cls) {
-    // Use fixed concrete lambda return types (bool/long long/double) and cast the
-    // conversion result: a spliced type in a lambda signature crashes the
-    // clang-p2996 mangler.
+    // Fixed concrete lambda return types (bool/long long/double), casting the
+    // conversion result: they are exactly what __bool__/__int__/__float__
+    // need to produce.
     constexpr const char* d = conversion_dunder(^^T, fn);
     if constexpr (d != nullptr) {
         constexpr auto R = std::meta::return_type_of(fn);
@@ -1524,9 +1521,8 @@ consteval bool ctor_binds(std::meta::info fn, std::span<const std::meta::info> e
 // (`__neg__`/`__pos__`/`__invert__`). Binding happens while that class is being
 // reflected, so its class_ object is in hand (no re-registration of an existing type).
 //
-// The forwarding lambda keeps the real Ret/P0/P1 template parameters in its
-// signature (from the function-type partial specialization) and only splices the
-// call in its body, staying clear of the clang-p2996 spliced-signature mangler crash.
+// The forwarding lambda takes the real Ret/P0/P1 template parameters from the
+// function-type partial specialization and splices the call in its body.
 
 template <typename T, std::meta::info fn, typename FnType>
 struct reflect_free_operator_binder;
@@ -1636,9 +1632,8 @@ consteval bool is_bindable_free_operator() {
 // absl::Status, ...) WITHOUT ever exposing std::ostream to Python — sidestepping both the
 // no-ostream-caster problem and the incomplete-basic_ostream compile error that binding the
 // stream operator as a dunder would hit. Guarded by a requires-expression (only binds when
-// actually streamable); the lambda keeps T (a real template parameter, not a splice) in its
-// signature, avoiding the clang-p2996 spliced-signature mangler crash; the `oss << self` call
-// resolves the operator by ADL in the lambda body.
+// actually streamable); the `oss << self` call resolves the operator by ADL in
+// the lambda body.
 template <typename T>
 void bind_stream_str(auto& cls) {
     if constexpr (requires(std::ostream& os, const T& t) { os << t; }) {
@@ -1687,11 +1682,11 @@ consteval std::meta::info find_property_setter() {
     return found;
 }
 
-// Bind one property from its getter and (optional) setter. Uses pointer-to-member-
-// functions (&[:getter:] / &[:setter:]) -- like data members use &[:mem:] -- so no
-// lambda names a spliced type (clang-p2996 mangler rule). getter/setter are template
-// parameters (not captured locals): a std::meta::info is a consteval-only type and
-// cannot be captured by the runtime extras lambda. The getter's return-policy / doc
+// Bind one property from its getter and (optional) setter, via pointer-to-
+// member-functions (&[:getter:] / &[:setter:]) -- like data members use
+// &[:mem:]. getter/setter are template parameters (not captured locals): a
+// std::meta::info is a consteval-only type and cannot be captured by the
+// runtime extras lambda. The getter's return-policy / doc
 // annotations are threaded via with_data_extras.
 template <std::meta::info getter, std::meta::info setter>
 void reflect_bind_property_impl(auto& cls) {
@@ -1780,15 +1775,9 @@ void reflect_bind_member_function(auto& cls) {
 }
 
 /// The template's default instantiation -- the only thing the binder binds for
-/// a member function template. It is substituted right here, two-plus
-/// dependent levels deep: that shape used to require hoisting the substitute()
-/// to the dispatch loop and passing the spec down as an NTTP, because
-/// reflections of same-named function templates (raw_hash_map's operator[] /
-/// its SFINAE-false pack sibling) mangled identically as template arguments
-/// and the two dispatch instantiations were silently FOLDED into one body at
-/// codegen (TC-0004 -- fixed in the toolchain mangler; regression-covered by
-/// HetMap's pack-sibling operator[] and by
-/// libcxx/test/.../substitute-nested-dependent.pass.cpp).
+/// a member function template. (Same-named sibling templates need the
+/// member_tmpl_mangle_hint disambiguator below when used as dispatcher NTTPs;
+/// GCC-8.)
 consteval std::meta::info default_spec(std::meta::info tmpl) {
     return std::meta::substitute(tmpl, std::vector<std::meta::info>{});
 }
