@@ -109,6 +109,26 @@ static_assert(nb::detail::is_exclude_marker(^^EX_MARKER));
 static_assert(!ex_has_spec(^^exclude_test::Expr<int>));
 static_assert(!ex_has_spec(^^exclude_test::Expr<exclude_test::Expr<int>>));
 
+// By-NAME member exclusion (nb::exclude_member_): the GCC-safe escape hatch that
+// drops a member before its reflection is ever materialized. The rule is read
+// from the exclude_ marker WITHOUT forming the named member's reflection, and
+// liftable_class_members drops it (so XVec::named_out never binds on either
+// backend). XVec::len() -- a sibling with no rule -- stays liftable.
+namespace {
+constexpr auto xvec_excl_rules = nb::detail::excluded_members_v<^^EX_MARKER>;
+consteval bool liftable_has(std::meta::info cls, std::string_view name) {
+    for (auto m : nb::detail::liftable_class_members(cls, cls, xvec_excl_rules))
+        if (std::meta::has_identifier(m) && std::meta::identifier_of(m) == name)
+            return true;
+    return false;
+}
+}
+static_assert(xvec_excl_rules.size() == 1);
+static_assert(xvec_excl_rules[0].owner == ^^exclude_test::XVec);
+static_assert(std::string_view(xvec_excl_rules[0].name) == "named_out");
+static_assert(!liftable_has(^^exclude_test::XVec, "named_out"));  // dropped by name
+static_assert(liftable_has(^^exclude_test::XVec, "len"));         // sibling unaffected
+
 // --- Compile-time checks for the emit backend's type renderer (nb_reflect_spell.h) ---
 // The cast-based round-trip probe (overload-exact member-pointer casts compiled
 // WITHOUT reflection) lives with the emit test; these pin the renderer's output

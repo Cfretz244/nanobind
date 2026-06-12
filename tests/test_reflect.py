@@ -615,8 +615,11 @@ def test41_exclude_marker(t):
     # Excluded entities are not bound under any name.
     for absent in ("ExprInt", "Opaque", "Helper", "ExBase"):
         assert not hasattr(t, absent), absent
-    # Members whose signatures mention an excluded entity are skipped...
-    for absent in ("expr", "dot", "helper", "opaque", "field", "doomed"):
+    # Members whose signatures mention an excluded entity are skipped, plus
+    # `doomed` (listed by reflection) and `named_out` (listed BY NAME via
+    # nb::exclude_member_ -- the GCC-safe escape hatch).
+    for absent in ("expr", "dot", "helper", "opaque", "field", "doomed",
+                   "named_out"):
         assert not hasattr(t.XVec, absent), absent
     # ...including free functions and constructors.
     assert not hasattr(t, "free_expr")

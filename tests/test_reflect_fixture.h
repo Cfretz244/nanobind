@@ -718,6 +718,10 @@ struct XVec : ExBase {
                                                     // (the per-member escape hatch for
                                                     // lazily-ill-formed bodies in
                                                     // unowned code; Eigen's sized ctors)
+    int named_out() const { return 2; }             // listed BY NAME (exclude_member_)
+                                                    // -> skipped: the GCC-safe escape
+                                                    // hatch (no member reflection formed),
+                                                    // Eigen's vector-only w()/operator[]
     int dot(const Expr<int>&) const { return 7; }   // excluded param       -> skipped
     Expr<int> expr() const { return {}; }           // excluded return      -> skipped
     detail::Helper helper() const { return {}; }    // excluded namespace   -> skipped

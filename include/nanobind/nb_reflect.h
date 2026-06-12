@@ -43,6 +43,27 @@ NAMESPACE_BEGIN(NB_NAMESPACE)
 ///                ^^nb::exclude_<^^Eigen::Transpose, ^^Eigen::Block>>(m);
 template <std::meta::info... Excluded> struct exclude_ {};
 
+/// Exclude an individual member BY NAME on a given (derived) class, without ever
+/// materializing the member's reflection. This is the GCC-safe counterpart of
+/// listing a member's exact reflection in exclude_<...>: GCC 16 instantiates a
+/// constexpr member's BODY when its reflection is materialized as an NTTP (the
+/// reflect_constant / define_static_array lift), so a member whose constexpr
+/// body is lazily ill-formed for the bound specialization (Eigen's vector-only
+/// accessors w()/x()/y()/z() on a 3x3 Matrix static_assert in their bodies)
+/// cannot be named by reflection at all -- forming the marker is itself the hard
+/// error. `Owner` is a CLASS reflection (safe to materialize; no body is
+/// instantiated) and `Name` is the member identifier. Any member named `Name`
+/// reachable while binding `Owner` (declared on it or any flattened base) is
+/// dropped BEFORE the lift, so its body is never instantiated. Pass the markers
+/// inside exclude_<...> exactly like entity reflections:
+///
+///   nb::exclude_<^^Eigen::Transpose,
+///                ^^nb::exclude_member_<^^Eigen::Matrix<double,3,3>, "w">>
+///
+/// Honored identically on both backends, so one marker set serves clang and GCC.
+template <std::meta::info Owner, reflect::fixed_string Name>
+struct exclude_member_ {};
+
 /// Emit-mode trampoline selection markers (consumed by nb_reflect_emit.h;
 /// inert configuration in the constexpr backend, where trampolines are
 /// registered via NB_REFLECT_TRAMPOLINE / the two-stage codegen instead):
@@ -1264,6 +1285,112 @@ consteval std::vector<std::meta::info> compute_excluded() {
 template <std::meta::info... Rs>
 inline constexpr auto excluded_v = std::define_static_array(compute_excluded<Rs...>());
 
+// --- Name-based member exclusions (nb::exclude_member_<Owner, "name">) ---
+//
+// A by-name rule drops any member named `name` reached while binding class
+// `owner` (declared on it or any flattened base), without ever materializing
+// the member's reflection. See exclude_member_ for why GCC needs this. The
+// rules are consulted in liftable_class_members (the single pre-lift drop
+// point), so a lazily-ill-formed constexpr member never reaches the
+// define_static_array lift that would instantiate its body. Each rule is
+// resolved (owner reflection + name as a define_static_string pointer) at
+// collection time, where the marker is a constant; the {info, const char*}
+// struct is structural, so define_static_array carries the rule table.
+struct member_excl_rule {
+    std::meta::info owner;        // the DERIVED class the rule applies to
+    const char* name;             // the member identifier/dunder to drop
+};
+
+consteval bool is_exclude_member_marker(std::meta::info r) {
+    if (!std::meta::is_type(r))
+        return false;
+    r = std::meta::dealias(r);
+    return std::meta::is_class_type(r)
+        && std::meta::has_template_arguments(r)
+        && std::meta::template_of(r) == ^^exclude_member_;
+}
+
+// Resolve one exclude_member_<Owner, "name"> marker into a rule. `Marker` is a
+// constant here, so its fixed_string NTTP can be spliced; the name characters
+// are copied into a define_static_string so the rule is storable. Reads only the
+// marker's template arguments -- never the named member -- so nothing is
+// instantiated.
+template <std::meta::info Marker>
+consteval member_excl_rule resolve_exclude_member() {
+    constexpr auto owner = std::meta::extract<std::meta::info>(
+        std::meta::template_arguments_of(std::meta::dealias(Marker))[0]);
+    std::string_view name(
+        [:std::meta::template_arguments_of(std::meta::dealias(Marker))[1]:].data);
+    return {owner, std::define_static_string(name)};
+}
+
+// Collect every exclude_member_<Owner, "name"> rule appearing inside one
+// exclude_ marker.
+template <std::meta::info R>
+consteval void collect_excluded_members(std::vector<member_excl_rule>& out) {
+    if constexpr (is_exclude_marker(R))
+        template for (constexpr auto a :
+                      std::define_static_array(
+                          std::meta::template_arguments_of(R))) {
+            constexpr auto e = std::meta::extract<std::meta::info>(a);
+            if constexpr (is_exclude_member_marker(e))
+                out.push_back(resolve_exclude_member<e>());
+        };
+}
+
+template <std::meta::info... Rs>
+consteval std::vector<member_excl_rule> compute_excluded_members() {
+    std::vector<member_excl_rule> out;
+    (collect_excluded_members<Rs>(out), ...);
+    return out;
+}
+
+// Memoized once per reflect_ pack: the by-name member-exclusion rule table
+// ({info, const char*} is structural, so define_static_array carries it).
+template <std::meta::info... Rs>
+inline constexpr auto excluded_members_v =
+    std::define_static_array(compute_excluded_members<Rs...>());
+
+// True if member `m` is dropped by an exclude_member_ rule applying to derived
+// class `derived`. The rule name matches either the member's plain identifier
+// (w/x/y/z/resize/...) or -- for operator members, which have no identifier --
+// its Python dunder (operator[] is named "__getitem__"). The dunder route lets
+// an operator whose constexpr body is lazily ill-formed (Eigen's vector-only
+// operator[] on a 3x3) be dropped by name without forming its reflection.
+consteval bool member_excluded_by_name(
+        std::meta::info m, std::meta::info derived,
+        std::span<const member_excl_rule> rules) {
+    if (rules.empty())
+        return false;
+    std::string_view id;
+    if (std::meta::has_identifier(m))
+        id = std::meta::identifier_of(m);
+    else if (std::meta::is_function(m) && std::meta::is_operator_function(m)) {
+        const char* d = operator_dunder(std::meta::operator_of(m),
+                                        std::meta::parameters_of(m).size());
+        if (!d)
+            return false;
+        id = d;
+    } else
+        return false;
+    for (auto& r : rules) {
+        if (id != r.name)
+            continue;
+        // The rule fires when binding the owner spec itself, OR when binding any
+        // class in the owner's public-base subtree directly (Eigen's facade
+        // bases -- DenseCoeffsBase<Vec3,1> etc. -- are bound as REAL Python
+        // bases, and the rule must reach the member there too, not only on the
+        // flattened path where derived == owner).
+        if (r.owner == derived)
+            return true;
+        std::vector<std::meta::info> owners{r.owner};
+        collect_public_base_subtree(r.owner, owners);
+        if (info_vec_contains(owners, derived))
+            return true;
+    }
+    return false;
+}
+
 consteval bool info_span_contains(std::span<const std::meta::info> v,
                                   std::meta::info x) {
     for (auto e : v)
@@ -1849,10 +1976,20 @@ consteval bool never_bound_plain_member_fn(std::meta::info m) {
     return false;                           // ordinary public method: the method pass binds it
 }
 
-consteval std::vector<std::meta::info> liftable_class_members(std::meta::info cls) {
+// `cls` is the class whose members are enumerated for the lift; `derived` is
+// the class currently being bound (== cls for own members, the derived type
+// when flattening a base) -- the key a by-name rule applies to. `rules` carries
+// the nb::exclude_member_<...> by-name drops. Dropping a by-name-excluded member
+// here, on BOTH backends, keeps surfaces identical and (the GCC point) keeps a
+// lazily-ill-formed constexpr body out of the define_static_array lift.
+consteval std::vector<std::meta::info> liftable_class_members(
+        std::meta::info cls, std::meta::info derived,
+        std::span<const member_excl_rule> rules) {
     std::vector<std::meta::info> out;
     for (auto m : std::meta::members_of(
              cls, std::meta::access_context::unchecked())) {
+        if (member_excluded_by_name(m, derived, rules))
+            continue;
 #if !defined(__clang__)
         if (std::meta::is_function(m)
             && std::meta::is_special_member_function(m)
@@ -1865,6 +2002,10 @@ consteval std::vector<std::meta::info> liftable_class_members(std::meta::info cl
         out.push_back(m);
     }
     return out;
+}
+
+consteval std::vector<std::meta::info> liftable_class_members(std::meta::info cls) {
+    return liftable_class_members(cls, cls, {});
 }
 
 consteval class_member_kind classify_class_member(
@@ -1898,7 +2039,7 @@ void bind_class_contents(auto& cls) {
     // hold the BINDER-0011/0012 rationale.
     if constexpr (class_constructs(^^T, has_reflect_trampoline<T>)) {
         template for (constexpr auto fn :
-            std::define_static_array(liftable_class_members(^^T))) {
+            std::define_static_array(liftable_class_members(^^T, ^^T, excluded_members_v<Rs...>))) {
             if constexpr (ctor_binds(fn, excluded_v<Rs...>)) {
                 reflect_bind_ctor<fn>(cls);
             }
@@ -1937,7 +2078,7 @@ void bind_class_contents(auto& cls) {
     // parameter is defaulted; others skip. Deleted functions are filtered on every
     // path: public + enumerable, but calling one is a hard error (BINDER-0012).
     template for (constexpr auto fn :
-        std::define_static_array(liftable_class_members(^^T))) {
+        std::define_static_array(liftable_class_members(^^T, ^^T, excluded_members_v<Rs...>))) {
         constexpr class_member_kind kind =
             classify_class_member(fn, excluded_v<Rs...>);
         if constexpr (kind == class_member_kind::fn)
@@ -1952,7 +2093,7 @@ void bind_class_contents(auto& cls) {
     // be excluded *before* it is instantiated (a nested if constexpr, not an &&
     // short-circuit).
     template for (constexpr auto fn :
-        std::define_static_array(liftable_class_members(^^T))) {
+        std::define_static_array(liftable_class_members(^^T, ^^T, excluded_members_v<Rs...>))) {
         if constexpr (classify_class_member(fn, excluded_v<Rs...>)
                       == class_member_kind::fn) {
             if constexpr (is_property_getter<fn>()) {
@@ -1991,7 +2132,7 @@ void flatten_base_members(auto& cls) {
     // where flat_hash_map's heterogeneous contains/find/erase/operator[] live
     // (declared on the flattened raw_hash_map/raw_hash_set ancestry).
     template for (constexpr auto fn :
-        std::define_static_array(liftable_class_members(Base))) {
+        std::define_static_array(liftable_class_members(Base, ^^T, excluded_members_v<Rs...>))) {
         constexpr class_member_kind kind =
             classify_class_member(fn, excluded_v<Rs...>);
         if constexpr (kind == class_member_kind::fn)

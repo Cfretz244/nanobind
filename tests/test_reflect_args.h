@@ -27,7 +27,9 @@ consteval std::meta::info xvec_member(std::string_view name) {
 #define EX_MARKER                                                              \
     nanobind::exclude_<^^exclude_test::Expr, ^^exclude_test::detail,           \
                        ^^exclude_test::Opaque, ^^exclude_test::ExBase,         \
-                       xvec_member("doomed")>
+                       xvec_member("doomed"),                                  \
+                       ^^nanobind::exclude_member_<^^exclude_test::XVec,       \
+                                                   "named_out">>
 
 // The full pack bound by the suite. Box<float> is referenced by no signature;
 // it is bound only because it is listed explicitly here (the explicit opt-in

@@ -766,7 +766,7 @@ consteval void append_class_contents(std::string& out,
     // rationale).
     if constexpr (class_constructs(Cls, HasTramp)) {
         template for (constexpr auto fn : std::define_static_array(
-                          liftable_class_members(Cls))) {
+                          liftable_class_members(Cls, Cls, excluded_members_v<Rs...>))) {
             if constexpr (ctor_binds(fn, excluded_v<Rs...>))
                 append_ctor<fn>(out);
         };
@@ -801,7 +801,7 @@ consteval void append_class_contents(std::string& out,
 
     // Methods / member templates (one shared kind-router).
     template for (constexpr auto fn : std::define_static_array(
-                      liftable_class_members(Cls))) {
+                      liftable_class_members(Cls, Cls, excluded_members_v<Rs...>))) {
         constexpr class_member_kind kind =
             classify_class_member(fn, excluded_v<Rs...>);
         if constexpr (kind == class_member_kind::fn)
@@ -812,7 +812,7 @@ consteval void append_class_contents(std::string& out,
 
     // Properties.
     template for (constexpr auto fn : std::define_static_array(
-                      liftable_class_members(Cls))) {
+                      liftable_class_members(Cls, Cls, excluded_members_v<Rs...>))) {
         if constexpr (classify_class_member(fn, excluded_v<Rs...>)
                       == class_member_kind::fn) {
             if constexpr (is_property_getter<fn>())
@@ -857,7 +857,7 @@ consteval void append_flatten_base(std::string& out,
     // `template` disambiguator for member templates is part of their callee.
     std::string call_prefix = base_spell + "::";
     template for (constexpr auto fn : std::define_static_array(
-                      liftable_class_members(Base))) {
+                      liftable_class_members(Base, Cls, excluded_members_v<Rs...>))) {
         constexpr class_member_kind kind =
             classify_class_member(fn, excluded_v<Rs...>);
         if constexpr (kind == class_member_kind::fn)
@@ -1406,7 +1406,7 @@ template <std::meta::info Cls, std::meta::info Owner, std::meta::info... Rs>
 consteval void probe_member_fns(std::string& out, std::string_view tag,
                                 std::size_t& n) {
     template for (constexpr auto fn : std::define_static_array(
-                      liftable_class_members(Owner))) {
+                      liftable_class_members(Owner, Cls, excluded_members_v<Rs...>))) {
         if constexpr (classify_class_member(fn, excluded_v<Rs...>)
                       == class_member_kind::fn) {
             constexpr member_fn_route route = classify_member_fn(Cls, fn);
