@@ -137,14 +137,11 @@ if (TARGET Eigen3::Eigen)
 endif()
 
 # C++26 static reflection (P2996) test — only built if the compiler supports it.
-# GCC trunk uses -freflection and has template-for built in.
-# Bloomberg clang-p2996 uses -freflection-latest (includes -fexpansion-statements
-# and -fparameter-reflection) and requires -stdlib=libc++ for <meta>.
+# GCC 16+ enables the whole adopted reflection set (including template-for and
+# define_static_array) under -std=c++26 -freflection.
 include(CheckCXXSourceCompiles)
 set(CMAKE_REQUIRED_FLAGS_OLD "${CMAKE_REQUIRED_FLAGS}")
 
-# Test source that exercises template-for and define_static_array — these
-# require different flags on GCC vs Bloomberg, so this distinguishes them.
 set(NB_REFLECT_CHECK_SRC "
 #include <meta>
 struct S { int x; double y; };
@@ -159,30 +156,16 @@ consteval int count() {
 int main() { static_assert(count() == 2); }
 ")
 
-# GCC: -freflection enables everything including template-for
 set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS_OLD} -std=c++26 -freflection")
 check_cxx_source_compiles("${NB_REFLECT_CHECK_SRC}" NB_HAS_REFLECTION_GCC)
-
-if (NOT NB_HAS_REFLECTION_GCC)
-  # Bloomberg: needs -freflection-latest and -stdlib=libc++
-  set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS_OLD} -std=c++26 -freflection-latest -stdlib=libc++")
-  check_cxx_source_compiles("${NB_REFLECT_CHECK_SRC}" NB_HAS_REFLECTION_BLOOMBERG)
-endif()
 
 set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS_OLD}")
 
 if (NB_HAS_REFLECTION_GCC)
   set(NB_REFLECT_FLAGS -std=c++26 -freflection)
-  # GCC spells the constant-evaluation budget differently from clang.
+  # The raised constant-evaluation budget covers the heavy consteval walks
+  # (the emit generator renders the whole module as consteval strings).
   set(NB_REFLECT_BIG_STEPS -fconstexpr-ops-limit=2000000000)
-elseif(NB_HAS_REFLECTION_BLOOMBERG)
-  # The raised -fconstexpr-steps covers the whole-namespace consteval walks
-  # (required_stl_types / required_user_specs) over the growing test fixture
-  # namespace; the default budget is no longer enough. Safe since the TC-0002
-  # Sema use-after-free fix (the budget itself was never the bug).
-  set(NB_REFLECT_FLAGS -std=c++26 -freflection-latest
-      -stdlib=libc++ -fconstexpr-steps=100000000)
-  set(NB_REFLECT_BIG_STEPS -fconstexpr-steps=2000000000)
 endif()
 
 if (NB_REFLECT_FLAGS)
