@@ -19,17 +19,12 @@
 #include <string>
 #include <vector>
 
-#if defined(__has_feature)
-#  if __has_feature(annotation_attributes)
-#    define NB_FIXTURE_ANN(...) [[=__VA_ARGS__]]
-#  endif
-#endif
-// GCC 16 (P3394 annotations under -freflection): no __has_feature name for
-// it; key off the reflection feature-test macro instead.
-#if !defined(NB_FIXTURE_ANN) && defined(__cpp_impl_reflection)
+// GCC 16 (P3394 annotations under -freflection): key off the reflection
+// feature-test macro. Expands to nothing on a non-reflection compiler (the
+// emit backend's generated TU is built without reflection flags).
+#if defined(__cpp_impl_reflection)
 #  define NB_FIXTURE_ANN(...) [[=__VA_ARGS__]]
-#endif
-#ifndef NB_FIXTURE_ANN
+#else
 #  define NB_FIXTURE_ANN(...)
 #endif
 

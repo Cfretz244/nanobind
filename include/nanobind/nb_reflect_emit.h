@@ -476,7 +476,7 @@ consteval void append_free_function(std::string& out) {
     // Mirrors reflect_free_function's gate (deleted / variadic / move-only /
     // unbindable / nameless-non-spec), plus the emit-only spellability gate.
     if constexpr (std::meta::is_deleted(Fn)
-                  || nb_has_ellipsis_parameter(Fn)
+                  || std::meta::is_vararg_function(Fn)
                   || has_move_only_by_value_param(Fn)
                   || has_unbindable_signature(Fn)
                   || (!std::meta::has_identifier(Fn)
