@@ -1174,8 +1174,7 @@ struct emit_item {
 consteval void worklist_dispatch(std::meta::info R,
                                  std::span<const std::meta::info> ex,
                                  std::vector<emit_item>& out) {
-    if (is_exclude_marker(R) || is_trampoline_marker(R)
-        || is_excluded_entity(R, ex))
+    if (is_config_marker(R) || is_excluded_entity(R, ex))
         return;
     if (std::meta::is_namespace(R)) {
         for (auto mem : std::meta::members_of(R, std::meta::access_context::unchecked())) {
@@ -1213,7 +1212,7 @@ consteval std::vector<emit_item> compute_emit_worklist() {
     // Mirror reflect_'s order: discovered template specializations first,
     // then the dispatch walks.
     auto specs = [&](std::meta::info R) {
-        if (is_exclude_marker(R) || is_trampoline_marker(R))
+        if (is_config_marker(R))
             return;
         for (auto ty : required_user_specs(R, ex))
             out.push_back({ty, ^^void, emit_kind::cls});

@@ -17,6 +17,7 @@
 #include "nanobind.h"
 #include "nb_paren_init.h"
 #include "nb_reflect_annotations.h"
+#include "nb_reflect_match.h"
 #include "stl/string.h"
 #include <span>
 #include <sstream>          // std::ostringstream for streamable -> __str__ (bind_stream_str)
@@ -73,6 +74,70 @@ struct exclude_member_ {};
 /// two-stage codegen tier's rule -- what a json-style run uses).
 template <std::meta::info... Classes> struct trampoline_ {};
 struct trampoline_all_ {};
+
+/// Predicate-driven inclusion: pass ^^match_<^^scope, Matcher> in the
+/// reflect_ pack to bind every member of `scope` (a namespace, walked
+/// recursively) the matcher accepts, exactly as if each had been listed in
+/// the pack explicitly. The matcher (see nb_reflect_match.h: the combinator
+/// DSL, or any type satisfying nb::matcher) is consulted only for members the
+/// binder could bind anyway -- classes, enums, free functions that survive
+/// the usual skip/exclusion/completeness gates -- so accepting something
+/// unbindable is harmless.
+///
+///   nb::reflect_<^^nb::match_<^^glm,
+///                    nb::any_of_<nb::named_<"vec*">, nb::named_<"mat*">>>>(m);
+template <std::meta::info Scope, matcher M> struct match_ {};
+
+/// Predicate-driven exclusion: the predicate counterpart of listing entities
+/// in exclude_. Every exclusion gate that consults the exclude_ list also
+/// runs these matchers, so anything the matcher accepts -- entities, and
+/// members via the signature/member gates -- becomes opaque:
+///
+///   nb::reflect_<^^Eigen::Matrix<double, 3, 1>,
+///                ^^nb::exclude_if_<nb::in_namespace_<^^Eigen::internal>>,
+///                ^^nb::exclude_if_<nb::named_<"*Solver*">>>(m);
+///
+/// Accepted at the top level of the pack or nested inside exclude_<...>.
+/// NOT a replacement for exclude_member_: a member whose constexpr body is
+/// lazily ill-formed must be dropped by name BEFORE its reflection is
+/// lifted, and running any predicate that late is already too late.
+template <matcher M> struct exclude_if_ {};
+
+/// One explicit template-argument tuple for instantiate_ (below). Arguments
+/// are reflections: types (^^int), constant values via nb::val_<3> /
+/// std::meta::reflect_constant(...).
+template <std::meta::info... Args> struct with_ {};
+
+/// One axis of a product_: the candidate arguments for one template
+/// parameter position.
+template <std::meta::info... Es> struct set_ {};
+
+/// Cross product of axes: product_<set_<^^int, ^^double>, set_<val_<2>,
+/// val_<3>>> expands to every combination (int,2), (int,3), (double,2),
+/// (double,3). Combinations that fail to substitute or complete are silently
+/// skipped -- a grid legitimately has invalid corners.
+template <typename... Sets> struct product_ {};
+
+/// A constant value as a reflection, for NTTP arguments in with_/set_:
+/// nb::val_<3>, nb::val_<glm::length_t(4)>.
+template <auto V> inline constexpr std::meta::info val_ = std::meta::reflect_constant(V);
+
+/// Default instantiations: pass ^^instantiate_<Target, ArgSets...> in the
+/// reflect_ pack to mint class-template specializations in bulk and bind
+/// them exactly as if each were listed explicitly (same discovery, naming,
+/// and emit-lane treatment as writing ^^Box<int> in the pack). `Target` is a
+/// class-template reflection, or a matcher TYPE reflection (e.g.
+/// ^^nb::named_<"vec*">) applying the rule to every class template in the
+/// pack's namespace seeds the matcher accepts. ArgSets are with_<...> tuples
+/// and/or product_<set_<...>...> grids. An explicit with_ that fails to
+/// substitute is a compile error (you named it; silence would lose it); a
+/// product_ combination that fails is skipped.
+///
+///   nb::reflect_<^^nb::instantiate_<^^absl::btree_map,
+///                    nb::with_<^^int, ^^std::string>,
+///                    nb::product_<nb::set_<^^int, ^^std::string>,
+///                                 nb::set_<^^int, ^^double>>>>(m);
+template <std::meta::info Target, typename... ArgSets> struct instantiate_ {};
 
 NAMESPACE_BEGIN(detail)
 
@@ -1214,6 +1279,37 @@ consteval bool is_trampoline_marker(std::meta::info r) {
     return std::meta::is_class_type(r)
         && std::meta::has_template_arguments(r)
         && std::meta::template_of(r) == ^^trampoline_;
+}
+
+// Recognizers for the matcher/instantiation markers (same dealias discipline
+// as is_exclude_marker: a marker reached through an alias must still be
+// recognized).
+consteval bool is_marker_of(std::meta::info r, std::meta::info tmpl) {
+    if (!std::meta::is_type(r))
+        return false;
+    r = std::meta::dealias(r);
+    return std::meta::is_class_type(r)
+        && std::meta::has_template_arguments(r)
+        && std::meta::template_of(r) == tmpl;
+}
+consteval bool is_match_marker(std::meta::info r) {
+    return is_marker_of(r, ^^match_);
+}
+consteval bool is_exclude_if_marker(std::meta::info r) {
+    return is_marker_of(r, ^^exclude_if_);
+}
+consteval bool is_instantiate_marker(std::meta::info r) {
+    return is_marker_of(r, ^^instantiate_);
+}
+
+/// True for every CONFIGURATION marker in a reflect_ pack -- anything the raw
+/// entity walks must skip rather than treat as a binding seed. (match_ and
+/// instantiate_ DO produce seeds, but only through the seeds_of expansion;
+/// at the raw-walk level they are configuration like the rest.)
+consteval bool is_config_marker(std::meta::info r) {
+    return is_exclude_marker(r) || is_trampoline_marker(r)
+        || is_match_marker(r) || is_exclude_if_marker(r)
+        || is_instantiate_marker(r);
 }
 
 template <std::meta::info... Rs>
@@ -2540,8 +2636,7 @@ consteval void collect_scope_user_specs(std::meta::info r,
                                         std::vector<std::meta::info>& visited,
                                         std::vector<std::meta::info>& walked,
                                         std::span<const std::meta::info> ex = {}) {
-    if (is_exclude_marker(r) || is_trampoline_marker(r)
-        || is_excluded_entity(r, ex))
+    if (is_config_marker(r) || is_excluded_entity(r, ex))
         return;  // a marker is not a seed; an excluded seed is opaque
     if (std::meta::is_namespace(r)) {
         for (auto mem : std::meta::members_of(r, std::meta::access_context::unchecked())) {
@@ -2623,8 +2718,7 @@ consteval std::vector<std::meta::info> required_user_specs(
 consteval void collect_seed_classes(std::meta::info r,
                                     std::vector<std::meta::info>& out,
                                     std::span<const std::meta::info> ex = {}) {
-    if (is_exclude_marker(r) || is_trampoline_marker(r)
-        || is_excluded_entity(r, ex))
+    if (is_config_marker(r) || is_excluded_entity(r, ex))
         return;
     if (std::meta::is_namespace(r)) {
         for (auto mem : std::meta::members_of(r, std::meta::access_context::unchecked())) {
@@ -2972,10 +3066,11 @@ void reflect_enum_of(module_& m) {
 
 template <std::meta::info r, std::meta::info... Rs>
 void reflect_dispatch(module_& m) {
-    if constexpr (is_exclude_marker(r) || is_trampoline_marker(r)
+    if constexpr (is_config_marker(r)
                   || is_excluded_entity(r, excluded_v<Rs...>)) {
-        // An ^^nb::exclude_<...> / ^^nb::trampoline_<...> marker
-        // (configuration, not a binding seed), or a seed that is itself
+        // A configuration marker (exclude_ / trampoline_ / match_ /
+        // exclude_if_ / instantiate_ -- the latter two seed through the
+        // seeds_of expansion, not this walk), or a seed that is itself
         // excluded -- bind nothing.
     } else if constexpr (std::meta::is_namespace(r)) {
         template for (constexpr auto mem :
