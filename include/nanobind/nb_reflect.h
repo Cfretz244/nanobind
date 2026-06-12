@@ -823,36 +823,11 @@ consteval bool fn_skip_annotated(std::meta::info fn) {
 // extension. Public-base re-exports remain covered by inheritance/flattening;
 // private-base re-exports no longer bind.)
 
-// True if `m` reflects a DEDUCTION GUIDE. There is no is_deduction_guide
-// metafunction; a guide is the only namespace-scope function template with no
-// identifier that is not an operator/conversion/literal-operator/constructor
-// template (has_identifier is safe on a guide reflection -- it answers false).
-consteval bool is_deduction_guide_refl(std::meta::info m) {
-    return std::meta::is_function_template(m)
-        && !std::meta::has_identifier(m)
-        && !std::meta::is_operator_function_template(m)
-        && !std::meta::is_conversion_function_template(m)
-        && !std::meta::is_literal_operator_template(m)
-        && !std::meta::is_constructor_template(m);
-}
-
-// A namespace's members with deduction guides stripped. A guide is never
-// bindable (reflect_dispatch's is_template arm already skips it), and on
-// pre-TC-0008 toolchains its reflection cannot even be MANGLED as a template
-// argument -- the lift into define_static_array itself ICEs ("Can't mangle a
-// deduction guide name!", the backing array specialization's linkage name
-// embeds every element reflection). Strip guides BEFORE the lift so the
-// namespace walks stay clear of mangled-name position entirely
-// (TartanLlama/expected's `unexpected(E) -> unexpected<E>` is the field shape).
-consteval std::vector<std::meta::info> namespace_members_for_binding(
-        std::meta::info ns) {
-    std::vector<std::meta::info> out;
-    for (auto m : std::meta::members_of(
-             ns, std::meta::access_context::unchecked()))
-        if (!is_deduction_guide_refl(m))
-            out.push_back(m);
-    return out;
-}
+// (Deduction guides need no special handling on GCC 16: a namespace walk
+// enumerates them, but they classify as templates and are skipped by every
+// routing classifier, and lifting a guide reflection into define_static_array
+// works. The clang-p2996 fork needed a pre-lift stripping pass here -- its
+// mangler ICE'd on guide reflections as template arguments, TC-0008.)
 
 // True if a function template instantiates with ZERO explicit template
 // arguments (every parameter defaulted / SFINAE-satisfied) and has no trailing
@@ -1680,7 +1655,8 @@ void bind_free_operators(auto& cls) {
     constexpr auto scope = std::meta::parent_of(^^T);
     if constexpr (std::meta::is_namespace(scope)) {
         template for (constexpr auto fn :
-            std::define_static_array(namespace_members_for_binding(scope))) {
+            std::define_static_array(std::meta::members_of(
+                scope, std::meta::access_context::unchecked()))) {
             if constexpr (is_bindable_free_operator<fn>()
                 && !has_ann<fn, reflect::skip>()
                 && !fn_mentions_excluded(fn, excluded_v<Rs...>)) {
@@ -3013,7 +2989,8 @@ void reflect_dispatch(module_& m) {
         // excluded -- bind nothing.
     } else if constexpr (std::meta::is_namespace(r)) {
         template for (constexpr auto mem :
-            std::define_static_array(namespace_members_for_binding(r))) {
+            std::define_static_array(std::meta::members_of(
+                r, std::meta::access_context::unchecked()))) {
             constexpr ns_member_kind kind =
                 classify_namespace_member(mem, excluded_v<Rs...>);
             if constexpr (kind == ns_member_kind::cls)

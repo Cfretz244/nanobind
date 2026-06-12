@@ -597,7 +597,8 @@ consteval void append_class_free_operators(std::string& out) {
     constexpr auto scope = std::meta::parent_of(Cls);
     if constexpr (std::meta::is_namespace(scope)) {
         template for (constexpr auto fn : std::define_static_array(
-                          namespace_members_for_binding(scope))) {
+                          std::meta::members_of(
+                scope, std::meta::access_context::unchecked()))) {
             if constexpr (is_bindable_free_operator<fn>()
                           && !has_ann<fn, reflect::skip>()
                           && !fn_mentions_excluded(fn, excluded_v<Rs...>)) {
@@ -1179,7 +1180,7 @@ consteval void worklist_dispatch(std::meta::info R,
         || is_excluded_entity(R, ex))
         return;
     if (std::meta::is_namespace(R)) {
-        for (auto mem : namespace_members_for_binding(R)) {
+        for (auto mem : std::meta::members_of(R, std::meta::access_context::unchecked())) {
             switch (classify_namespace_member(mem, ex)) {
             case ns_member_kind::cls:
                 out.push_back({mem, mem, emit_kind::cls});
