@@ -1211,15 +1211,21 @@ consteval std::vector<emit_item> compute_emit_worklist() {
     std::vector<std::meta::info> exl = compute_excluded<Rs...>();
     exclusion_set ex{exl, excluded_matchers<Rs...>()};
     // Mirror reflect_'s order: discovered template specializations first,
-    // then the dispatch walks.
-    auto specs = [&](std::meta::info R) {
-        if (is_config_marker(R))
-            return;
-        for (auto ty : required_user_specs(R, ex))
-            out.push_back({ty, ^^void, emit_kind::cls});
+    // then the dispatch walks -- each phase over every pack element's
+    // effective seeds (the match_/instantiate_ expansion), so an expanded
+    // seed renders exactly like an explicitly listed one. (Duplicates are
+    // deduplicated by bind-function name at render time.)
+    auto specs = [&](const std::vector<std::meta::info>& seeds) {
+        for (auto s : seeds)
+            for (auto ty : required_user_specs(s, ex))
+                out.push_back({ty, ^^void, emit_kind::cls});
     };
-    (specs(Rs), ...);
-    (worklist_dispatch(Rs, ex, out), ...);
+    (specs(seeds_of<Rs, Rs...>()), ...);
+    auto disp = [&](const std::vector<std::meta::info>& seeds) {
+        for (auto s : seeds)
+            worklist_dispatch(s, ex, out);
+    };
+    (disp(seeds_of<Rs, Rs...>()), ...);
     return out;
 }
 
@@ -1284,10 +1290,17 @@ inline constexpr const char* emit_item_decl_v = [] {
 }();
 
 // The pack-dependent prologue piece (the auto-detected STL caster includes;
-// small, one static string per seed).
+// small, one static string per pack element). Iterates the element's
+// effective seeds so an instantiate_-minted spec's member types (a
+// btree_map<int, std::string>'s std::string) pull their casters too; a
+// repeated #include across seeds is harmless.
 template <std::meta::info R, std::meta::info... Rs>
-inline constexpr const char* emit_stl_includes_v = std::define_static_string(
-    codegen::emit_stl_includes(R, excluded_q<Rs...>()));
+inline constexpr const char* emit_stl_includes_v = [] {
+    std::string s;
+    for (auto seed : seeds_of<R, Rs...>())
+        s += codegen::emit_stl_includes(seed, excluded_q<Rs...>());
+    return std::define_static_string(s);
+}();
 
 consteval std::vector<std::size_t> iota_vec(std::size_t n) {
     std::vector<std::size_t> v;

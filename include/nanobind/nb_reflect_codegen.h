@@ -258,15 +258,30 @@ consteval const char* emit_trampolines() {
         "#pragma once\n"
         "#include <nanobind/nb_reflect.h>\n"
         "#include <nanobind/trampoline.h>\n";
-    ((out += detail::codegen::emit_stl_includes(Rs)), ...);
+    // Each pass iterates every pack element's effective seeds (its
+    // match_/instantiate_ expansion; a non-marker element is its own sole
+    // seed), so the walks below never see configuration markers.
+    auto stl = [&](const std::vector<std::meta::info>& seeds) {
+        for (auto s : seeds)
+            out += detail::codegen::emit_stl_includes(s);
+    };
+    (stl(detail::seeds_of<Rs, Rs...>()), ...);
     out += "\n";
     // One `seen` set across every reflected arg and both emission passes, so each
     // trampoline struct is emitted exactly once (no redefinition in the header).
     std::vector<std::string> seen;
-    ((out += detail::codegen::emit_subtree(Rs, seen)), ...);
+    auto subtree = [&](const std::vector<std::meta::info>& seeds) {
+        for (auto s : seeds)
+            out += detail::codegen::emit_subtree(s, seen);
+    };
+    (subtree(detail::seeds_of<Rs, Rs...>()), ...);
     // Trampolines for discovered template specializations (not namespace members,
     // so emit_subtree misses them).
-    ((out += detail::codegen::emit_spec_classes(Rs, seen)), ...);
+    auto specs = [&](const std::vector<std::meta::info>& seeds) {
+        for (auto s : seeds)
+            out += detail::codegen::emit_spec_classes(s, seen);
+    };
+    (specs(detail::seeds_of<Rs, Rs...>()), ...);
     return std::define_static_string(out);
 }
 

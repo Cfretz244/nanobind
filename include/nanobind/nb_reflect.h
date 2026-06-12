@@ -114,8 +114,12 @@ template <std::meta::info... Es> struct set_ {};
 
 /// Cross product of axes: product_<set_<^^int, ^^double>, set_<val_<2>,
 /// val_<3>>> expands to every combination (int,2), (int,3), (double,2),
-/// (double,3). Combinations that fail to substitute or complete are silently
-/// skipped -- a grid legitimately has invalid corners.
+/// (double,3). A combination that fails SUBSTITUTION (an unsatisfied
+/// constraint, a wrong argument kind) is silently skipped -- a grid
+/// legitimately has invalid corners, and constraints are how a template
+/// declares its valid ones. A combination that substitutes but whose class
+/// body cannot COMPLETE is a hard error, exactly as if the specialization
+/// had been listed in the pack explicitly.
 template <typename... Sets> struct product_ {};
 
 /// A constant value as a reflection, for NTTP arguments in with_/set_:
@@ -1561,6 +1565,231 @@ consteval exclusion_set excluded_q() {
     return {excluded_v<Rs...>, excluded_matchers<Rs...>()};
 }
 
+// --- Effective seeds: match_ / instantiate_ expansion ---
+//
+// Each reflect_ pack element expands to a vector of ordinary binding seeds:
+// a non-marker element is its own (sole) seed, configuration markers expand
+// to none, and match_ / instantiate_ expand to the entities they select or
+// mint. Downstream -- the bind set, the spec/caster discovery fixpoints, the
+// dispatch walks, the emit worklist -- iterates seeds and never sees those
+// two markers, so an expanded seed is bit-for-bit equivalent to listing it
+// in the pack explicitly (same discovery, naming, base wiring, emit text).
+
+// Defined with the dispatch machinery below; the match_ walk classifies
+// members through it so the matcher only ever sees what the binder could
+// bind. (The enum lives here so the early walk can switch on it.)
+enum class ns_member_kind { skip, cls, enum_, free_fn, ns };
+consteval ns_member_kind classify_namespace_member(std::meta::info mem,
+                                                   const exclusion_set& ex);
+
+// The match_ walk: classify FIRST, so the matcher is consulted only for
+// members the binder could bind anyway (classes, enums, free functions that
+// survive the skip/exclusion/completeness gates) -- accepting something
+// unbindable is inert, and the matcher never sees entities whose mere
+// querying is hazardous. A nested namespace the matcher accepts is seeded
+// WHOLE (everything inside binds); one it rejects is recursed into, looking
+// for individual matches.
+consteval void collect_match_seeds(matcher_fn m, std::meta::info ns,
+                                   const exclusion_set& ex,
+                                   std::vector<std::meta::info>& out) {
+    for (auto mem : std::meta::members_of(ns, std::meta::access_context::unchecked())) {
+        switch (classify_namespace_member(mem, ex)) {
+        case ns_member_kind::cls:
+        case ns_member_kind::enum_:
+        case ns_member_kind::free_fn:
+            if (m(mem) && !info_vec_contains(out, mem))
+                out.push_back(mem);
+            break;
+        case ns_member_kind::ns:
+            if (m(mem)) {
+                if (!info_vec_contains(out, mem))
+                    out.push_back(mem);
+            } else {
+                collect_match_seeds(m, mem, ex, out);
+            }
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+// Class-template sweep for matcher-targeted instantiate_ rules -- the one
+// member kind classify_namespace_member deliberately skips.
+consteval void collect_matching_class_templates(matcher_fn m, std::meta::info ns,
+                                                const exclusion_set& ex,
+                                                std::vector<std::meta::info>& out) {
+    for (auto mem : std::meta::members_of(ns, std::meta::access_context::unchecked())) {
+        if (is_excluded_entity(mem, ex))
+            continue;
+        if (std::meta::is_class_template(mem)) {
+            if (m(mem) && !info_vec_contains(out, mem))
+                out.push_back(mem);
+        } else if (std::meta::is_namespace(mem)
+                   && !std::meta::is_namespace_alias(mem)) {
+            collect_matching_class_templates(m, mem, ex, out);
+        }
+    }
+}
+
+// The namespaces a matcher-targeted instantiate_ rule sweeps: every
+// namespace appearing directly in the pack, plus every match_ marker's
+// scope.
+template <std::meta::info... Rs>
+consteval std::vector<std::meta::info> pack_namespace_roots() {
+    std::vector<std::meta::info> out;
+    auto add = [&](std::meta::info r) {
+        if (std::meta::is_namespace(r)) {
+            if (!info_vec_contains(out, r))
+                out.push_back(r);
+        } else if (is_match_marker(r)) {
+            auto scope = std::meta::extract<std::meta::info>(
+                std::meta::template_arguments_of(std::meta::dealias(r))[0]);
+            if (std::meta::is_namespace(scope) && !info_vec_contains(out, scope))
+                out.push_back(scope);
+        }
+    };
+    (add(Rs), ...);
+    return out;
+}
+
+// Deliberately undefined (the reflect_discovery_diverged idiom): evaluating
+// a call fails with "called before its definition", pointing here. An
+// EXPLICIT nb::with_<...> tuple that cannot substitute, or whose
+// specialization cannot complete, is a hard error -- the user named that
+// combination, and losing it silently is the silent-no-op trap. product_
+// combinations skip silently instead (a grid legitimately has invalid
+// corners).
+consteval void instantiate_with_rule_failed(std::meta::info tmpl);
+
+// And the malformed-marker counterpart: every instantiate_ ArgSet must be a
+// with_<...> or product_<set_<...>...> specialization.
+consteval void instantiate_arg_set_must_be_with_or_product(std::meta::info argset);
+
+// Mint one specialization: target template x one argument tuple, gated by
+// can_substitute + is_complete_type (the BINDER-0014 pair -- the same gates
+// an explicitly listed spec passes through in discovery).
+consteval void expand_instantiation(std::meta::info tmpl,
+                                    const std::vector<std::meta::info>& args,
+                                    bool explicit_rule,
+                                    std::vector<std::meta::info>& out) {
+    if (std::meta::can_substitute(tmpl, args)) {
+        auto spec = std::meta::substitute(tmpl, args);
+        if (std::meta::is_complete_type(spec)) {
+            if (!info_vec_contains(out, spec))
+                out.push_back(spec);
+            return;
+        }
+    }
+    if (explicit_rule)
+        instantiate_with_rule_failed(tmpl);
+}
+
+// Expand one ArgSet (a with_ tuple or a product_ grid) against one target
+// template. Entirely value-form: the tuples are infos (types via ^^T,
+// constants via nb::val_ / reflect_constant), consumed by substitute as-is.
+consteval void expand_arg_sets(std::meta::info tmpl, std::meta::info argset,
+                               std::vector<std::meta::info>& out) {
+    argset = std::meta::dealias(argset);
+    if (!std::meta::is_type(argset) || !std::meta::has_template_arguments(argset))
+        instantiate_arg_set_must_be_with_or_product(argset);
+    auto kind = std::meta::template_of(argset);
+    if (kind == ^^with_) {
+        std::vector<std::meta::info> tup;
+        for (auto a : std::meta::template_arguments_of(argset))
+            tup.push_back(std::meta::extract<std::meta::info>(a));
+        expand_instantiation(tmpl, tup, /*explicit_rule=*/true, out);
+    } else if (kind == ^^product_) {
+        std::vector<std::vector<std::meta::info>> axes;
+        for (auto s : std::meta::template_arguments_of(argset)) {
+            auto sd = std::meta::dealias(s);
+            if (!std::meta::is_type(sd) || !std::meta::has_template_arguments(sd)
+                || std::meta::template_of(sd) != ^^set_)
+                instantiate_arg_set_must_be_with_or_product(argset);
+            std::vector<std::meta::info> axis;
+            for (auto e : std::meta::template_arguments_of(sd))
+                axis.push_back(std::meta::extract<std::meta::info>(e));
+            axes.push_back(axis);
+        }
+        bool done = axes.empty();
+        for (auto& a : axes)
+            if (a.empty())
+                done = true;
+        std::vector<std::size_t> idx(axes.size(), 0);
+        while (!done) {       // odometer over the axes
+            std::vector<std::meta::info> tup;
+            for (std::size_t k = 0; k < axes.size(); ++k)
+                tup.push_back(axes[k][idx[k]]);
+            expand_instantiation(tmpl, tup, /*explicit_rule=*/false, out);
+            std::size_t k = axes.size();
+            while (k > 0) {
+                --k;
+                if (++idx[k] < axes[k].size())
+                    break;
+                idx[k] = 0;
+                if (k == 0)
+                    done = true;
+            }
+        }
+    } else {
+        instantiate_arg_set_must_be_with_or_product(argset);
+    }
+}
+
+// The seed expansion for one pack element (see the section comment above).
+template <std::meta::info R, std::meta::info... Rs>
+consteval std::vector<std::meta::info> seeds_of() {
+    std::vector<std::meta::info> out;
+    if constexpr (is_match_marker(R)) {
+        constexpr auto margs = std::define_static_array(
+            std::meta::template_arguments_of(std::meta::dealias(R)));
+        constexpr auto scope = std::meta::extract<std::meta::info>(margs[0]);
+        static_assert(std::meta::is_namespace(scope),
+                      "nb::match_ requires a namespace as its scope");
+        collect_match_seeds(&matcher_invoke<typename [:margs[1]:]>, scope,
+                            excluded_q<Rs...>(), out);
+    } else if constexpr (is_instantiate_marker(R)) {
+        constexpr auto margs = std::define_static_array(
+            std::meta::template_arguments_of(std::meta::dealias(R)));
+        constexpr auto target = std::meta::extract<std::meta::info>(margs[0]);
+        std::vector<std::meta::info> targets;
+        if constexpr (std::meta::is_type(target)) {
+            // A matcher TYPE as the target: the rule applies to every class
+            // template in the pack's namespace roots the matcher accepts.
+            constexpr auto mty = std::meta::dealias(target);
+            static_assert(matcher<typename [:mty:]>,
+                          "nb::instantiate_ target must be a class template "
+                          "reflection or a matcher type reflection");
+            auto ex = excluded_q<Rs...>();
+            for (auto ns : pack_namespace_roots<Rs...>())
+                collect_matching_class_templates(
+                    &matcher_invoke<typename [:mty:]>, ns, ex, targets);
+        } else {
+            static_assert(std::meta::is_template(target)
+                          && std::meta::is_class_template(target),
+                          "nb::instantiate_ target must be a class template "
+                          "reflection or a matcher type reflection");
+            targets.push_back(target);
+        }
+        for (std::size_t i = 1; i < margs.size(); ++i)
+            for (auto tmpl : targets)
+                expand_arg_sets(tmpl, margs[i], out);
+    } else if constexpr (is_config_marker(R)) {
+        // exclude_ / exclude_if_ / trampoline_: configuration, no seeds.
+    } else {
+        out.push_back(R);
+    }
+    return out;
+}
+
+// Memoized per (element, pack): the `template for` consumers in reflect_
+// iterate this (a variable template -- a constexpr local cannot be an
+// expansion range inside a template, GCC-2). Seeds are namespace-scope and
+// class-type reflections, safe to lift.
+template <std::meta::info R, std::meta::info... Rs>
+inline constexpr auto effective_seeds_v =
+    std::define_static_array(seeds_of<R, Rs...>());
+
 // True if `type` (after stripping cv/ref/pointers) is, or mentions anywhere in
 // its template-argument tree, an entity the binder cannot represent: an
 // nb::exclude_-listed one, or a user class-template specialization that
@@ -2835,13 +3064,24 @@ consteval std::vector<std::meta::info> compute_bind_set() {
     std::vector<std::meta::info> out;
     std::vector<std::meta::info> exl = compute_excluded<Rs...>();
     exclusion_set ex{exl, excluded_matchers<Rs...>()};
-    (collect_seed_classes(Rs, out, ex), ...);
+    // Iterate each pack element's effective seeds (its match_/instantiate_
+    // expansion; a non-marker element is its own sole seed) so an expanded
+    // seed joins the set exactly like an explicitly listed one.
+    auto seed_classes = [&](const std::vector<std::meta::info>& seeds) {
+        for (auto s : seeds)
+            collect_seed_classes(s, out, ex);
+    };
+    (seed_classes(seeds_of<Rs, Rs...>()), ...);
     auto merge = [&](std::vector<std::meta::info> specs) {
         for (auto s : specs)
             if (!info_vec_contains(out, s))
                 out.push_back(s);
     };
-    (merge(required_user_specs(Rs, ex)), ...);
+    auto merge_specs = [&](const std::vector<std::meta::info>& seeds) {
+        for (auto s : seeds)
+            merge(required_user_specs(s, ex));
+    };
+    (merge_specs(seeds_of<Rs, Rs...>()), ...);
     return out;
 }
 
@@ -3115,7 +3355,8 @@ void reflect_enum(module_& m) {
 /// member is a shorthand, not a declaration of contents -- following it binds
 /// the entire aliased namespace (a fixture's `namespace sd = simdjson;` pulled
 /// in the world, BINDER-0028).
-enum class ns_member_kind { skip, cls, enum_, free_fn, ns };
+// (ns_member_kind and this function's declaration live with the seed
+// machinery above, which the match_ walk shares.)
 consteval ns_member_kind classify_namespace_member(
         std::meta::info mem, const exclusion_set& ex) {
     if (std::meta::is_template(mem))
@@ -3200,6 +3441,25 @@ void reflect_user_specs(module_& m) {
     };
 }
 
+// Per-pack-element seed hops: each phase of reflect_ runs over the element's
+// effective seeds (its match_/instantiate_ expansion; a non-marker element
+// is its own sole seed), so the phase bodies above never see the markers.
+template <std::meta::info R, std::meta::info... Rs>
+void check_stl_casters_seeds() {
+    template for (constexpr auto s : effective_seeds_v<R, Rs...>)
+        check_stl_casters<s, Rs...>();
+}
+template <std::meta::info R, std::meta::info... Rs>
+void reflect_user_specs_seeds(module_& m) {
+    template for (constexpr auto s : effective_seeds_v<R, Rs...>)
+        reflect_user_specs<s, Rs...>(m);
+}
+template <std::meta::info R, std::meta::info... Rs>
+void reflect_dispatch_seeds(module_& m) {
+    template for (constexpr auto s : effective_seeds_v<R, Rs...>)
+        reflect_dispatch<s, Rs...>(m);
+}
+
 NAMESPACE_END(detail)
 
 /// Automatically bind classes, enums, and namespaces via C++26 reflection.
@@ -3212,14 +3472,16 @@ template <std::meta::info... Rs>
 void reflect_(module_& m) {
     // Diagnose any std type used in a bound signature whose <nanobind/stl/*.h>
     // caster was not included (a no-op when every needed caster is present).
-    (detail::check_stl_casters<Rs, Rs...>(), ...);
+    (detail::check_stl_casters_seeds<Rs, Rs...>(), ...);
     // Bind user class-template specializations reachable from the signatures, then
     // the namespaces/classes/enums/functions themselves (order-independent: the
     // reflect_class is_valid() guard dedups specs reached by both passes). Each
     // per-entity call also receives the whole pack: Python-base wiring consults
-    // the pack-wide bind set (a base seeded by ANY pack element counts).
-    (detail::reflect_user_specs<Rs, Rs...>(m), ...);
-    (detail::reflect_dispatch<Rs, Rs...>(m), ...);
+    // the pack-wide bind set (a base seeded by ANY pack element counts). Every
+    // phase iterates each element's effective seeds, so a match_/instantiate_
+    // expansion binds exactly like explicit listing.
+    (detail::reflect_user_specs_seeds<Rs, Rs...>(m), ...);
+    (detail::reflect_dispatch_seeds<Rs, Rs...>(m), ...);
 }
 
 NAMESPACE_END(NB_NAMESPACE)
