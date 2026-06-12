@@ -159,6 +159,28 @@ thing that cannot be expressed in-language (a virtual-override **trampoline**) h
   investigation — per-overload exclusion itself NOT reproduced, repros under
   `corpus/findings/repros/BINDER-0016/`).
 
+- **Matcher API (match_ / exclude_if_) + default instantiations (instantiate_)**:
+  `nb_reflect_match.h` defines the `nb::matcher` concept (empty default-constructible
+  type, consteval `M{}(info) -> bool`; never lambdas -- GCC consteval-lambda decay)
+  and the combinator DSL (`is_class_`/`is_enum_`/`is_function_`/`is_template_`,
+  `named_<"glob">` (anchored `*`/`?` over normalized identifiers: dealias, spec ->
+  template), `in_namespace_`, `derived_from_`, `has_annotation_`,
+  `all_of_`/`any_of_`/`not_`; every leaf P3560-guarded -- answers false, never
+  throws). Pack markers: `match_<^^scope, M>` walks the namespace classify-FIRST
+  (matcher only sees cls/enum/free-fn survivors of the usual gates; an accepted
+  nested namespace seeds whole) and `instantiate_<Target, ArgSets...>` mints class
+  template specializations (`with_<...>` explicit tuples -- substitution failure is
+  a hard error via the undefined-consteval-fn idiom; `product_<set_<...>...>` grids
+  -- substitution failures skip silently, constraints declare valid corners;
+  `val_<V>` for NTTPs; Target may be a matcher-type reflection swept over the
+  pack's namespace roots). Both expand EARLY into per-element "effective seeds"
+  (`seeds_of`/`effective_seeds_v`) consumed by every walk in all three backends, so
+  an expanded seed is bit-for-bit an explicit listing. `exclude_if_<M>` rides the
+  `exclusion_set` (listed span + consteval-fn-pointer predicates, rebuilt per
+  evaluation -- such pointers must NEVER persist to static storage/NTTPs) consulted
+  wherever the exclude_ list was: entity, template resolution, parent chain, and
+  the member signature gates. It does NOT replace `exclude_member_` (pre-lift
+  by-name drops). Probes 10-13 in the umbrella's gcc16-proveout/probes/.
 - **Wave-2 parallel-corpus hardening (BINDER-0022..0028):** module name
   collisions bind parent-qualified instead of clobbering (`yamlcpp`'s
   NodeType::value vs EmitterStyle::value; reflect_enum also gained the

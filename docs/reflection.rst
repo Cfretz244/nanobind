@@ -626,6 +626,154 @@ pImpl idiom, e.g. pugixml's ``xml_node_struct`` behind ``internal_object()`` —
 is opaque on every path, and members mentioning a pointer/reference to one are
 skipped automatically (no manual ``nb::exclude_`` needed).
 
+Selecting entities with matchers (nb::match_, nb::exclude_if_)
+---------------------------------------------------------------
+
+Listing entities one by one and hand-building exclusion packs both stop
+scaling on large surfaces. A **matcher** is a composable compile-time
+predicate over reflections -- any empty, default-constructible type callable
+as ``M{}(std::meta::info) -> bool`` in constant evaluation (the
+``nb::matcher`` concept, ``nanobind/nb_reflect_match.h``). Two pack markers
+consume them:
+
+``nb::match_<^^scope, M>`` walks the namespace ``scope`` (recursively) and
+binds every member the matcher accepts, **exactly as if each had been listed
+in the pack explicitly** -- same discovery, naming, base wiring, and emit
+output:
+
+.. code-block:: cpp
+
+   nb::reflect_<^^nb::match_<^^glm,
+                    nb::any_of_<nb::named_<"vec*">, nb::named_<"mat*">>>>(m);
+
+``nb::exclude_if_<M>`` is the predicate counterpart of listing entities in
+``nb::exclude_``: everything the matcher accepts becomes opaque, at exactly
+the points a listed entity would be -- the entity itself, specializations of
+a matched template, and (when the matcher accepts a namespace or class)
+everything declared inside it, transitively. It is accepted at the top level
+of the pack or nested inside an ``exclude_<...>`` marker:
+
+.. code-block:: cpp
+
+   nb::reflect_<^^Eigen::Matrix<double, 3, 1>,
+                ^^nb::exclude_if_<nb::in_namespace_<^^Eigen::internal>>,
+                ^^nb::exclude_if_<nb::any_of_<nb::named_<"*Solver*">,
+                                              nb::named_<"Cwise*">>>>(m);
+
+The built-in matcher vocabulary:
+
+=========================================  ====================================================
+Matcher                                    Accepts
+=========================================  ====================================================
+``nb::is_class_``                          class types (after dealiasing)
+``nb::is_enum_``                           enumeration types
+``nb::is_function_``                       functions (not function templates)
+``nb::is_template_``                       templates of any kind
+``nb::named_<"glob">``                     entities whose identifier matches the anchored
+                                           glob (``*`` / ``?``); a specialization matches
+                                           through its template's name
+``nb::in_namespace_<^^ns>``                entities declared (transitively) inside ``ns``
+``nb::derived_from_<^^Base>``              ``Base`` itself and everything derived from it
+``nb::has_annotation_<A>``                 entities carrying a ``[[=A{...}]]`` annotation
+``nb::all_of_<Ms...>``                     conjunction
+``nb::any_of_<Ms...>``                     disjunction
+``nb::not_<M>``                            negation
+=========================================  ====================================================
+
+For anything the DSL cannot express, write the predicate yourself -- any type
+satisfying the concept works:
+
+.. code-block:: cpp
+
+   struct small_value_types {
+       consteval bool operator()(std::meta::info r) const {
+           return std::meta::is_type(r) && std::meta::is_class_type(r)
+               && std::meta::size_of(r) <= 16;
+       }
+   };
+   nb::reflect_<^^nb::match_<^^mylib, small_value_types>>(m);
+
+Three rules keep matchers safe and predictable:
+
+- **Matchers are types, not lambdas.** They travel through the pack as
+  template arguments, and a consteval lambda cannot decay to a function
+  pointer under GCC.
+- **Guard kind-specific metafunctions.** GCC's metafunctions *throw*
+  ``std::meta::exception`` on a wrong-kind argument (``annotations_of`` on a
+  template, ``template_of`` on a non-specialization). The built-in leaves
+  guard everything and answer ``false``; a user matcher must do the same --
+  an "uncaught std::meta::exception" error during binding points at the
+  matcher body.
+- **match_ never sees the dangerous cases.** The walk classifies each member
+  first and consults the matcher only for classes, enums, and free functions
+  that survive the usual skip/exclusion/completeness gates, so accepting
+  something unbindable is simply inert. A nested namespace the matcher
+  accepts is bound whole; one it rejects is recursed into. (Consequently
+  ``exclude_if_`` is **not** a replacement for ``nb::exclude_member_``: a
+  member whose constexpr body is lazily ill-formed must be dropped by name
+  *before* its reflection is materialized.)
+
+Default instantiations (nb::instantiate_)
+------------------------------------------
+
+Explicit listing covers a handful of specializations; heavily templated
+libraries need them in bulk. ``nb::instantiate_<Target, ArgSets...>`` mints
+class-template specializations from argument-set rules and binds each one
+exactly like a pack-listed specialization (same CamelCase naming, discovery
+fixpoint, and emit output):
+
+.. code-block:: cpp
+
+   nb::reflect_<^^nb::instantiate_<^^absl::btree_map,
+                    nb::with_<^^int, ^^std::string>,        // one explicit tuple
+                    nb::product_<                            // a 2x2 grid
+                        nb::set_<^^int, ^^std::string>,      //   keys
+                        nb::set_<^^int, ^^double>>>>(m);     //   values
+
+``nb::with_<Args...>`` is one explicit argument tuple;
+``nb::product_<set_<...>, set_<...>, ...>`` expands the cross product of its
+axes. Arguments are reflections: types as ``^^int``, constant template
+arguments through ``nb::val_``:
+
+.. code-block:: cpp
+
+   // glm's vector grid: vec<2..4, float/double, packed_highp>
+   nb::reflect_<^^nb::instantiate_<^^glm::vec,
+                    nb::product_<
+                        nb::set_<nb::val_<glm::length_t(2)>,
+                                 nb::val_<glm::length_t(3)>,
+                                 nb::val_<glm::length_t(4)>>,
+                        nb::set_<^^float, ^^double>,
+                        nb::set_<nb::val_<glm::packed_highp>>>>>(m);
+
+``Target`` is a class-template reflection, **or a matcher type reflection**:
+the rule then applies to every class template the matcher accepts under the
+pack's namespace roots (the namespaces listed in the pack plus every
+``match_`` scope) -- "all the ``vec*`` templates, instantiated like this":
+
+.. code-block:: cpp
+
+   nb::reflect_<^^mylib,
+                ^^nb::instantiate_<^^nb::named_<"*_map">,
+                    nb::with_<^^int, ^^std::string>>>(m);
+
+Failure semantics are deliberately asymmetric:
+
+- A ``with_`` tuple that fails to substitute (or whose specialization cannot
+  complete) is a **hard error** through a pointed diagnostic
+  (``instantiate_with_rule_failed``): you named that combination, and losing
+  it silently would be worse.
+- A ``product_`` combination that fails **substitution** -- an unsatisfied
+  constraint, a wrong argument kind -- is **silently skipped**: a grid
+  legitimately has invalid corners, and constraints are how a template
+  declares its valid ones. A combination that substitutes but whose class
+  body cannot *complete* (e.g. a member that is ill-formed for those
+  arguments) is a hard error, exactly as if it had been listed explicitly.
+
+Each minted specialization seeds the same discovery fixpoint as an explicit
+listing, so member types it references (including std types needing casters)
+surface automatically in both backends.
+
 The emit backend (full source codegen)
 ---------------------------------------
 
